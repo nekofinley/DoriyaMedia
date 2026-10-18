@@ -41,6 +41,10 @@ async function load() {
     const q = new URLSearchParams({
       library_id: libId.value, type: type.value, search: search.value, sort: sort.value, limit: '500',
     })
+    // The shelf holds films and series. Seasons and episodes only join the list
+    // when they are what was asked for — a type filter, or a search that has to
+    // be able to find an episode by name.
+    if (!type.value && !search.value) q.set('roots', '1')
     const r = await api.get(`/api/items?${q}`)
     items.value = r.items || []
     total.value = r.total || 0

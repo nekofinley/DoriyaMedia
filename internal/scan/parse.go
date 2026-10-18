@@ -482,6 +482,19 @@ func cleanTitle(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// DisplayName drops the bracketed suffixes a directory name may carry, the way
+// ParseName drops them from a file name. A source is free to put an id, a year or
+// a release group in brackets — that is what makes a virtual tree resolvable from
+// a path alone — and none of it belongs on a season card, where "游郭篇
+// [season 39433]" should read "游郭篇". Falls back to the original when stripping
+// would leave nothing behind.
+func DisplayName(s string) string {
+	if out := strings.Join(strings.Fields(reBracketGroups.ReplaceAllString(s, " ")), " "); out != "" {
+		return out
+	}
+	return strings.TrimSpace(s)
+}
+
 // NormalizeKey builds a match key for dedupe.
 func NormalizeKey(s string) string {
 	s = strings.ToLower(s)

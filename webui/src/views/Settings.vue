@@ -48,7 +48,22 @@ const testing = ref(false)
 const addingSource = ref(false)
 
 // new library form
-const libForm = ref({ name: '', type: 'movie', source_id: '', path: '/', providers: ['nfo', 'bgm', 'tmdb'] })
+const libForm = ref({
+  name: '', type: 'movie',
+  // A library may scan several places: one show can be split across two drives,
+  // and a 番剧 library is often a cloud source plus a folder on this machine.
+  sources: [{ source_id: '', path: '/' }],
+  providers: ['nfo', 'bgm', 'tmdb'],
+})
+
+function addLibSource() {
+  const first = libForm.value.sources[0]
+  libForm.value.sources.push({ source_id: first?.source_id || '', path: '/' })
+}
+
+function removeLibSource(i) {
+  if (libForm.value.sources.length > 1) libForm.value.sources.splice(i, 1)
+}
 const addingLibrary = ref(false)
 
 const providerLabels = { nfo: '本地 nfo', tmdb: 'TMDB', bgm: 'Bangumi' }
@@ -77,7 +92,9 @@ async function loadAll() {
     sys.value = await api.get('/api/system/info')
     cfg.value = await api.get('/api/config')
     users.value = (await api.get('/api/admin/users')).users || []
-    if (!libForm.value.source_id && sources.value.length) libForm.value.source_id = sources.value[0].id
+    if (!libForm.value.sources[0].source_id && sources.value.length) {
+      libForm.value.sources[0].source_id = sources.value[0].id
+    }
   } catch (e) {
     error.value = e.message
   }
@@ -91,23 +108,40 @@ function startEdit(lib) {
   let provs = []
   try { provs = JSON.parse(lib.providers || '[]') } catch {}
   if (!provs.length) provs = ['nfo', 'bgm', 'tmdb']
-  editForm.value = { name: lib.name, type: lib.type, path: lib.path, providers: provs }
+  // Older libraries carry a single source_id/path; newer ones a list.
+  const places = (lib.sources && lib.sources.length)
+    ? lib.sources.map((s) => ({ source_id: s.source_id, path: s.path }))
+    : [{ source_id: lib.source_id, path: lib.path }]
+  editForm.value = { name: lib.name, type: lib.type, sources: places, providers: provs }
 }
 function toggleProvider(p) {
   const a = editForm.value.providers
   const i = a.indexOf(p)
   i >= 0 ? a.splice(i, 1) : a.push(p)
 }
+function addEditSource() {
+  const first = editForm.value.sources[0]
+  editForm.value.sources.push({ source_id: first?.source_id || '', path: '/' })
+}
+function removeEditSource(i) {
+  if (editForm.value.sources.length > 1) editForm.value.sources.splice(i, 1)
+}
 async function saveEdit(id) {
   try {
     const f = editForm.value
+    const picked = f.sources
+      .filter((s) => s.source_id)
+      .map((s) => ({ source_id: Number(s.source_id), path: s.path || '/' }))
+    if (!picked.length) { toast.err('至少要选一个存储源'); return }
     await api.put(`/api/libraries/${id}`, {
-      name: f.name, type: f.type, path: f.path || '/',
+      name: f.name, type: f.type,
+      source_id: picked[0].source_id, path: picked[0].path,
+      sources: picked,
       providers: JSON.stringify(f.providers.length ? f.providers : ['nfo', 'bgm', 'tmdb']),
     })
     editing.value = null
     await loadAll()
-    toast.ok('媒体库已更新,改过路径记得重新扫描')
+    toast.ok('媒体库已更新,改过源或路径记得重新扫描')
   } catch (e) { toast.err(e.message) }
 }
 
@@ -122,6 +156,13 @@ function fmtClock(ts) {
 }
 function sourceName(id) {
   return sources.value.find((s) => s.id === id)?.name || `源 #${id}`
+}
+/** One library may scan several places; the card lists them all. */
+function libSourcesLabel(lib) {
+  const places = (lib.sources && lib.sources.length)
+    ? lib.sources
+    : [{ source_id: lib.source_id, path: lib.path }]
+  return places.map((p) => `${sourceName(p.source_id)} ${p.path || '/'}`).join(' + ')
 }
 function providersOf(lib) {
   try {
@@ -219,11 +260,23 @@ async function delSource(id) {
 async function addLibrary() {
   try {
     const f = libForm.value
+    const picked = f.sources
+      .filter((s) => s.source_id)
+      .map((s) => ({ source_id: Number(s.source_id), path: s.path || '/' }))
+    if (!picked.length) { toast.err('至少要选一个存储源'); return }
     await api.post('/api/libraries', {
-      name: f.name, type: f.type, source_id: Number(f.source_id), path: f.path || '/',
+      name: f.name, type: f.type,
+      // source_id/path keep naming the first place, for anything that only knows
+      // about one source; the list is what the scan actually walks.
+      source_id: picked[0].source_id, path: picked[0].path,
+      sources: picked,
       providers: JSON.stringify(f.providers.length ? f.providers : ['nfo', 'bgm', 'tmdb']),
     })
-    libForm.value = { name: '', type: 'movie', source_id: f.source_id, path: '/', providers: ['nfo', 'bgm', 'tmdb'] }
+    libForm.value = {
+      name: '', type: 'movie',
+      sources: [{ source_id: f.sources[0]?.source_id || '', path: '/' }],
+      providers: ['nfo', 'bgm', 'tmdb'],
+    }
     addingLibrary.value = false
     await loadAll()
     toast.ok('媒体库已创建,记得点扫描')
@@ -667,15 +720,24 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                         <option value="series">剧集</option>
                       </select>
                     </div>
-                    <div class="field">
-                      <label>存储源</label>
-                      <select v-model="libForm.source_id">
-                        <option v-for="s in sources" :key="s.id" :value="s.id">{{ s.name }}</option>
-                      </select>
-                    </div>
-                    <div class="field">
-                      <label>路径(源内路径)</label>
-                      <input v-model="libForm.path" placeholder="/movies" />
+                    <div class="field wide">
+                      <label>存储源与路径(可以加多个,扫描时一起扫)</label>
+                      <div class="src-rows">
+                        <div v-for="(row, i) in libForm.sources" :key="i" class="src-row">
+                          <select v-model="row.source_id">
+                            <option v-for="s in sources" :key="s.id" :value="s.id">{{ s.name }}</option>
+                          </select>
+                          <input v-model="row.path" placeholder="/movies" />
+                          <button
+                            class="btn sm danger" :disabled="libForm.sources.length <= 1"
+                            title="删掉这个源" @click="removeLibSource(i)"
+                          ><AppIcon name="trash" :size="14" /></button>
+                        </div>
+                        <button class="btn sm" @click="addLibSource">
+                          <AppIcon name="plus" :size="14" /> 再加一个源
+                        </button>
+                      </div>
+                      <div class="tiny">同一个库里的多个源会一起扫描、合并成同一批剧集;某部剧拆在两个盘上也没关系。</div>
                     </div>
                   </div>
                   <div class="field">
@@ -688,7 +750,7 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                       >{{ providerLabels[p] }}</button>
                     </div>
                   </div>
-                  <button class="btn primary" :disabled="!libForm.source_id || !libForm.name" @click="addLibrary">
+                  <button class="btn primary" :disabled="!libForm.sources.some(s => s.source_id) || !libForm.name" @click="addLibrary">
                     <AppIcon name="check" :size="15" /> 创建媒体库
                   </button>
                 </template>
@@ -709,7 +771,24 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                       <option value="series">剧集</option>
                     </select>
                   </div>
-                  <div class="field"><label>路径(源内路径)</label><input v-model="editForm.path" placeholder="/movies" /></div>
+                  <div class="field wide">
+                    <label>存储源与路径(可以加多个)</label>
+                    <div class="src-rows">
+                      <div v-for="(row, i) in editForm.sources" :key="i" class="src-row">
+                        <select v-model="row.source_id">
+                          <option v-for="s in sources" :key="s.id" :value="s.id">{{ s.name }}</option>
+                        </select>
+                        <input v-model="row.path" placeholder="/movies" />
+                        <button
+                          class="btn sm danger" :disabled="editForm.sources.length <= 1"
+                          title="删掉这个源" @click="removeEditSource(i)"
+                        ><AppIcon name="trash" :size="14" /></button>
+                      </div>
+                      <button class="btn sm" @click="addEditSource">
+                        <AppIcon name="plus" :size="14" /> 再加一个源
+                      </button>
+                    </div>
+                  </div>
                 </div>
                 <div class="field">
                   <label>刮削来源(按优先级)</label>
@@ -734,7 +813,7 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                       <span class="badge">{{ lib.type === 'movie' ? '电影' : '剧集' }}</span>
                     </div>
                     <div class="tiny truncate">
-                      {{ sourceName(lib.source_id) }} · 路径 {{ lib.path }}
+                      {{ libSourcesLabel(lib) }}
                       · 刮削 {{ providersOf(lib).map(p => providerLabels[p] || p).join(' / ') }}
                     </div>
                   </div>
@@ -1568,6 +1647,14 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
 
 .lib-card { padding: var(--sp-4) var(--sp-5); }
 .lib-line { display: flex; align-items: center; gap: 14px; }
+
+/* One row per storage source on the library form: pick a source, name a path
+   inside it, and add as many rows as the library spans. */
+.src-rows { display: flex; flex-direction: column; gap: 8px; align-items: stretch; }
+.src-row { display: flex; gap: 8px; align-items: center; }
+.src-row select { flex: 0 0 38%; min-width: 0; }
+.src-row input { flex: 1 1 auto; min-width: 0; }
+.src-row .btn { flex: 0 0 auto; }
 .lib-actions { display: flex; gap: 8px; flex: none; flex-wrap: wrap; }
 /* 扫描/体检的进度显示由 LiveProgress 组件自己带样式 */
 .scan-done { margin-top: 10px; display: flex; align-items: center; gap: 6px; color: var(--text-3); }

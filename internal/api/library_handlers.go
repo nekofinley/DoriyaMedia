@@ -251,9 +251,29 @@ func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request, use
 	if lib.Providers == "" {
 		lib.Providers = `["nfo","bgm","tmdb"]`
 	}
+	// The library's own source_id/path name its first place: the column is NOT
+	// NULL with a foreign key, and everything that predates multi-source reads
+	// it. A request that sends only the list still has to fill it in.
+	if len(lib.Sources) > 0 && lib.SourceID == 0 {
+		lib.SourceID = lib.Sources[0].SourceID
+		if lib.Sources[0].Path != "" {
+			lib.Path = lib.Sources[0].Path
+		}
+	}
 	if err := s.Store.CreateLibrary(&lib); err != nil {
 		fail(w, 500, err.Error())
 		return
+	}
+	// A library may scan several places. The first of them is also its own
+	// source_id/path, which is what the older single-source shape reads.
+	if len(req.Sources) > 0 {
+		if err := s.Store.SetLibrarySources(lib.ID, req.Sources); err != nil {
+			fail(w, 500, err.Error())
+			return
+		}
+		if fresh, err := s.Store.LibraryByID(lib.ID); err == nil {
+			lib = *fresh
+		}
 	}
 	writeJSON(w, 200, lib)
 }
@@ -288,6 +308,17 @@ func (s *Server) handleUpdateLibrary(w http.ResponseWriter, r *http.Request, use
 	if err := s.Store.UpdateLibrary(lib); err != nil {
 		fail(w, 500, err.Error())
 		return
+	}
+	// The sources are replaced wholesale when the request carries them; a request
+	// that does not (an older client) leaves them exactly as they were.
+	if req.Sources != nil {
+		if err := s.Store.SetLibrarySources(lib.ID, req.Sources); err != nil {
+			fail(w, 500, err.Error())
+			return
+		}
+	}
+	if fresh, err := s.Store.LibraryByID(lib.ID); err == nil {
+		lib = fresh
 	}
 	writeJSON(w, 200, lib)
 }
@@ -334,7 +365,8 @@ func (s *Server) handleListItems(w http.ResponseWriter, r *http.Request, user *m
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	items, total, err := s.Store.ItemsByLibrary(libID, q.Get("type"), q.Get("search"), q.Get("sort"), offset, limit)
+	items, total, err := s.Store.ItemsByLibrary(libID, q.Get("type"), q.Get("search"), q.Get("sort"),
+		q.Get("roots") == "1", offset, limit)
 	if err != nil {
 		fail(w, 500, err.Error())
 		return

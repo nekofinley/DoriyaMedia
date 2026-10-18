@@ -25,6 +25,10 @@ type Manager struct {
 
 	listMu    sync.Mutex
 	listCache map[string][]source.Entry // per-EnrichLibrary-run dir listing cache
+	// One driver per source. A library may scan several sources, so a file's
+	// driver is looked up from the file, not from the library.
+	drvMu   sync.Mutex
+	drivers map[int64]source.Driver
 
 	bgmMu       sync.Mutex
 	bgmEpsCache map[int][]BgmEpisodeMeta
@@ -37,21 +41,55 @@ func NewManager(store *db.Store, cfg *config.Config) *Manager {
 // cachedList returns the directory listing, deduplicating repeated lookups
 // within one enrichment run (hundreds of episodes often share a few dirs —
 // each remote List costs a public round-trip).
-func (m *Manager) cachedList(ctx context.Context, drv source.Driver, dir string) ([]source.Entry, error) {
+func (m *Manager) cachedList(ctx context.Context, drv source.Driver, sourceID int64, dir string) ([]source.Entry, error) {
+	// Keyed by source as well as directory: two sources in one library can hold
+	// the same directory path, and a listing from the wrong one would have nfo
+	// and artwork looked for in a place the file is not.
+	key := fmt.Sprintf("%d|%s", sourceID, dir)
 	m.listMu.Lock()
 	defer m.listMu.Unlock()
 	if m.listCache == nil {
 		m.listCache = map[string][]source.Entry{}
 	}
-	if ents, ok := m.listCache[dir]; ok {
+	if ents, ok := m.listCache[key]; ok {
 		return ents, nil
+	}
+	if drv == nil {
+		return nil, fmt.Errorf("没有可用的存储源驱动(source %d)", sourceID)
 	}
 	ents, err := drv.List(ctx, dir)
 	if err != nil {
 		return nil, err
 	}
-	m.listCache[dir] = ents
+	m.listCache[key] = ents
 	return ents, nil
+}
+
+// driverFor returns the driver of the source a file lives on. A library may scan
+// several sources, so the library's own source_id is not the answer for a file —
+// the file's row is. Drivers are kept for the run.
+func (m *Manager) driverFor(sourceID int64) source.Driver {
+	if sourceID == 0 {
+		return nil
+	}
+	m.drvMu.Lock()
+	defer m.drvMu.Unlock()
+	if m.drivers == nil {
+		m.drivers = map[int64]source.Driver{}
+	}
+	if d, ok := m.drivers[sourceID]; ok {
+		return d
+	}
+	src, err := m.Store.SourceByID(sourceID)
+	if err != nil {
+		return nil
+	}
+	d, err := source.NewDriver(src)
+	if err != nil {
+		return nil
+	}
+	m.drivers[sourceID] = d
+	return d
 }
 
 // httpClient returns the client used for TMDB API/image traffic, routed
@@ -206,7 +244,7 @@ func (m *Manager) EnrichLibrary(lib *models.Library, report func(done, total int
 }
 
 func (m *Manager) enrichMovies(ctx context.Context, drv source.Driver, lib *models.Library, say func(done, total int, msg string)) {
-	items, _, err := m.Store.ItemsByLibrary(lib.ID, "movie", "", "", 0, 500000)
+	items, _, err := m.Store.ItemsByLibrary(lib.ID, "movie", "", "", false, 0, 500000)
 	if err != nil {
 		return
 	}
@@ -223,11 +261,11 @@ func (m *Manager) enrichMovies(ctx context.Context, drv source.Driver, lib *mode
 }
 
 func (m *Manager) enrichSeries(ctx context.Context, drv source.Driver, lib *models.Library, say func(done, total int, msg string)) {
-	shows, _, _ := m.Store.ItemsByLibrary(lib.ID, "show", "", "", 0, 100000)
-	seasons, _, _ := m.Store.ItemsByLibrary(lib.ID, "season", "", "", 0, 200000)
+	shows, _, _ := m.Store.ItemsByLibrary(lib.ID, "show", "", "", false, 0, 100000)
+	seasons, _, _ := m.Store.ItemsByLibrary(lib.ID, "season", "", "", false, 0, 200000)
 	// count all episodes for the progress denominator
 	epTotal := 0
-	if all, _, err := m.Store.ItemsByLibrary(lib.ID, "episode", "", "", 0, 500000); err == nil {
+	if all, _, err := m.Store.ItemsByLibrary(lib.ID, "episode", "", "", false, 0, 500000); err == nil {
 		epTotal = len(all)
 	}
 	total := len(shows) + epTotal
@@ -293,14 +331,18 @@ func (m *Manager) enrichShow(ctx context.Context, drv source.Driver, lib *models
 	if show.TMDBID != 0 && show.PosterPath != "" && show.Overview != "" {
 		return
 	}
-	filePath, ok := m.firstEpisodeFile(show.ID)
+	filePath, epSource, ok := m.firstEpisodeFile(show.ID)
 	if !ok {
 		return
+	}
+	// The show's own files name the source to read its nfo and artwork from.
+	if d := m.driverFor(epSource); d != nil {
+		drv = d
 	}
 	for _, p := range providers(lib) {
 		switch p {
 		case "nfo":
-			if m.tryShowNFO(ctx, drv, show, filePath) {
+			if m.tryShowNFO(ctx, drv, show, filePath, epSource) {
 				return
 			}
 		case "tmdb":
@@ -412,14 +454,17 @@ func (m *Manager) RefreshItem(itemID int64, tmdbID int) error {
 		}
 		it.TMDBID, it.BGMID, it.Overview, it.PosterPath, it.BackdropPath = 0, 0, "", "", ""
 		_ = m.Store.UpdateItemMeta(it)
-		filePath, ok := m.firstEpisodeFile(it.ID)
+		filePath, epSource, ok := m.firstEpisodeFile(it.ID)
 		if !ok {
 			return fmt.Errorf("剧集下没有可用的剧集文件")
+		}
+		if d := m.driverFor(epSource); d != nil {
+			drv = d
 		}
 		for _, p := range providers(lib) {
 			switch p {
 			case "nfo":
-				if m.tryShowNFO(ctx, drv, it, filePath) {
+				if m.tryShowNFO(ctx, drv, it, filePath, epSource) {
 					return nil
 				}
 			case "bgm":
@@ -484,9 +529,13 @@ func (m *Manager) tryMovieNFO(ctx context.Context, drv source.Driver, it *models
 	if f == nil || isHTTP(f.Path) {
 		return false
 	}
+	// The file's own source decides where to look: a library may scan several.
+	if d := m.driverFor(f.SourceID); d != nil {
+		drv = d
+	}
 	dir, base := dirBase(f.Path)
 	stem := fileStem(base)
-	list, err := m.cachedList(ctx, drv, dir)
+	list, err := m.cachedList(ctx, drv, f.SourceID, dir)
 	if err != nil {
 		return false
 	}
@@ -560,9 +609,12 @@ func (m *Manager) tryEpisodeNFO(ctx context.Context, drv source.Driver, ep *mode
 	if f == nil || isHTTP(f.Path) {
 		return false
 	}
+	if d := m.driverFor(f.SourceID); d != nil {
+		drv = d
+	}
 	dir, file := dirBase(f.Path)
 	stem := fileStem(file)
-	list, err := m.cachedList(ctx, drv, dir)
+	list, err := m.cachedList(ctx, drv, f.SourceID, dir)
 	if err != nil {
 		return false
 	}
@@ -612,13 +664,13 @@ func (m *Manager) tryEpisodeNFO(ctx context.Context, drv source.Driver, ep *mode
 	return m.Store.UpdateItemMeta(ep) == nil
 }
 
-func (m *Manager) tryShowNFO(ctx context.Context, drv source.Driver, show *models.Item, filePath string) bool {
+func (m *Manager) tryShowNFO(ctx context.Context, drv source.Driver, show *models.Item, filePath string, sourceID int64) bool {
 	if isHTTP(filePath) {
 		return false
 	}
 	dir, _ := dirBase(filePath)
 	for depth := 0; depth < 3 && dir != "" && dir != "/" && dir != "."; depth++ {
-		list, err := m.cachedList(ctx, drv, dir)
+		list, err := m.cachedList(ctx, drv, sourceID, dir)
 		if err != nil {
 			return false
 		}
@@ -1007,18 +1059,18 @@ func (m *Manager) writeImage(itemID int64, kind string, tmdbID int, srcPath stri
 
 // ---------- helpers ----------
 
-func (m *Manager) firstEpisodeFile(showID int64) (string, bool) {
+func (m *Manager) firstEpisodeFile(showID int64) (string, int64, bool) {
 	seasons, _ := m.Store.ItemChildren(showID)
 	for _, s := range seasons {
 		eps, _ := m.Store.ItemChildren(s.ID)
 		for _, e := range eps {
 			fls, _ := m.Store.FilesByItem(e.ID)
 			if len(fls) > 0 {
-				return fls[0].Path, true
+				return fls[0].Path, fls[0].SourceID, true
 			}
 		}
 	}
-	return "", false
+	return "", 0, false
 }
 
 func isHTTP(p string) bool {

@@ -15,7 +15,8 @@
 param(
   [string]$Cookie = "",
   [int]$Port = 5699,
-  [string]$Season = "/热门番剧/鬼灭之刃 [26801]",
+  [string]$Series = "/热门番剧/鬼灭之刃 [series 26801]",
+  [string]$Season = "/热门番剧/鬼灭之刃 [series 26801]/立志篇 [season 26801]",
   [switch]$SessionPackager,
   [int]$SegmentIndex = 3,
   [switch]$KeepRunning
@@ -26,7 +27,9 @@ $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $exe = Join-Path $root "doriyamedia.exe"
 if (-not (Test-Path $exe)) { throw "先构建:$exe 不存在(scripts\build.ps1)" }
 
-$scratch = Join-Path $root ".tmp\bili-e2e"
+# Per port, so two copies of this test can run side by side without
+# fighting over one SQLite file.
+$scratch = Join-Path $root ".tmp\bili-e2e-$Port"
 $dataDir = Join-Path $scratch "data"
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 $cfgPath = Join-Path $scratch "config.json"
@@ -74,6 +77,18 @@ function Wait-Port {
 }
 
 $base = "http://127.0.0.1:$Port"
+
+# Windows PowerShell sends a -Body <string> in the local code page, so any Chinese
+# in it arrives as "???" — a library path of "/热门番剧" becomes "/????" and the
+# source is scanned nowhere. Every JSON body goes out as UTF-8 bytes instead.
+function PostJson {
+  param([string]$Uri, $Object, $Session)
+  $json = $Object | ConvertTo-Json -Depth 6
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+  $args = @{ Uri = $Uri; Method = "Post"; Body = $bytes; ContentType = "application/json; charset=utf-8" }
+  if ($Session) { $args.WebSession = $Session }
+  Invoke-RestMethod @args
+}
 $fails = New-Object System.Collections.Generic.List[string]
 function Check {
   param([string]$What, [bool]$Ok, [string]$Detail = "")
@@ -92,15 +107,33 @@ try {
   }
 
   # ---- admin + source ----
-  $null = Invoke-RestMethod -Uri "$base/api/setup" -Method Post `
-    -Body (@{ name = "e2e"; password = "e2e-pass" } | ConvertTo-Json) -ContentType "application/json" -SessionVariable sess
-  Check "初始化管理员" ($null -ne $sess)
+  # A second run finds the scratch data dir already initialised; log in instead,
+  # so the test can be re-run without deleting anything.
+  $sess = $null
+  try {
+    $null = Invoke-RestMethod -Uri "$base/api/setup" -Method Post `
+      -Body ([System.Text.Encoding]::UTF8.GetBytes((@{ name = "e2e"; password = "e2e-pass" } | ConvertTo-Json))) `
+      -ContentType "application/json; charset=utf-8" -SessionVariable sess
+    Check "初始化管理员" ($null -ne $sess)
+  } catch {
+    $null = Invoke-RestMethod -Uri "$base/api/auth/login" -Method Post `
+      -Body ([System.Text.Encoding]::UTF8.GetBytes((@{ name = "e2e"; password = "e2e-pass" } | ConvertTo-Json))) `
+      -ContentType "application/json; charset=utf-8" -SessionVariable sess
+    Check "复用已有实例并登录" ($null -ne $sess)
+  }
 
-  $srcBody = @{
+  # 上一轮留下的库/源会让数量断言不准:先清空。
+  foreach ($old in @(Invoke-RestMethod -Uri "$base/api/libraries" -WebSession $sess)) {
+    Invoke-RestMethod -Uri "$base/api/libraries/$($old.id)" -Method Delete -WebSession $sess | Out-Null
+  }
+  foreach ($old in @(Invoke-RestMethod -Uri "$base/api/sources" -WebSession $sess)) {
+    Invoke-RestMethod -Uri "$base/api/sources/$($old.id)" -Method Delete -WebSession $sess | Out-Null
+  }
+
+  $src = PostJson "$base/api/sources" @{
     name = "B站番剧"; type = "bilibili"
     config = @{ bili_cookie = $Cookie; bili_quality = 0; bili_codec = "avc" }
-  } | ConvertTo-Json -Depth 5
-  $src = Invoke-RestMethod -Uri "$base/api/sources" -Method Post -WebSession $sess -Body $srcBody -ContentType "application/json"
+  } $sess
   Check "添加 bilibili 源" ($src.id -gt 0) "id=$($src.id) type=$($src.type)"
   $sid = $src.id
 
@@ -112,6 +145,17 @@ try {
   # ---- browse ----
   $rootL = Browse "/"
   Check "根目录" ($rootL.entries.Count -ge 2) (($rootL.entries | ForEach-Object { $_.name }) -join ", ")
+
+  # 一个系列目录下列出它的季度:bilibili 自己就叫它们第一季/第二季/游郭篇…
+  $seasons = Browse $Series
+  Check "系列目录列出季度" ($seasons.entries.Count -ge 2) `
+    (($seasons.entries | ForEach-Object { $_.name }) -join ", ")
+  $named = $seasons.entries | Where-Object { $_.name -match '游郭篇' }
+  Check "季度目录带 season id 且能反查" ([bool]$named -and $named.name -match '\[season \d+\]') $named.name
+  $spy = Browse "/热门番剧/间谍过家家 [series 41410]"
+  $numbered = @($spy.entries | Where-Object { $_.name -match '^第[一二三]季' })
+  Check "季度用 bilibili 自己的季名(第一季/第二季…)" ($numbered.Count -ge 2) `
+    (($spy.entries | ForEach-Object { $_.name }) -join ", ")
 
   $eps = Browse $Season
   Check "季目录列出剧集" ($eps.entries.Count -gt 0) "$($eps.entries.Count) 集"
@@ -226,6 +270,53 @@ try {
         $msg = $_.ErrorDetails.Message
         Check "会员集被拒绝且有中文理由" ($msg -match '大会员' -or $msg -match '没有可播放') $msg
       }
+    }
+  }
+  # ---- 媒体库:一个系列 = 一部剧,季度 = 季 ----
+  # 这是这套目录结构存在的全部意义:鬼灭之刃在 B 站是十几个独立条目,进了媒体库
+  # 要变成一部剧 + 十几个季度,而不是十几部互不相干的番。
+  $lib = PostJson "$base/api/libraries" @{
+    name = "追番"; type = "series"; source_id = $sid; path = "/热门番剧"; providers = "[]"
+  } $sess
+  Invoke-RestMethod -Uri "$base/api/libraries/$($lib.id)/scan" -Method Post -WebSession $sess | Out-Null
+  $st = $null
+  for ($i = 0; $i -lt 300; $i++) {
+    Start-Sleep -Seconds 1
+    $all = Invoke-RestMethod -Uri "$base/api/scan/status" -WebSession $sess
+    $st = @($all) | Where-Object { $_.library_id -eq $lib.id } | Select-Object -First 1
+    if ($st -and -not $st.running) { break }
+  }
+  Check "媒体库扫描完成" ($st -and -not $st.running -and -not $st.error) "phase=$($st.phase) error=$($st.error)"
+
+  # limit 上限是 500,而这个库有三千多集;按类型分别取,别指望一页拿全。
+  function Items([string]$Type, [int]$Limit = 500) {
+    @( (Invoke-RestMethod -Uri "$base/api/items?library_id=$($lib.id)&type=$Type&limit=$Limit" -WebSession $sess).items )
+  }
+  $shows = Items "show"
+  $seasons = Items "season"
+  $items = @($shows) + @($seasons) + (Items "episode")
+  $km = @($shows | Where-Object { $_.name -like "鬼灭之刃*" })
+  Check "鬼灭之刃在库里只有一部" ($km.Count -eq 1) `
+    ("匹配到 " + $km.Count + " 部: " + (($km | ForEach-Object { $_.name }) -join " / "))
+  Check "库里没有季度混进剧列表" `
+    (@($shows | Where-Object { $_.name -match '\[(season|series)' }).Count -eq 0) `
+    ("show=" + $shows.Count + " 条目总数=" + $items.Count)
+
+  if ($km.Count -eq 1) {
+    $seasonItems = @($seasons | Where-Object { $_.parent_id -eq $km[0].id })
+    Check "鬼灭之刃下面挂着多个季度" ($seasonItems.Count -ge 5) `
+      ("$($seasonItems.Count) 季: " + (($seasonItems | ForEach-Object { $_.name }) -join " / "))
+    $youguo = @($seasonItems | Where-Object { $_.name -match '游郭篇' })
+    if ($youguo.Count -gt 0) {
+      # 季条目的名字不该带着 [season …]:那是路径用的,不该出现在界面上。
+      Check "季度名去掉了方括号标记" ($youguo[0].name -notmatch '\[season') $youguo[0].name
+      # 走界面自己用的那个接口:剧集是季节的子条目,翻不了页也无所谓。
+      $detail = Invoke-RestMethod -Uri "$base/api/items/$($youguo[0].id)" -WebSession $sess
+      $epItems = @($detail.episodes)
+      Check "季度下面挂着剧集" ($epItems.Count -ge 3) `
+        ("游郭篇 $($epItems.Count) 集,第一集: " + (@($epItems | Sort-Object episode)[0].name))
+    } else {
+      Check "季度下面挂着剧集" $false "季度里没有游郭篇"
     }
   }
 }

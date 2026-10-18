@@ -122,6 +122,15 @@ func (s *Store) migrate() error {
 			providers TEXT NOT NULL DEFAULT '["nfo","tmdb"]',
 			created_at TIMESTAMP NOT NULL
 		)`,
+		// The places one library scans. A library used to be bound to a single
+		// source; the row in `libraries` still names the first of these, so every
+		// caller that only knows about one source keeps working.
+		`CREATE TABLE IF NOT EXISTS library_sources (
+			library_id INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+			source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+			path TEXT NOT NULL DEFAULT '/',
+			PRIMARY KEY (library_id, source_id, path)
+		)`,
 		`CREATE TABLE IF NOT EXISTS items (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			library_id INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
@@ -186,7 +195,20 @@ func (s *Store) migrate() error {
 	if err := s.migrateFilesUnique(); err != nil {
 		return err
 	}
+	if err := s.migrateLibrarySources(); err != nil {
+		return err
+	}
 	return s.migrateUsers()
+}
+
+// migrateLibrarySources records where every existing library scans. A library
+// from before multi-source support has exactly one place, named by its own
+// source_id/path; after this its library_sources row says the same thing, and
+// the scan reads the table instead of the column.
+func (s *Store) migrateLibrarySources() error {
+	_, err := s.DB.Exec(`INSERT OR IGNORE INTO library_sources (library_id, source_id, path)
+		SELECT id, source_id, path FROM libraries WHERE source_id > 0 AND name NOT LIKE '__browse__%'`)
+	return err
 }
 
 // migrateUsers adds the columns a database from before multi-user support is
@@ -558,6 +580,24 @@ func (s *Store) UpdateSource(src *models.Source) error {
 }
 
 func (s *Store) DeleteSource(id int64) error {
+	// `libraries.source_id` still carries ON DELETE CASCADE, so a library whose
+	// *first* source goes would go with it. When the library scans somewhere else
+	// as well, point its own source at that place first: losing one of several
+	// sources is not losing the library. (A library that has no other source is
+	// still removed with it — that is the documented behaviour.)
+	if _, err := s.DB.Exec(`UPDATE libraries SET source_id = (
+			SELECT ls.source_id FROM library_sources ls
+			WHERE ls.library_id = libraries.id AND ls.source_id <> ?
+			ORDER BY ls.rowid LIMIT 1),
+		path = COALESCE((
+			SELECT ls.path FROM library_sources ls
+			WHERE ls.library_id = libraries.id AND ls.source_id <> ?
+			ORDER BY ls.rowid LIMIT 1), path)
+		WHERE source_id = ? AND EXISTS (
+			SELECT 1 FROM library_sources ls
+			WHERE ls.library_id = libraries.id AND ls.source_id <> ?)`, id, id, id, id); err != nil {
+		return err
+	}
 	_, err := s.DB.Exec(`DELETE FROM sources WHERE id=?`, id)
 	return err
 }
@@ -591,6 +631,8 @@ func (s *Store) Sources() ([]models.Source, error) {
 
 // ---------- libraries ----------
 
+// CreateLibrary inserts a library, and records where it scans. The first source
+// is the library's own source_id/path, which is what every older caller reads.
 func (s *Store) CreateLibrary(lib *models.Library) error {
 	res, err := s.DB.Exec(`INSERT INTO libraries (name, type, source_id, path, providers, created_at) VALUES (?,?,?,?,?,?)`,
 		lib.Name, lib.Type, lib.SourceID, lib.Path, lib.Providers, time.Now())
@@ -598,13 +640,105 @@ func (s *Store) CreateLibrary(lib *models.Library) error {
 		return err
 	}
 	lib.ID, _ = res.LastInsertId()
-	return nil
+	if lib.SourceID > 0 {
+		_, err = s.DB.Exec(`INSERT OR IGNORE INTO library_sources (library_id, source_id, path) VALUES (?,?,?)`,
+			lib.ID, lib.SourceID, lib.Path)
+	}
+	return err
 }
 
 func (s *Store) UpdateLibrary(lib *models.Library) error {
 	_, err := s.DB.Exec(`UPDATE libraries SET name=?, type=?, source_id=?, path=?, providers=? WHERE id=?`,
 		lib.Name, lib.Type, lib.SourceID, lib.Path, lib.Providers, lib.ID)
 	return err
+}
+
+// LibrarySources returns the places a library scans, in the order they were
+// added. A library from before this existed has its single source_id/path
+// recorded by the migration, so this is never empty for a usable library.
+func (s *Store) LibrarySources(libraryID int64) ([]models.LibrarySource, error) {
+	rows, err := s.DB.Query(`SELECT library_id, source_id, path FROM library_sources
+		WHERE library_id=? ORDER BY rowid`, libraryID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []models.LibrarySource
+	for rows.Next() {
+		var ls models.LibrarySource
+		if err := rows.Scan(&ls.LibraryID, &ls.SourceID, &ls.Path); err != nil {
+			return nil, err
+		}
+		out = append(out, ls)
+	}
+	return out, rows.Err()
+}
+
+// SetLibrarySources replaces a library's sources in one transaction, and keeps
+// the library's own source_id/path pointing at the first of them — that pair is
+// what a stale client, the home page and the browse scratchpad still read.
+func (s *Store) SetLibrarySources(libraryID int64, list []models.LibrarySource) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM library_sources WHERE library_id=?`, libraryID); err != nil {
+		return err
+	}
+	for _, ls := range list {
+		if ls.SourceID <= 0 {
+			continue
+		}
+		path := ls.Path
+		if strings.TrimSpace(path) == "" {
+			path = "/"
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO library_sources (library_id, source_id, path) VALUES (?,?,?)`,
+			libraryID, ls.SourceID, path); err != nil {
+			return err
+		}
+	}
+	if len(list) > 0 && list[0].SourceID > 0 {
+		path := list[0].Path
+		if strings.TrimSpace(path) == "" {
+			path = "/"
+		}
+		if _, err := tx.Exec(`UPDATE libraries SET source_id=?, path=? WHERE id=?`,
+			list[0].SourceID, path, libraryID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// attachSources fills in Library.Sources for a set of libraries with one query.
+func (s *Store) attachSources(libs []models.Library) {
+	if len(libs) == 0 {
+		return
+	}
+	byLib := map[int64][]models.LibrarySource{}
+	rows, err := s.DB.Query(`SELECT library_id, source_id, path FROM library_sources ORDER BY rowid`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ls models.LibrarySource
+		if err := rows.Scan(&ls.LibraryID, &ls.SourceID, &ls.Path); err != nil {
+			return
+		}
+		byLib[ls.LibraryID] = append(byLib[ls.LibraryID], ls)
+	}
+	for i := range libs {
+		libs[i].Sources = byLib[libs[i].ID]
+		// A library with no recorded sources still scans where its own row says.
+		if len(libs[i].Sources) == 0 && libs[i].SourceID > 0 {
+			libs[i].Sources = []models.LibrarySource{{
+				LibraryID: libs[i].ID, SourceID: libs[i].SourceID, Path: libs[i].Path,
+			}}
+		}
+	}
 }
 
 func (s *Store) DeleteLibrary(id int64) error {
@@ -619,6 +753,9 @@ func (s *Store) LibraryByID(id int64) (*models.Library, error) {
 	if err != nil {
 		return nil, err
 	}
+	libs := []models.Library{*lib}
+	s.attachSources(libs)
+	*lib = libs[0]
 	return lib, nil
 }
 
@@ -657,6 +794,7 @@ func (s *Store) Libraries() ([]models.Library, error) {
 		}
 		out = append(out, lib)
 	}
+	s.attachSources(out)
 	return out, rows.Err()
 }
 
@@ -714,12 +852,20 @@ func (s *Store) ItemChildren(parentID int64) ([]models.Item, error) {
 	return scanItems(rows)
 }
 
-func (s *Store) ItemsByLibrary(libraryID int64, typ string, search string, sort string, offset, limit int) ([]models.Item, int, error) {
+// ItemsByLibrary lists a library's items. rootsOnly keeps the shelf to what a
+// library actually shows — films and series — and leaves seasons and episodes to
+// the pages that drill into them. Without it a series library lists every episode
+// it holds by added_at, so a freshly scanned library opens on a wall of episodes
+// with its series buried behind them.
+func (s *Store) ItemsByLibrary(libraryID int64, typ string, search string, sort string, rootsOnly bool, offset, limit int) ([]models.Item, int, error) {
 	where := []string{"library_id = ?"}
 	args := []any{libraryID}
 	if typ != "" {
 		where = append(where, "type = ?")
 		args = append(args, typ)
+	}
+	if rootsOnly {
+		where = append(where, "parent_id IS NULL")
 	}
 	if search != "" {
 		where = append(where, "name LIKE ?")

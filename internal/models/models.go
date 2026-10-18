@@ -88,6 +88,19 @@ type Library struct {
 	Path      string    `json:"path"`
 	Providers string    `json:"providers"` // json array e.g. ["nfo","tmdb"]
 	CreatedAt time.Time `json:"created_at"`
+	// Sources is every place this library scans. SourceID/Path above stay in
+	// step with the first entry, so anything that only knows about one source
+	// keeps working; a library with no entries at all is read as that one.
+	Sources []LibrarySource `json:"sources,omitempty"`
+}
+
+// LibrarySource is one place a library scans: a storage source and the path
+// inside it. A library may hold several — one show can be split across two
+// drives, and a 番剧 library is often a cloud source plus a folder on the server.
+type LibrarySource struct {
+	LibraryID int64  `json:"library_id"`
+	SourceID  int64  `json:"source_id"`
+	Path      string `json:"path"`
 }
 
 type Item struct {

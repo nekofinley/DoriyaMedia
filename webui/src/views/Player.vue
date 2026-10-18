@@ -40,10 +40,73 @@ const nativeSubs = computed(() => !!play.value?.native_subtitles)
  * working when a stream starts part-way into the file.
  */
 const dmCanvas = ref(null)
+/* Bilibili's own 弹幕设置, in its order: the areas its panel names, the five
+ * font sizes, and the three types of comment. The stored numbers are what the
+ * renderer takes — a fraction of the canvas, a multiplier, seconds to cross. */
+const DM_AREAS = [
+  { value: 0.25, label: '1/4 屏' },
+  { value: 0.5, label: '半屏' },
+  { value: 0.75, label: '3/4 屏' },
+  { value: 1, label: '全屏' },
+]
+const DM_FONTS = [
+  { value: 0.7, label: '极小' },
+  { value: 0.85, label: '小' },
+  { value: 1, label: '中' },
+  { value: 1.2, label: '大' },
+  { value: 1.45, label: '极大' },
+]
+const DM_TYPES = [
+  { key: 'scroll', label: '滚动' },
+  { key: 'top', label: '顶部' },
+  { key: 'bottom', label: '底部' },
+]
+const DM_SPEED_MIN = 4
+const DM_SPEED_MAX = 14
+const DM_DEFAULTS = { opacity: 0.9, speed: 8, area: 0.5, font: 1 }
+
+/** A stored number, or the default when nothing valid was ever written. */
+function dmStored(key, fallback) {
+  const raw = localStorage.getItem(key)
+  const n = raw === null ? NaN : Number(raw)
+  return Number.isFinite(n) ? n : fallback
+}
+
+/** An older build saved the area as a free slider position, which no chip could
+ *  show as selected; snap it to the nearest choice the panel offers. */
+function dmNearest(value, options) {
+  let best = options[0].value
+  let gap = Infinity
+  for (const o of options) {
+    const d = Math.abs(o.value - value)
+    if (d < gap) { best = o.value; gap = d }
+  }
+  return best
+}
+
+/** One object so a toggle is one assignment; a type missing from storage (or an
+ *  unreadable value) is on, which is the state the panel starts in. */
+function dmStoredTypes() {
+  const on = { scroll: true, top: true, bottom: true }
+  try {
+    const raw = JSON.parse(localStorage.getItem('dm:dmTypes') || 'null')
+    if (raw && typeof raw === 'object') {
+      for (const t of DM_TYPES) if (raw[t.key] === false) on[t.key] = false
+    }
+  } catch { /* a value an older build wrote is simply ignored */ }
+  return on
+}
+
 const danmakuOn = ref(localStorage.getItem('dm:dmOn') !== '0')
-const danmakuOpacity = ref(Number(localStorage.getItem('dm:dmOpacity') ?? 0.9))
-const danmakuSpeed = ref(Number(localStorage.getItem('dm:dmSpeed') ?? 8))
-const danmakuArea = ref(Number(localStorage.getItem('dm:dmArea') ?? 0.6))
+const danmakuOpacity = ref(Math.min(1, Math.max(0, dmStored('dm:dmOpacity', DM_DEFAULTS.opacity))))
+const danmakuSpeed = ref(Math.min(DM_SPEED_MAX, Math.max(DM_SPEED_MIN, dmStored('dm:dmSpeed', DM_DEFAULTS.speed))))
+const danmakuArea = ref(dmNearest(dmStored('dm:dmArea', DM_DEFAULTS.area), DM_AREAS))
+const danmakuFont = ref(dmNearest(dmStored('dm:dmFont', DM_DEFAULTS.font), DM_FONTS))
+const danmakuTypes = ref(dmStoredTypes())
+const dmOpacityPct = computed(() => Math.round(danmakuOpacity.value * 100))
+/** The slider reads 慢 → 快, so its value is the crossing time reversed: the
+ *  right-hand end is the renderer's smallest number of seconds. */
+const dmSpeedSlider = computed(() => DM_SPEED_MIN + DM_SPEED_MAX - danmakuSpeed.value)
 const danmakuCount = ref(0)
 const danmakuFailed = ref(false)
 const danmakuUrl = computed(() => play.value?.danmaku_url || '')
@@ -875,14 +938,52 @@ function ensureDanmaku() {
   danmaku = createDanmaku(dmCanvas.value)
   danmaku.setOptions({
     opacity: danmakuOpacity.value, speed: danmakuSpeed.value, area: danmakuArea.value,
+    fontScale: danmakuFont.value, types: danmakuTypes.value,
   })
 }
 
 function applyDanmakuOptions() {
   danmaku?.setOptions({
-    opacity: danmakuOpacity.value, speed: danmakuSpeed.value, area: danmakuArea.value, force: true,
+    opacity: danmakuOpacity.value, speed: danmakuSpeed.value, area: danmakuArea.value,
+    fontScale: danmakuFont.value, types: danmakuTypes.value,
   })
   paintDanmaku()
+}
+
+function setDanmakuArea(value) {
+  danmakuArea.value = value
+  applyDanmakuOptions()
+}
+
+function setDanmakuFont(value) {
+  danmakuFont.value = value
+  applyDanmakuOptions()
+}
+
+function onDanmakuOpacity(e) {
+  danmakuOpacity.value = Number(e.target.value) / 100
+  applyDanmakuOptions()
+}
+
+function onDanmakuSpeed(e) {
+  // The track runs 慢 → 快; the renderer stores the seconds a comment takes to
+  // cross, so the two run opposite each other.
+  danmakuSpeed.value = DM_SPEED_MIN + DM_SPEED_MAX - Number(e.target.value)
+  applyDanmakuOptions()
+}
+
+function toggleDanmakuType(key) {
+  danmakuTypes.value = { ...danmakuTypes.value, [key]: !danmakuTypes.value[key] }
+  applyDanmakuOptions()
+}
+
+function resetDanmakuOptions() {
+  danmakuOpacity.value = DM_DEFAULTS.opacity
+  danmakuSpeed.value = DM_DEFAULTS.speed
+  danmakuArea.value = DM_DEFAULTS.area
+  danmakuFont.value = DM_DEFAULTS.font
+  danmakuTypes.value = { scroll: true, top: true, bottom: true }
+  applyDanmakuOptions()
 }
 
 /** One frame, for the moments when nothing is moving (a seek, a pause). */
@@ -957,11 +1058,18 @@ watch(danmakuUrl, (url) => {
   }
 })
 
-watch([danmakuOpacity, danmakuSpeed, danmakuArea], () => {
+watch([danmakuOpacity, danmakuSpeed, danmakuArea, danmakuFont], () => {
   localStorage.setItem('dm:dmOpacity', String(danmakuOpacity.value))
   localStorage.setItem('dm:dmSpeed', String(danmakuSpeed.value))
   localStorage.setItem('dm:dmArea', String(danmakuArea.value))
+  localStorage.setItem('dm:dmFont', String(danmakuFont.value))
 })
+
+// Toggles replace the object, so a shallow watch sees every change; deep is
+// harmless and keeps a future in-place edit persisted too.
+watch(danmakuTypes, () => {
+  localStorage.setItem('dm:dmTypes', JSON.stringify(danmakuTypes.value))
+}, { deep: true })
 
 function saveProgress() {  const v = videoEl.value
   if (!v || !v.duration || !isFinite(v.duration)) return
@@ -1863,20 +1971,68 @@ onBeforeUnmount(() => {
                     <AppIcon name="tv" :size="14" /> {{ danmakuOn ? '已开启' : '已关闭' }}
                   </button>
                 </div>
-                <template v-if="danmakuOn && danmakuReady">
-                  <label class="pn-range">
-                    <span>不透明度</span>
-                    <input v-model.number="danmakuOpacity" type="range" min="0.2" max="1" step="0.1" @input="applyDanmakuOptions" />
-                  </label>
-                  <label class="pn-range">
-                    <span>滚动速度</span>
-                    <input v-model.number="danmakuSpeed" type="range" min="4" max="14" step="1" @input="applyDanmakuOptions" />
-                  </label>
-                  <label class="pn-range">
-                    <span>显示区域</span>
-                    <input v-model.number="danmakuArea" type="range" min="0.25" max="1" step="0.05" @input="applyDanmakuOptions" />
-                  </label>
-                </template>
+                <!-- Bilibili's 弹幕设置: one row per choice. The options sit on a
+                     line rather than in the drawer's stacked column, which is
+                     the only new shape this panel needs. -->
+                <div v-if="danmakuOn && danmakuReady" class="dm-settings">
+                  <div class="pn-group">
+                    <div class="label">显示区域</div>
+                    <div class="pn-chips dm-opts">
+                      <button
+                        v-for="o in DM_AREAS" :key="o.value" class="chip sm"
+                        :class="{ on: danmakuArea === o.value }" @click="setDanmakuArea(o.value)"
+                      >{{ o.label }}</button>
+                    </div>
+                  </div>
+
+                  <div class="pn-group">
+                    <div class="label">不透明度 <span class="tiny">{{ dmOpacityPct }}%</span></div>
+                    <label class="pn-range">
+                      <input
+                        type="range" min="0" max="100" step="1" aria-label="弹幕不透明度"
+                        :value="dmOpacityPct" @input="onDanmakuOpacity"
+                      />
+                    </label>
+                  </div>
+
+                  <div class="pn-group">
+                    <div class="label">字号</div>
+                    <div class="pn-chips dm-opts">
+                      <button
+                        v-for="o in DM_FONTS" :key="o.value" class="chip sm"
+                        :class="{ on: danmakuFont === o.value }" @click="setDanmakuFont(o.value)"
+                      >{{ o.label }}</button>
+                    </div>
+                  </div>
+
+                  <div class="pn-group">
+                    <div class="label">速度</div>
+                    <label class="pn-range">
+                      <span class="tiny">慢</span>
+                      <input
+                        type="range" :min="DM_SPEED_MIN" :max="DM_SPEED_MAX" step="1" aria-label="弹幕速度"
+                        :value="dmSpeedSlider" @input="onDanmakuSpeed"
+                      />
+                      <span class="tiny">快</span>
+                    </label>
+                  </div>
+
+                  <div class="pn-group">
+                    <div class="label">弹幕类型</div>
+                    <div class="pn-chips dm-opts">
+                      <button
+                        v-for="t in DM_TYPES" :key="t.key" class="chip sm"
+                        :class="{ on: danmakuTypes[t.key] }" @click="toggleDanmakuType(t.key)"
+                      >{{ t.label }}</button>
+                    </div>
+                  </div>
+
+                  <div class="pn-group">
+                    <div class="pn-chips dm-opts">
+                      <button class="chip sm" @click="resetDanmakuOptions">恢复默认</button>
+                    </div>
+                  </div>
+                </div>
               </div>
 
               <div v-if="play?.reason" class="pn-reason tiny">
@@ -2228,6 +2384,15 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 .pn-range { display: flex; align-items: center; gap: 10px; width: 100%; max-width: 320px; }
 .pn-range > span { flex: 0 0 62px; font-size: var(--fs-12); color: var(--text-3); }
 .pn-range > input[type='range'] { flex: 1; min-width: 0; accent-color: var(--accent, #ff5c8a); }
+
+/* 弹幕设置: bilibili's panel as one block in the drawer. Its four or five
+   choices per row do not fit the drawer's stacked .pn-chips; a wrapping row is
+   the one shape those groups need that the drawer does not already have. The
+   ranges here carry their own endpoints and value, so those spans size to their
+   text instead of taking the 62px label column. */
+.dm-settings { display: flex; flex-direction: column; gap: 10px; width: 100%; }
+.pn-chips.dm-opts { flex-direction: row; flex-wrap: wrap; gap: 6px; }
+.dm-settings .pn-range > span { flex: 0 0 auto; }
 
 
 /* 弹幕层: above the picture, below every control (which start at 4). */

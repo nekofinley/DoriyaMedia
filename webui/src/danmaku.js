@@ -13,9 +13,29 @@ const FONT_STACK = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto San
 const FIXED_SECONDS = 4 // how long a top/bottom comment stays on screen
 const LANE_GAP = 1.45 // lane height as a multiple of the font size
 
+// The 弹幕类型 switches, as bits. One test per comment emitted is cheaper than
+// walking three booleans, and it runs on the emit path, not every frame.
+const KIND_SCROLL = 1
+const KIND_TOP = 2
+const KIND_BOTTOM = 4
+const KIND_ALL = KIND_SCROLL | KIND_TOP | KIND_BOTTOM
+
+function kindOf(c) {
+  // 4 and 5 are the pinned bottom and top comments; everything else (scroll,
+  // reverse, advanced) travels across the picture and shares the lanes.
+  return c.mode === 5 ? KIND_TOP : c.mode === 4 ? KIND_BOTTOM : KIND_SCROLL
+}
+
+// Anything not explicitly off is on, so a partial object is a valid setting.
+function maskOf(types) {
+  return (types.scroll === false ? 0 : KIND_SCROLL)
+    | (types.top === false ? 0 : KIND_TOP)
+    | (types.bottom === false ? 0 : KIND_BOTTOM)
+}
+
 export function createDanmaku(canvas) {
   const ctx = canvas.getContext('2d')
-  const opt = { opacity: 1, speed: 8, area: 0.6, fontScale: 1 }
+  const opt = { opacity: 1, speed: 8, area: 0.6, fontScale: 1, mask: KIND_ALL }
 
   let comments = [] // sorted by time
   let cursor = 0 // next comment to emit
@@ -44,9 +64,14 @@ export function createDanmaku(canvas) {
     // Bilibili publishes sizes against a 25px baseline, and its own player draws
     // them at about that size on a desktop stage; on a phone that is far too big
     // for the picture, so the layer scales with the canvas instead.
+    const prevFont = fontSize
     fontSize = Math.max(13, Math.min(25, Math.round(h * 0.05))) * opt.fontScale
     laneH = Math.round(fontSize * LANE_GAP)
     laneCount = Math.max(1, Math.floor((H * opt.area) / laneH))
+    // Text width is measured against the font size, so a cached width belongs to
+    // the size it was measured at. A font change is a user action; clearing the
+    // cache costs one measure per comment on the next emit, not per frame.
+    if (fontSize !== prevFont) for (const c of comments) c._w = undefined
     reset(lastTime < 0 ? 0 : lastTime)
   }
 
@@ -98,6 +123,9 @@ export function createDanmaku(canvas) {
   }
 
   function emit(c, t) {
+    // A type that is switched off is skipped before it can claim a lane: a
+    // comment nobody can see must not push the visible ones aside.
+    if (!(opt.mask & kindOf(c))) return
     if (c.mode === 4 || c.mode === 5) {
       emitFixed(c, t)
       return
@@ -148,6 +176,10 @@ export function createDanmaku(canvas) {
     ctx.globalAlpha = opt.opacity
     ctx.textBaseline = 'top'
     ctx.lineJoin = 'round'
+    // The area setting is the band the layer may use, measured from the top.
+    // Bottom comments sit on the bottom of that band rather than of the picture:
+    // with 显示区域 at 1/4 屏 the whole layer is meant to stay in the top quarter.
+    const areaH = H * opt.area
     const keep = []
     for (const a of active) {
       const c = a.c
@@ -162,7 +194,7 @@ export function createDanmaku(canvas) {
         const idx = Math.min(a.slot, Math.max(0, slots - 1))
         x = (W - a.w) / 2
         y = c.mode === 4
-          ? H - (idx + 1) * laneH
+          ? areaH - (idx + 1) * laneH
           : idx * laneH
         if (t > (c.mode === 4 ? bottomLanes[idx] : topLanes[idx])) continue
       } else {
@@ -196,10 +228,28 @@ export function createDanmaku(canvas) {
       const speedChanged = next.speed !== undefined && next.speed !== opt.speed
       const areaChanged = next.area !== undefined && next.area !== opt.area
       const scaleChanged = next.fontScale !== undefined && next.fontScale !== opt.fontScale
+      let typesChanged = false
+      if (next.types !== undefined) {
+        const mask = maskOf(next.types)
+        if (mask !== opt.mask) {
+          opt.mask = mask
+          typesChanged = true
+        }
+      }
       if (next.opacity !== undefined) opt.opacity = next.opacity
       if (next.speed !== undefined) opt.speed = Math.max(3, next.speed)
       if (next.area !== undefined) opt.area = next.area
       if (next.fontScale !== undefined) opt.fontScale = next.fontScale
+      if (typesChanged) {
+        // Drop what a switched-off type already had on screen, and forget its
+        // lanes, so it cannot hold a slot against a type that is still on. The
+        // comments themselves are kept: later ones of that type come back
+        // without another fetch.
+        active = active.filter((a) => (opt.mask & kindOf(a.c)) !== 0)
+        if (!(opt.mask & KIND_TOP)) topLanes = []
+        if (!(opt.mask & KIND_BOTTOM)) bottomLanes = []
+        if (!(opt.mask & KIND_SCROLL)) laneFreeAt = new Array(laneCount).fill(0)
+      }
       if (speedChanged || areaChanged || scaleChanged || next.force) resize()
     },
     resize,

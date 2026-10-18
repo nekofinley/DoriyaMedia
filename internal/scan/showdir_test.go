@@ -249,6 +249,32 @@ func TestFranchisePromotion(t *testing.T) {
 			childCount: map[string]int{"/public/Cartoon/青之驱魔师": 3},
 			wantShow:   "/public/Cartoon/青之驱魔师", wantSeason: 1, wantLabel: "第 1 季",
 		},
+		{
+			// B 站的番剧树:系列目录里挂着这部剧的每一个季度。方括号里是路径用
+			// 的 id,既要能反查出下一层,又不能出现在界面上。
+			name:       "bilibili 系列/季度:季度名不带方括号标记",
+			libPath:    "/热门番剧",
+			dir:        "/热门番剧/鬼灭之刃 [series 26801]/游郭篇 [season 39433]",
+			file:       "/热门番剧/鬼灭之刃 [series 26801]/游郭篇 [season 39433]/鬼灭之刃 第1话 残酷 [ep267851].mp4",
+			childCount: map[string]int{"/热门番剧/鬼灭之刃 [series 26801]": 15},
+			wantShow:   "/热门番剧/鬼灭之刃 [series 26801]", wantSeason: 0, wantLabel: "游郭篇",
+		},
+		{
+			name:       "bilibili 季度自己就叫第一季/第二季",
+			libPath:    "/热门番剧",
+			dir:        "/热门番剧/间谍过家家 [series 41410]/第二季 [season 46085]",
+			file:       "/热门番剧/间谍过家家 [series 41410]/第二季 [season 46085]/间谍过家家 第1话 [ep1].mp4",
+			childCount: map[string]int{"/热门番剧/间谍过家家 [series 41410]": 7},
+			wantShow:   "/热门番剧/间谍过家家 [series 41410]", wantSeason: 2, wantLabel: "第 2 季",
+		},
+		{
+			name:       "bilibili 只有一季的番:季度目录自己当剧",
+			libPath:    "/热门番剧",
+			dir:        "/热门番剧/冰菓 [series 3398]/冰菓 [season 3398]",
+			file:       "/热门番剧/冰菓 [series 3398]/冰菓 [season 3398]/冰菓 第1话 古典部系列 [ep1].mp4",
+			childCount: map[string]int{"/热门番剧/冰菓 [series 3398]": 1},
+			wantShow:   "/热门番剧/冰菓 [series 3398]/冰菓 [season 3398]", wantSeason: 1, wantLabel: "第 1 季",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

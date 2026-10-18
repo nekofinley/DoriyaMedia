@@ -24,6 +24,12 @@ type fileRec struct {
 	Size  int64
 	MTime int64
 	Strm  bool
+	// SourceID and Root are where this file came from. A library may scan more
+	// than one source, so neither can be read off the library: the file's own row
+	// has to carry them, or two sources would be organised as if they were one
+	// tree and the wrong rows would be deleted on the next scan.
+	SourceID int64
+	Root     string
 }
 
 type Scanner struct {
@@ -111,15 +117,11 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 		prog.AddEvent("warn", msg)
 	}
 
-	src, err := sc.Store.SourceByID(lib.SourceID)
-	if err != nil {
-		fail("源不存在: " + err.Error())
-		return err
-	}
-	drv, err := source.NewDriver(src)
-	if err != nil {
-		fail("源错误: " + err.Error())
-		return err
+	// Where this library scans. A library may hold several places; each is walked
+	// with its own driver, and every file found keeps the source it came from.
+	places, err := sc.Store.LibrarySources(lib.ID)
+	if err != nil || len(places) == 0 {
+		places = []models.LibrarySource{{LibraryID: lib.ID, SourceID: lib.SourceID, Path: lib.Path}}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -137,7 +139,7 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 	// bury everything else on a large library, so the feed takes every eighth
 	// plus whatever is current — enough to see it moving.
 	var walkSeen int
-	files, listings, err := walkTree(ctx, drv, lib.Path, sc.Cfg.ScanConcurrency, func(dir string, dirs, found, errs int64, firstErr string) {
+	onDir := func(dir string, dirs, found, errs int64, firstErr string) {
 		walkSeen++
 		prog.Update(func(st *models.ScanState) {
 			st.Current = dir
@@ -149,17 +151,57 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 		if walkSeen%8 == 0 {
 			prog.AddEvent("dir", dir)
 		}
-	})
+	}
+
+	var files []fileRec
+	listings := map[string][]source.Entry{}
+	// walked records the sources this scan read to the end. Cleanup only touches
+	// those: a source that could not be listed is not a source whose files are
+	// gone, and deleting them would throw away the library rows and the watch
+	// progress attached to them.
+	walked := map[int64]bool{}
+	current := map[int64]bool{}
+	var srcErrs []string
+	for _, place := range places {
+		current[place.SourceID] = true
+		if ctx.Err() != nil {
+			break
+		}
+		src, serr := sc.Store.SourceByID(place.SourceID)
+		if serr != nil {
+			srcErrs = append(srcErrs, fmt.Sprintf("源 %d: %v", place.SourceID, serr))
+			continue
+		}
+		drv, derr := source.NewDriver(src)
+		if derr != nil {
+			srcErrs = append(srcErrs, fmt.Sprintf("%s: %v", src.Name, derr))
+			continue
+		}
+		prog.AddEvent("info", fmt.Sprintf("扫描 %s %s", src.Name, place.Path))
+		f, l, werr := walkTree(ctx, drv, place.Path, sc.Cfg.ScanConcurrency, place.SourceID, onDir)
+		for k, v := range l {
+			listings[k] = v
+		}
+		files = append(files, f...)
+		if werr == nil {
+			walked[place.SourceID] = true
+		} else {
+			srcErrs = append(srcErrs, fmt.Sprintf("%s: %v", src.Name, werr))
+		}
+	}
 	if ctx.Err() != nil {
 		prog.Update(func(st *models.ScanState) { st.Phase = "error" })
 		fail("扫描已取消")
 		finish()
 		return ctx.Err()
 	}
-	if err != nil && len(files) == 0 {
-		fail("遍历失败: " + err.Error())
+	if len(files) == 0 && len(srcErrs) > 0 {
+		fail("遍历失败: " + strings.Join(srcErrs, "; "))
 		finish()
-		return err
+		return fmt.Errorf("scan: %s", strings.Join(srcErrs, "; "))
+	}
+	if len(srcErrs) > 0 {
+		prog.AddEvent("warn", "部分源读取失败(不清理这些源): "+strings.Join(srcErrs, "; "))
 	}
 
 	prog.Update(func(st *models.ScanState) {
@@ -169,7 +211,7 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 		st.Current = fmt.Sprintf("发现 %d 个视频文件,正在整理…", len(files))
 	})
 	prog.AddEvent("file", fmt.Sprintf("发现 %d 个视频文件", len(files)))
-	if err := sc.organize(lib, files, prog); err != nil {
+	if err := sc.organize(lib, files, prog, current, walked); err != nil {
 		fail("整理失败: " + err.Error())
 		finish()
 		return err
@@ -211,10 +253,15 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 
 const maxDepth = 8
 
-func walkTree(ctx context.Context, drv source.Driver, root string, concurrency int, onDir func(dir string, dirs, files, errs int64, firstErr string)) ([]fileRec, map[string][]source.Entry, error) {
+func walkTree(ctx context.Context, drv source.Driver, root string, concurrency int, srcID int64, onDir func(dir string, dirs, files, errs int64, firstErr string)) ([]fileRec, map[string][]source.Entry, error) {
 	if concurrency <= 0 {
 		concurrency = 4
 	}
+	// Listings are shared with the identify pass so it does not re-list every
+	// directory over the network. They are keyed per source: two sources in one
+	// library can hold the same directory path, and a listing from the wrong one
+	// would have artwork and nfo looked up in a place the file is not.
+	dirKey := func(dir string) string { return fmt.Sprintf("%d|%s", srcID, dir) }
 	sem := make(chan struct{}, concurrency)
 	var mu sync.Mutex
 	var files []fileRec
@@ -261,7 +308,7 @@ func walkTree(ctx context.Context, drv source.Driver, root string, concurrency i
 			return
 		}
 		mu.Lock()
-		listings[dir] = entries
+		listings[dirKey(dir)] = entries
 		mu.Unlock()
 		for _, e := range entries {
 			if SkipEntry(e.Name) {
@@ -281,7 +328,7 @@ func walkTree(ctx context.Context, drv source.Driver, root string, concurrency i
 			if strings.HasSuffix(low, ".strm") {
 				if url := readStrm(ctx, drv, e.Path); url != "" {
 					mu.Lock()
-					files = append(files, fileRec{Path: url, Dir: dir, Strm: true})
+					files = append(files, fileRec{Path: url, Dir: dir, Strm: true, SourceID: srcID, Root: root})
 					mu.Unlock()
 					filesFound.Add(1)
 				}
@@ -294,7 +341,7 @@ func walkTree(ctx context.Context, drv source.Driver, root string, concurrency i
 				continue // skip tiny junk
 			}
 			mu.Lock()
-			files = append(files, fileRec{Path: e.Path, Dir: dir, Size: e.Size, MTime: e.MTime})
+			files = append(files, fileRec{Path: e.Path, Dir: dir, Size: e.Size, MTime: e.MTime, SourceID: srcID, Root: root})
 			mu.Unlock()
 			filesFound.Add(1)
 		}
@@ -340,7 +387,7 @@ type movieGroup struct {
 	Files []fileRec
 }
 
-func (sc *Scanner) organize(lib *models.Library, files []fileRec, prog *models.ScanProgress) error {
+func (sc *Scanner) organize(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked map[int64]bool) error {
 	// The walk runs for minutes without touching the database, and the first
 	// statement after it is the one that fails. Ping before any real work, so a
 	// connection whose handle went stale during that idle stretch is replaced on
@@ -351,16 +398,16 @@ func (sc *Scanner) organize(lib *models.Library, files []fileRec, prog *models.S
 
 	switch lib.Type {
 	case "series":
-		err := sc.organizeSeries(lib, files, prog)
+		err := sc.organizeSeries(lib, files, prog, current, walked)
 		return err
 	default:
-		err := sc.organizeMovies(lib, files, prog)
+		err := sc.organizeMovies(lib, files, prog, current, walked)
 		return err
 	}
 }
 
-func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *models.ScanProgress) error {
-	existing, _, err := sc.Store.ItemsByLibrary(lib.ID, "movie", "", "", 0, 1000000)
+func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked map[int64]bool) error {
+	existing, _, err := sc.Store.ItemsByLibrary(lib.ID, "movie", "", "", false, 0, 1000000)
 	if err != nil {
 		log.Printf("organize: load movies failed: %v", err)
 		return err
@@ -383,7 +430,7 @@ func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *mo
 	}
 
 	for _, fr := range files {
-		if fr.Strm || fr.Path == fr.Dir || fr.Dir == strings.TrimSuffix(lib.Path, "/") {
+		if fr.Strm || fr.Path == fr.Dir || fr.Dir == strings.TrimSuffix(fr.Root, "/") {
 			// flat file: parse by filename
 			p := ParseName(baseName(fr.Path))
 			add(groupKey(p), orDefault(p.Title, baseName(fr.Path)), p.Year, fr)
@@ -418,7 +465,7 @@ func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *mo
 		}
 		for _, fr := range g.Files {
 			if _, err := sc.Store.UpsertFile(&models.MediaFile{
-				ItemID: itemID, SourceID: lib.SourceID, Path: fr.Path, Size: fr.Size, MTime: fr.MTime,
+				ItemID: itemID, SourceID: fr.SourceID, Path: fr.Path, Size: fr.Size, MTime: fr.MTime,
 			}); err != nil {
 				return err
 			}
@@ -429,7 +476,7 @@ func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *mo
 		})
 		prog.AddEvent("show", fmt.Sprintf("%s%s", g.Title, yearSuffix(g.Year)))
 	}
-	return sc.cleanup(lib, files)
+	return sc.cleanup(lib, files, current, walked)
 }
 
 // yearSuffix renders " (2019)" for the feed, empty when the year is unknown.
@@ -532,7 +579,7 @@ func planShow(childCount map[string]int, libPath, dir, filePath string, parsedSe
 			strings.TrimSuffix(parent, "/") != strings.TrimSuffix(libPath, "/") &&
 			!isTechDir(baseName(parent)) && !IsCategoryDir(baseName(parent)) &&
 			childCount[parent] >= 2 {
-			subLabel = baseName(showDir)
+			subLabel = DisplayName(baseName(showDir))
 			showDir = parent
 		}
 	}
@@ -554,7 +601,7 @@ func planShow(childCount map[string]int, libPath, dir, filePath string, parsedSe
 	}
 }
 
-func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *models.ScanProgress) error {
+func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked map[int64]bool) error {
 	idx := &seriesIndex{
 		shows:       map[string]int64{},
 		seasons:     map[string]int64{},
@@ -564,14 +611,14 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 		loaded:      map[int64]bool{},
 	}
 
-	shows, _, err := sc.Store.ItemsByLibrary(lib.ID, "show", "", "", 0, 100000)
+	shows, _, err := sc.Store.ItemsByLibrary(lib.ID, "show", "", "", false, 0, 100000)
 	if err != nil {
 		return err
 	}
 	for _, it := range shows {
 		idx.shows[NormalizeKey(it.Name)] = it.ID
 	}
-	seasons, _, err := sc.Store.ItemsByLibrary(lib.ID, "season", "", "", 0, 200000)
+	seasons, _, err := sc.Store.ItemsByLibrary(lib.ID, "season", "", "", false, 0, 200000)
 	if err != nil {
 		return err
 	}
@@ -644,7 +691,7 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 		// Show title: prefer the show DIRECTORY (the season-dir's parent), so
 		// "风夏/Season 1/EP01.mkv" or "风夏/01.mkv" both resolve to show "风夏".
 		// Only fall back to the filename when the file sits at the library root.
-		showDir, season, seasonName := planShow(childCount, lib.Path, fr.Dir, fr.Path, p.Season)
+		showDir, season, seasonName := planShow(childCount, fr.Root, fr.Dir, fr.Path, p.Season)
 		showTitle := ""
 		if showDir != "" {
 			dp := ParseName(baseName(showDir))
@@ -729,7 +776,7 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 		}
 
 		if _, err := sc.Store.UpsertFile(&models.MediaFile{
-			ItemID: epID, SourceID: lib.SourceID, Path: fr.Path, Size: fr.Size, MTime: fr.MTime,
+			ItemID: epID, SourceID: fr.SourceID, Path: fr.Path, Size: fr.Size, MTime: fr.MTime,
 		}); err != nil {
 			log.Printf("organize: UpsertFile failed (done=%d) path=%q: %v", progDone(prog), fr.Path, err)
 			return err
@@ -741,7 +788,7 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 		prog.AddEvent("episode", fmt.Sprintf("%s S%02dE%02d", showTitle, season, ep))
 
 	}
-	if err := sc.cleanup(lib, files); err != nil {
+	if err := sc.cleanup(lib, files, current, walked); err != nil {
 		log.Printf("organize: cleanup failed (done=%d): %v", progDone(prog), err)
 		return err
 	}
@@ -755,24 +802,45 @@ func progDone(prog *models.ScanProgress) int {
 }
 
 // cleanup deletes files no longer present and prunes childless items.
-func (sc *Scanner) cleanup(lib *models.Library, files []fileRec) error {
+// cleanup deletes the files a library no longer holds, and the items left empty.
+//
+// A file is identified by the source it came from *and* its path: a library may
+// scan several sources, and the same path in two of them is two different files.
+//
+// current is the set of sources this library scans now, walked the set this scan
+// managed to read, and the difference between them is the whole point:
+//
+//   - a file whose source is no longer one of the library's is deleted: the
+//     library stopped scanning there, so those rows belong to nobody;
+//   - a file whose source *is* one of them but was not read this time (a listing
+//     that failed, a drive that was asleep) is left alone — not being able to
+//     read a source is not evidence that its files are gone, and deleting them
+//     would take the rows and the watch progress attached to them with it.
+func (sc *Scanner) cleanup(lib *models.Library, files []fileRec, current, walked map[int64]bool) error {
 	seen := map[string]bool{}
 	for _, fr := range files {
-		seen[fr.Path] = true
+		seen[fileSourceKey(fr.SourceID, fr.Path)] = true
 	}
-	rows, err := sc.Store.DB.Query(`SELECT f.id, f.path FROM files f JOIN items i ON i.id = f.item_id WHERE i.library_id = ?`, lib.ID)
+	rows, err := sc.Store.DB.Query(`SELECT f.id, f.source_id, f.path FROM files f JOIN items i ON i.id = f.item_id WHERE i.library_id = ?`, lib.ID)
 	if err != nil {
 		return err
 	}
 	var gone []int64
 	for rows.Next() {
-		var id int64
+		var id, srcID int64
 		var p string
-		if err := rows.Scan(&id, &p); err != nil {
+		if err := rows.Scan(&id, &srcID, &p); err != nil {
 			rows.Close()
 			return err
 		}
-		if !seen[p] {
+		if !current[srcID] {
+			gone = append(gone, id)
+			continue
+		}
+		if !walked[srcID] {
+			continue
+		}
+		if !seen[fileSourceKey(srcID, p)] {
 			gone = append(gone, id)
 		}
 	}
@@ -803,6 +871,11 @@ func (sc *Scanner) cleanup(lib *models.Library, files []fileRec) error {
 	return nil
 }
 
+// fileSourceKey identifies a file within a library: the same path on two sources
+// is two different files.
+func fileSourceKey(sourceID int64, path string) string {
+	return fmt.Sprintf("%d|%s", sourceID, path)
+}
 func groupKey(p Parsed) string {
 	return NormalizeKey(fmt.Sprintf("%s|%d", p.Title, p.Year))
 }

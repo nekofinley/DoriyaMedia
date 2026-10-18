@@ -264,6 +264,17 @@ type pgcSection struct {
 	Episodes []pgcEpisode `json:"episodes"`
 }
 
+// pgcSeasonRef is one entry of a series' season list: bilibili's own name for
+// that 季度 and its id. The list is the same whoever you ask, and it is ordered,
+// with the series' first season first — which makes its head a stable key for
+// the whole franchise.
+type pgcSeasonRef struct {
+	SeasonID    int64  `json:"season_id"`
+	SeasonTitle string `json:"season_title"` // 第一季 / 游郭篇 / 立志篇(中配)
+	Badge       string `json:"badge"`
+	SeasonType  int    `json:"season_type"` // 1 = 番剧, 2 = 剧场版
+}
+
 type pgcSeason struct {
 	SeasonID int64        `json:"season_id"`
 	Title    string       `json:"title"`
@@ -271,7 +282,9 @@ type pgcSeason struct {
 	Total    int          `json:"total"`
 	Episodes []pgcEpisode `json:"episodes"`
 	Section  []pgcSection `json:"section"`
-	Rating   struct {
+	// Seasons is every 季度 of this series, this one included.
+	Seasons []pgcSeasonRef `json:"seasons"`
+	Rating  struct {
 		Score float64 `json:"score"`
 	} `json:"rating"`
 }
@@ -310,12 +323,24 @@ type pgcPlayInfo struct {
 }
 
 // ---------- virtual tree ----------
+//
+// Two levels above the episodes, because bilibili has two:
+//
+//	/<系列> [series 26801]/<季度> [season 39433]/<剧集> [ep267851].mp4
+//
+// A 番剧's quarterly sequels — 立志篇, 游郭篇, 刀匠村篇 — are separate seasons on
+// bilibili, published as separate entries with their own episode numbering. Left
+// flat they would arrive in a media library as so many unrelated shows; nested
+// like this the scanner reads them the way it reads any other series, with the
+// 系列 as the show and each 季度 as one of its seasons (its 命名季 support, which
+// exists for exactly this: 物语系列/{化物语,伪物语}).
+//
+// The brackets are the whole state: a path alone resolves the next level, so the
+// tree survives a restart, and the scanner's name parser drops bracketed suffixes,
+// so none of it reaches the UI as part of a title.
 
-// Season directories carry their id in brackets. That keeps the tree stateless:
-// a path is all the driver needs to resolve an episode again after a restart,
-// and the bracket is dropped by the scanner's name parser, so it never reaches
-// the UI as part of a title.
-var reSeasonDir = regexp.MustCompile(`\[(\d+)\]$`)
+var reSeriesDir = regexp.MustCompile(`\[series (\d+)\]$`)
+var reSeasonDir = regexp.MustCompile(`\[season (\d+)\]$`)
 var reEpisodeFile = regexp.MustCompile(`\[ep(\d+)\]\.mp4$`)
 
 // dirtyPathChars are the ones a title may contain and a path may not.
@@ -336,15 +361,22 @@ func biliClean(s string) string {
 	return s
 }
 
-// seasonDir is the directory name of one 番剧. The id in brackets is what makes
-// the tree stateless: a path alone is enough to resolve the season again.
-func seasonDir(title string, seasonID int64) string {
-	return fmt.Sprintf("%s [%d]", biliClean(title), seasonID)
+// seriesDir names a 番剧 series — the whole franchise, all of its 季度 under it.
+func seriesDir(title string, key int64) string {
+	return fmt.Sprintf("%s [series %d]", biliClean(title), key)
 }
 
-func episodeFileName(season string, ep *pgcEpisode, sectionTitle string) string {
+// seasonDirOf names one 季度 inside a series. Bilibili's own name for it is the
+// best label there is: 第一季 / 第二季 / 游郭篇 / 刀匠村篇 — and the numbered ones
+// are then read as seasons by the scanner's own season parser, so 第二季 lands in
+// season 2 without any mapping table.
+func seasonDirOf(title string, seasonID int64) string {
+	return fmt.Sprintf("%s [season %d]", biliClean(title), seasonID)
+}
+
+func episodeFileName(series string, ep *pgcEpisode, sectionTitle string) string {
 	num := strings.TrimSpace(ep.Title)
-	name := biliClean(season)
+	name := biliClean(series)
 	switch {
 	case sectionTitle != "":
 		name += " " + biliClean(sectionTitle+num)
@@ -369,8 +401,8 @@ func lastSegment(p string) string {
 	return p
 }
 
-func seasonIDFromDir(name string) (int64, bool) {
-	m := reSeasonDir.FindStringSubmatch(name)
+func dirID(re *regexp.Regexp, name string) (int64, bool) {
+	m := re.FindStringSubmatch(name)
 	if m == nil {
 		return 0, false
 	}
@@ -381,6 +413,92 @@ func seasonIDFromDir(name string) (int64, bool) {
 	return id, true
 }
 
+func seriesKeyFromDir(name string) (int64, bool) { return dirID(reSeriesDir, name) }
+func seasonKeyFromDir(name string) (int64, bool) { return dirID(reSeasonDir, name) }
+
+// franchiseTitle works out what a series is called from one of its seasons.
+//
+// Bilibili does not state the series' name: it gives the season's own title
+// ("鬼灭之刃 柱训练篇") and, in the series list, what that season is within it
+// ("柱训练篇"). One minus the other is the series, and every season of a series
+// computes the same answer — which is what lets a season found through the hot
+// index land in the same directory as the same season found through 我的追番.
+func franchiseTitle(title, seasonTitle string) string {
+	t := strings.TrimSpace(title)
+	st := strings.TrimSpace(seasonTitle)
+	if st != "" && t != st && strings.HasSuffix(t, st) {
+		if base := strings.TrimSpace(strings.TrimSuffix(t, st)); base != "" {
+			return base
+		}
+	}
+	return t
+}
+
+// seriesName is what a series is called, always derived from its *first* season.
+//
+// Deriving it from whichever 季度 you arrived through would name one series
+// several ways — 工作细胞 through its movie came out as 工作细胞：细胞大作战 —
+// and a directory that changes its name between two scans reads to the scanner
+// as a different show: the old one is deleted, and the watch progress with it.
+func (d *BilibiliDriver) seriesName(ctx context.Context, key int64) (string, error) {
+	v, err := biliCached(fmt.Sprintf("series-name:%d", key), 6*time.Hour, func() (any, error) {
+		s, err := d.season(ctx, key)
+		if err != nil {
+			return "", err
+		}
+		label := ""
+		for _, ref := range s.Seasons {
+			if ref.SeasonID == key {
+				label = ref.SeasonTitle
+				break
+			}
+		}
+		name := strings.TrimSpace(franchiseTitle(s.Title, label))
+		// A series title that lost its tail to the split can end in punctuation:
+		// 小车队大救援：安全先锋队 minus 安全先锋队 leaves 小车队大救援：.
+		name = strings.Trim(strings.TrimSpace(name), "：:·-—– \t")
+		if name == "" {
+			return strings.TrimSpace(s.Title), nil
+		}
+		return name, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	name, _ := v.(string)
+	return name, nil
+}
+
+// franchiseOf returns the key and name of the series a season belongs to. The
+// key is the first season in bilibili's own series list: the same for every
+// sibling, and enough to list the whole series again from the path alone.
+func (d *BilibiliDriver) franchiseOf(ctx context.Context, seasonID int64) (int64, string, error) {
+	s, err := d.season(ctx, seasonID)
+	if err != nil {
+		return 0, "", err
+	}
+	if len(s.Seasons) == 0 {
+		// A season with no series list is a series of one.
+		return s.SeasonID, strings.TrimSpace(s.Title), nil
+	}
+	key := s.Seasons[0].SeasonID
+	if key == 0 {
+		key = s.SeasonID
+	}
+	name, err := d.seriesName(ctx, key)
+	if err != nil || name == "" {
+		// Still list it — as a series named after this season rather than none.
+		for _, ref := range s.Seasons {
+			if ref.SeasonID == s.SeasonID {
+				return key, franchiseTitle(s.Title, ref.SeasonTitle), nil
+			}
+		}
+		return key, strings.TrimSpace(s.Title), nil
+	}
+	return key, name, nil
+}
+
+// episodeIDFromPath p is a driver path of an episode file.
 func episodeIDFromPath(p string) (int64, bool) {
 	m := reEpisodeFile.FindStringSubmatch(p)
 	if m == nil {
@@ -398,10 +516,15 @@ func (d *BilibiliDriver) List(ctx context.Context, dir string) ([]Entry, error) 
 	if dir == "" {
 		dir = "/"
 	}
-	// Any directory whose own name carries a season id lists that season's
-	// episodes, wherever it hangs: 最近更新/10-19/…, 我的追番/…, 热门番剧/….
-	if id, ok := seasonIDFromDir(lastSegment(dir)); ok {
+	// A directory names what it is in its own brackets, so a path is all the
+	// state there is: a season directory lists its episodes, a series directory
+	// lists its seasons, wherever either of them hangs.
+	last := lastSegment(dir)
+	if id, ok := seasonKeyFromDir(last); ok {
 		return d.episodeEntries(ctx, dir, id)
+	}
+	if key, ok := seriesKeyFromDir(last); ok {
+		return d.seasonEntries(ctx, dir, key)
 	}
 	switch strings.TrimSuffix(dir, "/") {
 	case "", "/":
@@ -414,15 +537,15 @@ func (d *BilibiliDriver) List(ctx context.Context, dir string) ([]Entry, error) 
 	return nil, fmt.Errorf("bilibili: 未知目录 %s", dir)
 }
 
-// rootEntries is a flat list of 番剧: what the account follows, then what is
-// airing, then the most followed.
+// rootEntries lists 番剧 series: what the account follows, then what is airing,
+// then the most followed.
 //
-// Flat on purpose. This tree is also what a 媒体库 pointed at this source scans,
+// Every directory here is a whole series rather than a single 季度, and that is
+// on purpose twice over. This tree is what a 媒体库 pointed at this source scans,
 // and the scanner turns every directory under the library root into one show — so
 // a structural directory (「最近更新」, a day, a category) would become a show of
-// its own and bury the 番剧 under it. Everything below the root is therefore a
-// 番剧 and nothing else; the groupings that are worth having live at their own
-// paths (/热门番剧, /我的追番), which a library can also point at directly.
+// its own, and a lone 季度 (「游郭篇」) would become a show of its own too, which
+// is what made a series with three seasons arrive as three unrelated anime.
 func (d *BilibiliDriver) rootEntries(ctx context.Context) ([]Entry, error) {
 	var lists [][]pgcIndexItem
 	// 我的追番 needs an account; a visitor just gets the public lists.
@@ -440,7 +563,7 @@ func (d *BilibiliDriver) rootEntries(ctx context.Context) ([]Entry, error) {
 	if len(lists) == 0 {
 		return nil, fmt.Errorf("bilibili: 番剧列表获取失败(网络或风控)")
 	}
-	return seasonEntries("/", dedupeSeasons(lists...)), nil
+	return d.seriesEntries(ctx, "/", dedupeSeasons(lists...)), nil
 }
 
 func (d *BilibiliDriver) hotEntries(ctx context.Context) ([]Entry, error) {
@@ -448,7 +571,7 @@ func (d *BilibiliDriver) hotEntries(ctx context.Context) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	return seasonEntries("/热门番剧", hot), nil
+	return d.seriesEntries(ctx, "/热门番剧", hot), nil
 }
 
 func (d *BilibiliDriver) followEntries(ctx context.Context) ([]Entry, error) {
@@ -459,27 +582,63 @@ func (d *BilibiliDriver) followEntries(ctx context.Context) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	return seasonEntries("/我的追番", f), nil
+	return d.seriesEntries(ctx, "/我的追番", f), nil
 }
 
-// seasonEntry names one 番剧 directory. The name is canonical — the 番剧's own
-// title and its id, never a decoration like "更新至12话" — because a directory
-// that gets renamed between two scans reads to the scanner as a different show:
-// the old one is deleted and its watch progress with it.
-func seasonEntry(parent, title string, seasonID int64, mtime int64) Entry {
-	name := seasonDir(title, seasonID)
-	return Entry{Name: name, Path: VirtualJoin(parent, name), IsDir: true, MTime: mtime}
-}
-
-func seasonEntries(parent string, list []pgcIndexItem) []Entry {
-	out := make([]Entry, 0, len(list))
-	for _, it := range list {
-		if it.SeasonID == 0 || strings.TrimSpace(it.Title) == "" {
+// seriesEntries turns season seeds into series directories, one per franchise.
+//
+// A seed is a single 季度 (from the hot index, the timeline, or the follow list);
+// resolving which series it belongs to costs one cached API call each, and is
+// what keeps 鬼灭之刃's five 季度 in one directory instead of five.
+func (d *BilibiliDriver) seriesEntries(ctx context.Context, parent string, seeds []pgcIndexItem) []Entry {
+	seen := map[int64]bool{}
+	out := make([]Entry, 0, len(seeds))
+	for _, seed := range seeds {
+		if seed.SeasonID == 0 {
 			continue
 		}
-		out = append(out, seasonEntry(parent, it.Title, it.SeasonID, 0))
+		key, title, err := d.franchiseOf(ctx, seed.SeasonID)
+		if err != nil || key == 0 {
+			// One unresolvable seed must not empty the whole listing: it is
+			// listed as a series of itself, which is what it looks like without
+			// the series list bilibili did not hand over.
+			key, title = seed.SeasonID, seed.Title
+		}
+		if seen[key] || strings.TrimSpace(title) == "" {
+			continue
+		}
+		seen[key] = true
+		name := seriesDir(title, key)
+		out = append(out, Entry{Name: name, Path: VirtualJoin(parent, name), IsDir: true})
 	}
 	return out
+}
+
+// seasonEntries lists one series' 季度, in bilibili's own order — which is the
+// broadcast order, and why 第二季 lands in season 2 and 游郭篇 right after 立志篇.
+func (d *BilibiliDriver) seasonEntries(ctx context.Context, dir string, seriesKey int64) ([]Entry, error) {
+	s, err := d.season(ctx, seriesKey)
+	if err != nil {
+		return nil, err
+	}
+	refs := s.Seasons
+	if len(refs) == 0 {
+		// A series of one, listed by its own name.
+		refs = []pgcSeasonRef{{SeasonID: s.SeasonID, SeasonTitle: s.Title}}
+	}
+	out := make([]Entry, 0, len(refs))
+	for _, ref := range refs {
+		if ref.SeasonID == 0 {
+			continue
+		}
+		title := strings.TrimSpace(ref.SeasonTitle)
+		if title == "" {
+			title = fmt.Sprintf("第%d季", len(out)+1)
+		}
+		name := seasonDirOf(title, ref.SeasonID)
+		out = append(out, Entry{Name: name, Path: VirtualJoin(dir, name), IsDir: true})
+	}
+	return out, nil
 }
 
 // dedupeSeasons keeps the first occurrence of each 番剧, so one that is both
@@ -594,8 +753,8 @@ func (d *BilibiliDriver) followSeasons(ctx context.Context) ([]pgcIndexItem, err
 				break
 			}
 			var res struct {
-				List []pgcIndexItem `json:"list"`
-				Total  int          `json:"total"`
+				List  []pgcIndexItem `json:"list"`
+				Total int            `json:"total"`
 			}
 			if err := json.Unmarshal(raw, &res); err != nil {
 				return nil, err
@@ -617,16 +776,26 @@ func (d *BilibiliDriver) followSeasons(ctx context.Context) ([]pgcIndexItem, err
 }
 
 // episodeEntries lists one season's episodes and its extra sections. Paths are
-// built under the directory that was actually listed, so the same 番剧 reached
-// through two paths (the root and /热门番剧) still resolves to its own episodes.
+// built under the directory that was actually listed, so the same 季度 reached
+// through two paths still resolves to its own episodes.
 func (d *BilibiliDriver) episodeEntries(ctx context.Context, dir string, seasonID int64) ([]Entry, error) {
 	s, err := d.season(ctx, seasonID)
 	if err != nil {
 		return nil, err
 	}
+	// The file names carry the series, not the season: they already sit inside
+	// the season's own directory, and the series is what a player shows as the
+	// title when an episode is opened from the file browser.
+	series := strings.TrimSpace(s.Title)
+	for _, ref := range s.Seasons {
+		if ref.SeasonID == s.SeasonID {
+			series = franchiseTitle(s.Title, ref.SeasonTitle)
+			break
+		}
+	}
 	out := make([]Entry, 0, len(s.Episodes)+4)
 	add := func(ep *pgcEpisode, section string) {
-		name := episodeFileName(s.Title, ep, section)
+		name := episodeFileName(series, ep, section)
 		out = append(out, Entry{
 			Name: name, Path: VirtualJoin(dir, name),
 			IsDir: false, MTime: ep.PubTime,

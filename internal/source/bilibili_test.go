@@ -38,21 +38,31 @@ func TestVirtualPathsRoundTrip(t *testing.T) {
 	if !strings.HasSuffix(name, ".mp4") {
 		t.Fatalf("episode name %q is not a video file", name)
 	}
-	dir := seasonDir("鬼灭之刃", 26801)
-	path := VirtualJoin("/热门番剧", VirtualJoin(dir, name))
+	path := VirtualJoin("/热门番剧",
+		VirtualJoin(seriesDir("鬼灭之刃", 26801),
+			VirtualJoin(seasonDirOf("立志篇", 26801), name)))
 
-	id, ok := episodeIDFromPath(path)
-	if !ok || id != 267851 {
+	if id, ok := episodeIDFromPath(path); !ok || id != 267851 {
 		t.Fatalf("episodeIDFromPath(%q) = %d/%v, want 267851", path, id, ok)
 	}
-	parent := path[:strings.LastIndex(path, "/")]
-	sid, ok := seasonIDFromDir(lastSegment(parent))
-	if !ok || sid != 26801 {
-		t.Fatalf("seasonIDFromDir(%q) = %d/%v, want 26801", parent, sid, ok)
+	seasonPath := path[:strings.LastIndex(path, "/")]
+	if id, ok := seasonKeyFromDir(lastSegment(seasonPath)); !ok || id != 26801 {
+		t.Fatalf("seasonKeyFromDir(%q) = %d/%v, want 26801", seasonPath, id, ok)
 	}
-	// A file path must never be mistaken for a season directory.
-	if _, ok := seasonIDFromDir(lastSegment(path)); ok {
+	seriesPath := seasonPath[:strings.LastIndex(seasonPath, "/")]
+	if id, ok := seriesKeyFromDir(lastSegment(seriesPath)); !ok || id != 26801 {
+		t.Fatalf("seriesKeyFromDir(%q) = %d/%v, want 26801", seriesPath, id, ok)
+	}
+	// The two kinds of directory must never be mistaken for one another, and a
+	// file must never look like either: the dispatch in List() is exactly this.
+	if _, ok := seriesKeyFromDir(lastSegment(seasonPath)); ok {
+		t.Fatalf("a season directory %q also parsed as a series", seasonPath)
+	}
+	if _, ok := seasonKeyFromDir(lastSegment(path)); ok {
 		t.Fatalf("file path %q parsed as a season directory", path)
+	}
+	if _, ok := seriesKeyFromDir(lastSegment(path)); ok {
+		t.Fatalf("file path %q parsed as a series directory", path)
 	}
 }
 
@@ -139,51 +149,53 @@ func TestCheckPlayInfoRefusesPreviewEpisode(t *testing.T) {
 	}
 }
 
-// The virtual tree doubles as a media library: the scanner turns every directory
-// under the library root into one show, and it deletes what it can no longer see.
-// So two things have to hold — nothing below the root may be anything but a 番剧,
-// and a 番剧's directory name must be the same on every scan (a renamed directory
-// reads as a different show, and the old one goes, watch progress with it).
-func TestTreeIsLibraryShaped(t *testing.T) {
-	lists := [][]pgcIndexItem{
-		{{SeasonID: 1, Title: "鬼灭之刃"}, {SeasonID: 2, Title: "间谍过家家", IndexShow: "全12话"}},
-		{{SeasonID: 2, Title: "间谍过家家"}, {SeasonID: 3, Title: "Fuimos Revolución 2021"}},
+// A season's title is not the series' title, and bilibili states only the first.
+// Every season of a series has to compute the same answer, or the same series
+// found through the hot index and through 我的追番 lands in two directories —
+// which the scanner would read as two shows.
+func TestFranchiseTitle(t *testing.T) {
+	cases := []struct{ title, seasonTitle, want string }{
+		{"鬼灭之刃", "立志篇", "鬼灭之刃"},              // first season: nothing to strip
+		{"鬼灭之刃 柱训练篇", "柱训练篇", "鬼灭之刃"},        // a sequel names its own season
+		{"鬼灭之刃 游郭篇 中配版", "游郭篇 中配版", "鬼灭之刃"},  // ...even a dubbed one
+		{"间谍过家家 第二季", "第二季", "间谍过家家"},
+		{"间谍过家家 第一季(粤配)", "第一季(粤配)", "间谍过家家"},
+		{"冰菓", "冰菓", "冰菓"},                   // season_title == title: keep it
+		{"某番", "", "某番"},                     // nothing to go on
+		{"游郭篇", "柱训练篇", "游郭篇"},               // not a suffix: leave it alone
 	}
-	got := seasonEntries("/", dedupeSeasons(lists...))
-	if len(got) != 3 {
-		t.Fatalf("dedupe left %d entries, want 3", len(got))
-	}
-	for _, e := range got {
-		if !e.IsDir {
-			t.Fatalf("%q is not a directory: a library would read it as an episode", e.Name)
-		}
-		if _, ok := seasonIDFromDir(e.Name); !ok {
-			t.Fatalf("%q does not carry a season id, so it cannot be resolved back", e.Name)
-		}
-		// The id is the only thing besides the title: no "全12话", no "更新至3话".
-		// Both change as a 番剧 airs, which would rename the directory.
-		for _, unstable := range []string{"全12话", "更新至", "连载中"} {
-			if strings.Contains(e.Name, unstable) {
-				t.Fatalf("directory name %q carries %q, which changes between scans", e.Name, unstable)
-			}
+	for _, c := range cases {
+		if got := franchiseTitle(c.title, c.seasonTitle); got != c.want {
+			t.Errorf("franchiseTitle(%q, %q) = %q, want %q", c.title, c.seasonTitle, got, c.want)
 		}
 	}
 }
 
-// A season directory has to survive the trip back: the name is the whole state.
-func TestSeasonDirRoundTrip(t *testing.T) {
-	for _, c := range []struct {
-		title string
-		id    int64
-	}{
-		{"鬼灭之刃", 26801},
-		{"Fuimos Revolución 2021", 123},
-		{"A/B:C", 7},
-	} {
-		dir := seasonDir(c.title, c.id)
-		got, ok := seasonIDFromDir(dir)
-		if !ok || got != c.id {
-			t.Fatalf("seasonIDFromDir(%q) = %d/%v, want %d", dir, got, ok, c.id)
+// Directory names double as library identities: they carry the id that resolves
+// them, and nothing that changes while a 番剧 airs.
+func TestTreeNamesAreStableAndResolvable(t *testing.T) {
+	names := []string{
+		seriesDir("鬼灭之刃", 26801),
+		seriesDir("间谍过家家", 41410),
+		seasonDirOf("第一季", 41410),
+		seasonDirOf("柱训练篇", 47836),
+		seasonDirOf("游郭篇 中配版", 45624),
+	}
+	for _, n := range names {
+		for _, unstable := range []string{"全12话", "更新至", "连载中", "已完结"} {
+			if strings.Contains(n, unstable) {
+				t.Fatalf("directory name %q carries %q, which changes between scans", n, unstable)
+			}
 		}
+	}
+	if _, ok := seriesKeyFromDir(names[0]); !ok {
+		t.Fatalf("%q does not resolve back to a series id", names[0])
+	}
+	if _, ok := seasonKeyFromDir(names[2]); !ok {
+		t.Fatalf("%q does not resolve back to a season id", names[2])
+	}
+	// Sanitising must not break the bracket the id lives in.
+	if got := seasonDirOf("A/B:C", 7); !strings.HasSuffix(got, "[season 7]") {
+		t.Fatalf("sanitised season directory = %q", got)
 	}
 }
