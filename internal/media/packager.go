@@ -41,6 +41,13 @@ type PackagerOptions struct {
 	Target  string
 	Headers map[string]string
 
+	// Inputs overrides Target/Headers with an explicit input list. One entry is
+	// an ordinary file; two are a source that publishes the picture and the sound
+	// separately (bilibili DASH), in that order — ffmpeg then gets one -i per
+	// stream and maps input 0 to video and input 1 to audio. Left empty for every
+	// other source, so the single-input command line below is unchanged.
+	Inputs []Input
+
 	VideoIndex   int // absolute stream index; <0 falls back to 0:v:0
 	AudioOrdinal int // ordinal among audio streams; <0 means no audio
 	VideoMode    string
@@ -176,31 +183,46 @@ func StartPackager(ctx context.Context, o PackagerOptions) (*Packager, error) {
 
 // packagerArgs builds the ffmpeg command line for a packaging session.
 func packagerArgs(o PackagerOptions) ([]string, error) {
-	target := o.Target
-	if strings.TrimSpace(target) == "" {
+	inputs := o.Inputs
+	if len(inputs) == 0 {
+		inputs = []Input{{Target: o.Target, Headers: o.Headers}}
+	}
+	multi := len(inputs) > 1
+	if strings.TrimSpace(inputs[0].Target) == "" {
 		return nil, fmt.Errorf("packager: empty target")
 	}
-	// The child's working directory is the output directory, so a local input
-	// must be absolute to still resolve.
-	if !isHTTPPath(target) {
-		abs, err := filepath.Abs(target)
-		if err != nil {
-			return nil, fmt.Errorf("packager: resolve %s: %w", target, err)
-		}
-		target = abs
+	// Burning re-encodes through a filter graph written against one input; a
+	// two-stream source has no path through it (and none of them carry subtitles).
+	if multi && o.Burn != nil {
+		return nil, fmt.Errorf("packager: 多流源(DASH)不支持烧录字幕")
 	}
 
 	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin"}
-	args = HeaderArgs(args, o.Headers)
-	if isHTTPPath(target) {
-		args = append(args, "-reconnect", "1", "-reconnect_streamed", "1")
+	for _, in := range inputs {
+		target := in.Target
+		// The child's working directory is the output directory, so a local input
+		// must be absolute to still resolve.
+		if !isHTTPPath(target) {
+			abs, err := filepath.Abs(target)
+			if err != nil {
+				return nil, fmt.Errorf("packager: resolve %s: %w", target, err)
+			}
+			target = abs
+		}
+		args = HeaderArgs(args, in.Headers)
+		if isHTTPPath(target) {
+			args = append(args, "-reconnect", "1", "-reconnect_streamed", "1")
+		}
+		// -ss belongs before -i (input seek): ffmpeg then starts reading near that
+		// position instead of decoding from the beginning. Every input is seeked to
+		// the same point — the parts of a DASH source are independent files, and
+		// seeking only one of them would start the sound somewhere else than the
+		// picture.
+		if o.StartSeconds > 0 {
+			args = append(args, "-ss", strconv.FormatFloat(o.StartSeconds, 'f', 3, 64))
+		}
+		args = append(args, "-i", target)
 	}
-	// -ss belongs before -i (input seek): ffmpeg then starts reading near that
-	// position instead of decoding from the beginning.
-	if o.StartSeconds > 0 {
-		args = append(args, "-ss", strconv.FormatFloat(o.StartSeconds, 'f', 3, 64))
-	}
-	args = append(args, "-i", target)
 
 	// Burning a subtitle means re-encoding the video with it overlaid: a bitmap
 	// track (PGS/VobSub) cannot be converted to text at all, and burning is also
@@ -234,15 +256,21 @@ func packagerArgs(o PackagerOptions) ([]string, error) {
 		}
 		args = append(args, "-c:a", "aac", "-b:a", "192k", "-ac", "2")
 	} else {
-		if o.VideoIndex >= 0 {
+		switch {
+		case multi:
+			// One input per stream: 0 is the picture, 1 the sound.
+			args = append(args, "-map", "0:v:0", "-map", "1:a:0")
+		case o.VideoIndex >= 0:
 			args = append(args, "-map", fmt.Sprintf("0:%d", o.VideoIndex))
-		} else {
+		default:
 			args = append(args, "-map", "0:v:0")
 		}
-		if o.AudioOrdinal >= 0 {
-			args = append(args, "-map", fmt.Sprintf("0:a:%d", o.AudioOrdinal))
-		} else {
-			args = append(args, "-an")
+		if !multi {
+			if o.AudioOrdinal >= 0 {
+				args = append(args, "-map", fmt.Sprintf("0:a:%d", o.AudioOrdinal))
+			} else {
+				args = append(args, "-an")
+			}
 		}
 
 		if o.VideoMode == "transcode" {

@@ -35,6 +35,54 @@ type Driver interface {
 	HasDirect() bool
 }
 
+// Part is one upstream stream of a file that is really several of them. It is
+// the shape a DASH source has: the picture and the sound sit at two different
+// URLs, and each one needs its own request headers. A driver that can answer
+// Parts states the codecs too, so its files need no ffprobe pass at all.
+type Part struct {
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"-"`
+	Kind    string            `json:"kind"` // "video" | "audio"
+	// Codec is the ffprobe codec name (h264, hevc, av1, aac…), Tag the
+	// codec_tag_string (hvc1 / hev1 / avc1) and Profile the H.264 profile — the
+	// three things the playback decision actually reads.
+	Codec    string  `json:"codec"`
+	Tag      string  `json:"tag,omitempty"`
+	Profile  string  `json:"profile,omitempty"`
+	Width    int     `json:"width,omitempty"`
+	Height   int     `json:"height,omitempty"`
+	Channels int     `json:"channels,omitempty"`
+	// Duration is the stream's length in seconds (0 when the source is silent
+	// about it).
+	Duration float64 `json:"duration,omitempty"`
+}
+
+// MultiPart is an optional Driver capability: the file is not one progressive
+// stream but several that have to be muxed together before any client can play
+// it. Such a driver also answers ProbeURL and DirectURL with the video part, so
+// a caller that ignores this interface still gets a usable — if silent — target;
+// HasDirect should be false, because a link a client cannot fetch is not a
+// direct link.
+type MultiPart interface {
+	Parts(ctx context.Context, path string) ([]Part, error)
+}
+
+// Comment is one bullet comment (弹幕) published against a file.
+type Comment struct {
+	Time  float64 `json:"t"`     // seconds into the file
+	Mode  int     `json:"mode"`  // 1-3 scroll, 4 bottom, 5 top, 6 reverse, 7+ advanced
+	Size  int     `json:"size"`  // font size as published; 25 is the normal one
+	Color int     `json:"color"` // 0xRRGGBB
+	Text  string  `json:"text"`
+}
+
+// Danmaku is an optional Driver capability: the file has bullet comments that
+// belong on top of it. The whole set is returned in one call — a player wants
+// them before playback starts, not as a live feed.
+type Danmaku interface {
+	Comments(ctx context.Context, path string) ([]Comment, error)
+}
+
 // NewDriver builds a driver from a source row.
 func NewDriver(src *models.Source) (Driver, error) {
 	var cfg models.SourceConfig
@@ -50,6 +98,8 @@ func NewDriver(src *models.Source) (Driver, error) {
 		return NewWebDAV(cfg.WebDAVURL, cfg.WebDAVUser, cfg.WebDAVPass), nil
 	case "openlist":
 		return NewOpenList(cfg.BaseURL, cfg.Token)
+	case "bilibili":
+		return NewBilibili(cfg.BiliCookie, cfg.BiliQuality, cfg.BiliCodec)
 	case "url":
 		return &URLDriver{}, nil
 	default:

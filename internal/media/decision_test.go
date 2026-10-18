@@ -3,6 +3,8 @@ package media
 import (
 	"strings"
 	"testing"
+
+	"doriyamedia/internal/source"
 )
 
 func probeFor(codec, profile, tag, audio, format string) *Probe {
@@ -320,5 +322,50 @@ func TestClientAudioReportWidensDirectPlay(t *testing.T) {
 		DecideOptions{HasDirect: true, ClientAudio: map[string]bool{"eac3": true}})
 	if old.Mode != "unsupported" {
 		t.Fatalf("mode=%q, want unsupported for MPEG-2 whatever the audio report says", old.Mode)
+	}
+}
+
+// A source that publishes the picture and the sound as two streams cannot be
+// handed to a client at all: whichever single URL it was pointed at carries the
+// video only, so "direct" and "proxy" would both play a silent picture. The one
+// honest offer is a server-side mux, and the fallback chain must not smuggle the
+// single-URL modes back in.
+func TestMultiPartSourceOnlyOffersRemux(t *testing.T) {
+	probe := partsProbe([]source.Part{
+		{URL: "https://cdn.test/video.m4s", Kind: "video", Codec: "h264", Tag: "avc1", Profile: "High", Width: 1920, Height: 1080, Duration: 1426},
+		{URL: "https://cdn.test/audio.m4s", Kind: "audio", Codec: "aac", Tag: "mp4a", Duration: 1426},
+	})
+	if probe.Duration() != 1426 {
+		t.Fatalf("duration from the source's own metadata = %v, want 1426", probe.Duration())
+	}
+	d := Decide(probe, "/热门番剧/x/第1话 [ep1].mp4", ClientSafari, DecideOptions{
+		MultiPart: true,
+		// The source does have a direct URL (the video part); offering it would be
+		// the bug this test exists for.
+		HasDirect: true,
+	})
+	if d.Mode != "remux" || d.Kind != "hls" {
+		t.Fatalf("multi-part decision = %s/%s, want remux/hls (%s)", d.Mode, d.Kind, d.Reason)
+	}
+	for _, m := range altModes(d) {
+		if m == "direct" || m == "proxy" {
+			t.Fatalf("fallback chain offers %q, which can only play a silent picture: %v", m, altModes(d))
+		}
+	}
+}
+
+// The copy still has to be decodable by the client: a codec this client has no
+// path for is refused rather than remuxed into a black picture.
+func TestMultiPartRefusesUndecodableCodec(t *testing.T) {
+	probe := partsProbe([]source.Part{
+		{URL: "https://cdn.test/video.m4s", Kind: "video", Codec: "av1", Tag: "av01", Width: 3840, Height: 2160},
+		{URL: "https://cdn.test/audio.m4s", Kind: "audio", Codec: "aac"},
+	})
+	d := Decide(probe, "/x/第1话 [ep1].mp4", ClientSafari, DecideOptions{MultiPart: true})
+	if d.Mode != "unsupported" {
+		t.Fatalf("AV1 into Safari decided %s, want unsupported (%s)", d.Mode, d.Reason)
+	}
+	if !strings.Contains(d.Reason, "DASH") {
+		t.Fatalf("reason should name the cause: %q", d.Reason)
 	}
 }

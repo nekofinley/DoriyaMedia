@@ -125,8 +125,15 @@ func (s *Server) ensureBrowseFile(ctx context.Context, sourceID int64, path stri
 		return nil, err
 	}
 	f := &models.MediaFile{ItemID: item.ID, SourceID: sourceID, Path: path}
-	if _, err := s.Store.UpsertFile(f); err != nil {
+	id, err := s.Store.UpsertFile(f)
+	if err != nil {
 		return nil, err
 	}
+	// UpsertFile returns the row id instead of writing it back into the struct,
+	// and everything downstream builds its URLs from file.ID: without this the
+	// first playback of a file would ask for /api/hls/0/… — a file that does not
+	// exist. Every later request found the row by path and had an id, which is
+	// why only the first click was broken.
+	f.ID = id
 	return f, nil
 }

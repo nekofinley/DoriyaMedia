@@ -31,6 +31,11 @@ type Engine struct {
 	// resolveLocks serialises link resolution per file (see resolveTarget).
 	resolveLocks map[string]*sync.Mutex
 
+	// partsCache holds resolved multi-stream inputs (see parts.go). Same TTL and
+	// the same per-file lock as the single-target cache above.
+	partsMu    sync.Mutex
+	partsCache map[string]partsEntry
+
 	// probe job registry: one job per file, shared by the async path
 	// (/api/play → polling) and the synchronous fallback (HLS/subtitles).
 	probeMu   sync.Mutex
@@ -78,6 +83,7 @@ func NewEngine(store *db.Store, cfg *config.Config) *Engine {
 		subCache:     map[string][]byte{},
 		resolveCache: map[string]resolveEntry{},
 		resolveLocks: map[string]*sync.Mutex{},
+		partsCache:   map[string]partsEntry{},
 		probeJobs:    map[int64]*probeJob{},
 		pre:          preProbeQueue{queued: map[int64]bool{}},
 		stream:       map[int64]*streamProgress{},
@@ -261,6 +267,11 @@ func (c *countWriter) Write(p []byte) (int, error) {
 // audioOrdinal: which audio stream (ordinal among audio streams, -1 = none).
 // videoIndex: absolute ffmpeg stream index of the real video stream
 // (cover-art attachments excluded by the prober); -1 falls back to 0:v:0.
+//
+// A source that publishes the picture and the sound as separate streams
+// (bilibili DASH) is read as one input per stream instead; the audio/video
+// stream arguments above then do not apply, because each input carries exactly
+// the stream it was resolved for.
 func (e *Engine) Segment(ctx context.Context, file *models.MediaFile, drv source.Driver,
 	start, length float64, videoMode, audioMode string, audioOrdinal, videoIndex, transcodeHeight int, out io.Writer) (n int64, err error) {
 
@@ -268,13 +279,13 @@ func (e *Engine) Segment(ctx context.Context, file *models.MediaFile, drv source
 	began := time.Now()
 	defer func() { e.noteSegmentDone(file.ID, length, time.Since(began), n, err) }()
 
-	target, headers, err := e.ProbeTarget(ctx, file, drv)
+	inputs, err := e.SegmentInputs(ctx, file, drv, "")
 	if err != nil {
 		return 0, err
 	}
 
 	cw := &countWriter{w: out}
-	runErr := e.runStream(ctx, segmentArgs(target, headers, start, length, videoMode, audioMode, audioOrdinal, videoIndex, transcodeHeight), cw)
+	runErr := e.runStream(ctx, segmentArgs(inputs, start, length, videoMode, audioMode, audioOrdinal, videoIndex, transcodeHeight), cw)
 	if runErr == nil {
 		return cw.n, nil
 	}
@@ -284,15 +295,15 @@ func (e *Engine) Segment(ctx context.Context, file *models.MediaFile, drv source
 		return cw.n, runErr
 	}
 
-	retryTarget, retryHeaders, rerr := e.resolveTarget(ctx, file, drv, target)
-	if rerr != nil || retryTarget == target {
+	retryInputs, rerr := e.SegmentInputs(ctx, file, drv, inputs[0].Target)
+	if rerr != nil || sameInputs(retryInputs, inputs) {
 		return cw.n, runErr
 	}
 	log.Printf("hls segment %d @%.0fs: source refused the link, retrying with a fresh one: %v",
 		file.ID, start, runErr)
 
 	cw2 := &countWriter{w: out}
-	if err2 := e.runStream(ctx, segmentArgs(retryTarget, retryHeaders, start, length, videoMode, audioMode, audioOrdinal, videoIndex, transcodeHeight), cw2); err2 != nil {
+	if err2 := e.runStream(ctx, segmentArgs(retryInputs, start, length, videoMode, audioMode, audioOrdinal, videoIndex, transcodeHeight), cw2); err2 != nil {
 		return cw2.n, fmt.Errorf("attempt 1: %w; attempt 2 with a fresh source link: %v", runErr, err2)
 	}
 	log.Printf("hls segment %d @%.0fs: recovered with a fresh source link", file.ID, start)
@@ -300,28 +311,43 @@ func (e *Engine) Segment(ctx context.Context, file *models.MediaFile, drv source
 }
 
 // segmentArgs builds the ffmpeg command line for one segment.
-func segmentArgs(target string, headers map[string]string, start, length float64,
+//
+// inputs is what the segment reads: one entry for an ordinary file, two for a
+// source that publishes the picture and the sound separately (bilibili DASH).
+// The single-input form maps the video by absolute stream index, because 0:v:0
+// would pick an attached cover image when one is present; with one input per
+// stream each one carries exactly the stream it was resolved for, so the mapping
+// is by input instead.
+func segmentArgs(inputs []Input, start, length float64,
 	videoMode, audioMode string, audioOrdinal, videoIndex, transcodeHeight int) []string {
 
+	multi := len(inputs) > 1
 	args := []string{"-hide_banner", "-loglevel", "error"}
-	args = HeaderArgs(args, headers)
-	if isHTTPPath(target) {
-		// reconnect helps mid-segment CDN hiccups for http sources
-		args = append(args, "-reconnect", "1", "-reconnect_streamed", "1")
+	for _, in := range inputs {
+		args = HeaderArgs(args, in.Headers)
+		if isHTTPPath(in.Target) {
+			// reconnect helps mid-segment CDN hiccups for http sources
+			args = append(args, "-reconnect", "1", "-reconnect_streamed", "1")
+		}
+		// Every input is seeked: the parts of a DASH source are two independent
+		// files, and seeking only one of them would put the sound out of step.
+		args = append(args, "-ss", fmt.Sprintf("%.3f", start), "-i", in.Target)
 	}
-	args = append(args, "-ss", fmt.Sprintf("%.3f", start), "-i", target)
 
-	// Map by absolute index: 0:v:0 would pick an attached cover image when
-	// present, producing garbage/error segments.
-	if videoIndex >= 0 {
+	switch {
+	case multi:
+		args = append(args, "-map", "0:v:0", "-map", "1:a:0")
+	case videoIndex >= 0:
 		args = append(args, "-map", fmt.Sprintf("0:%d", videoIndex))
-	} else {
+	default:
 		args = append(args, "-map", "0:v:0")
 	}
-	if audioOrdinal >= 0 {
-		args = append(args, "-map", fmt.Sprintf("0:a:%d", audioOrdinal))
-	} else {
-		args = append(args, "-an")
+	if !multi {
+		if audioOrdinal >= 0 {
+			args = append(args, "-map", fmt.Sprintf("0:a:%d", audioOrdinal))
+		} else {
+			args = append(args, "-an")
+		}
 	}
 
 	if videoMode == "transcode" {

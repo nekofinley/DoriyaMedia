@@ -106,8 +106,9 @@ function up() {
   goCrumb({ path: '/' + parts.join('/') })
 }
 
-const srcIcon = (t) => (t === 'openlist' ? 'cloud' : t === 'webdav' ? 'globe' : 'hdd')
+const srcIcon = (t) => (t === 'openlist' ? 'cloud' : t === 'webdav' ? 'globe' : t === 'bilibili' ? 'tv' : 'hdd')
 function srcDetail(s) {
+  if (s.type === 'bilibili') return s.config?.bili_cookie ? 'B站番剧 · 已配置账号' : 'B站番剧 · 未登录(480P)'
   return s.config?.base_url || s.config?.webdav_url || s.config?.root || ''
 }
 function ext(name) {
@@ -128,6 +129,7 @@ function ext(name) {
             <p class="muted" style="max-width:62ch">
               浏览任意存储源里的目录,点开视频即播。播放同样经过决策引擎:
               该 302 直连就 302,iOS 播不了的自动转封装,并支持断点续播。
+              B 站番剧的音视频是两条流,由服务端合流后播放(视频直拷,不重编码),并带上弹幕。
             </p>
           </div>
         </div>

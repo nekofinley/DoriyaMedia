@@ -315,6 +315,13 @@ type DecideOptions struct {
 	// (ffprobe names, e.g. "eac3"). It only ever widens direct play; see
 	// CanDirectPlay.
 	ClientAudio map[string]bool
+	// MultiPart marks a file whose media is several upstream streams that have
+	// to be muxed together (bilibili DASH: the picture and the sound live at two
+	// URLs). Direct play and proxying are both impossible for such a file — the
+	// single URL a client could be pointed at carries the video only, so either
+	// mode plays a silent picture — which leaves a server-side remux as the one
+	// honest offer.
+	MultiPart bool
 }
 
 // Decide produces the playback plan: what to play first, and which strategies are
@@ -367,7 +374,9 @@ func canDirectPlay(probe *Probe, path string, client ClientKind, opts DecideOpti
 func fallbackPlan(probe *Probe, path string, client ClientKind, opts DecideOptions, primary *Decision) []string {
 	var out []string
 	canDirect, _ := canDirectPlay(probe, path, client, opts)
-	if canDirect {
+	// A multi-stream source has no single URL to fall back to: offering direct or
+	// proxy would only trade one failed attempt for another, both of them silent.
+	if canDirect && !opts.MultiPart {
 		if opts.HasDirect && len(opts.DirectHeaders) == 0 && primary.Mode != "direct" {
 			out = append(out, "direct")
 		}
@@ -439,6 +448,25 @@ func decide(probe *Probe, path string, client ClientKind, opts DecideOptions) *D
 	}
 
 	can, why := canDirectPlay(probe, path, client, opts)
+	if opts.MultiPart {
+		// The source publishes the picture and the sound separately, so there is
+		// no URL to play directly and no URL to proxy: both would give the client
+		// a video-only stream. Muxing them is the only mode that can work, and
+		// the client still has to be able to decode the copy.
+		if hlsVideoCopyOK(v, client, opts.AppleHEVCCopy, opts.ClientHEVC) {
+			d.Mode, d.Kind = "remux", "hls"
+			d.Reason = "源的音视频是两条流(DASH),服务端合流为 HLS(视频流直拷)"
+			return d
+		}
+		if hevcCopyBlockedForApple(v, client, opts.AppleHEVCCopy) {
+			return unsupported(d, "源的音视频是两条流(DASH),需服务端合流,但 Apple 不解码 MPEG-TS 里的 HEVC(只有声音没有画面);转码已禁用,无法播放")
+		}
+		codec := "该视频编码"
+		if v != nil && v.CodecName != "" {
+			codec = strings.ToUpper(v.CodecName)
+		}
+		return unsupported(d, fmt.Sprintf("源的音视频是两条流(DASH),需服务端合流,但 %s 无法被本机解码(只有声音没有画面);转码已禁用,无法播放", codec))
+	}
 	if can {
 		if hasDirect && len(directHeaders) == 0 {
 			d.Mode, d.Kind, d.Reason = "direct", "mp4", "客户端原生支持,302 直连"

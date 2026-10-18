@@ -128,15 +128,18 @@ func (e *Engine) StartProbe(file *models.MediaFile, drv source.Driver) {
 // an in-flight background job when one exists (single-flight per file).
 // The HLS/subtitle handlers use it as their fallback path.
 func (e *Engine) EnsureProbe(ctx context.Context, file *models.MediaFile, drv source.Driver) (*Probe, error) {
-	if p := ProbeFromCache(file); p != nil {
-		return p, nil
-	}
 	if drv == nil {
 		var err error
 		drv, err = e.DriverFor(file)
 		if err != nil {
 			return nil, err
 		}
+	}
+	// ProbeFor answers from the files table for an ordinary file and from the
+	// source's own metadata for one whose media is several streams, which no
+	// single ffprobe pass could describe.
+	if p, err := e.ProbeFor(ctx, file, drv); err != nil || p != nil {
+		return p, err
 	}
 
 	job, leader := e.acquireProbeJob(file)

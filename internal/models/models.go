@@ -73,6 +73,11 @@ type SourceConfig struct {
 	// openlist / alist v3
 	BaseURL string `json:"base_url,omitempty"`
 	Token   string `json:"token,omitempty"`
+	// bilibili (番剧 / PGC). The cookie is a full account credential — the API
+	// masks it for anyone who is not an administrator.
+	BiliCookie  string `json:"bili_cookie,omitempty"`
+	BiliQuality int    `json:"bili_quality,omitempty"` // preferred qn; 0 = best the account has
+	BiliCodec   string `json:"bili_codec,omitempty"`   // avc | hevc | av01 | auto
 }
 
 type Library struct {

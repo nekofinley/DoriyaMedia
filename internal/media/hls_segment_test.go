@@ -220,7 +220,7 @@ func TestProbeTargetReusesCachedLink(t *testing.T) {
 // The ffmpeg command line must still map the real video stream and the chosen
 // audio ordinal, and must never leave the output unconstrained.
 func TestSegmentArgsMapping(t *testing.T) {
-	args := segmentArgs("http://cdn.test/x.mkv", nil, 12.5, 4, "transcode", "aac", 2, 7, 720)
+	args := segmentArgs([]Input{{Target: "http://cdn.test/x.mkv"}}, 12.5, 4, "transcode", "aac", 2, 7, 720)
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"-ss 12.500", "-i http://cdn.test/x.mkv", "-map 0:7", "-map 0:a:2",
@@ -230,5 +230,34 @@ func TestSegmentArgsMapping(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("command line missing %q:\n%s", want, joined)
 		}
+	}
+}
+
+// A source that publishes the picture and the sound separately has to be read as
+// two inputs: each one carries its own headers, both are seeked to the same
+// point, and the mapping is by input rather than by absolute stream index.
+func TestSegmentArgsMultiInput(t *testing.T) {
+	inputs := []Input{
+		{Target: "http://cdn.test/video.m4s", Headers: map[string]string{"Referer": "https://www.bilibili.com/"}},
+		{Target: "http://cdn.test/audio.m4s", Headers: map[string]string{"Referer": "https://www.bilibili.com/"}},
+	}
+	args := segmentArgs(inputs, 60, 4, "remux", "copy", 0, -1, 720)
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-ss 60.000", "-i http://cdn.test/video.m4s",
+		"-ss 60.000", "-i http://cdn.test/audio.m4s",
+		"-map 0:v:0", "-map 1:a:0",
+		"-c:v copy", "-c:a copy", "-t 4.000", "-f mpegts", "pipe:1",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("command line missing %q:\n%s", want, joined)
+		}
+	}
+	// Each input needs the headers of its own request, so there are two of them.
+	if n := strings.Count(joined, "-headers"); n != 2 {
+		t.Fatalf("headers applied to %d inputs, want 2:\n%s", n, joined)
+	}
+	if strings.Contains(joined, "-an") {
+		t.Fatalf("a two-input segment must carry its audio:\n%s", joined)
 	}
 }

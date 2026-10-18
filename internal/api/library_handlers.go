@@ -20,10 +20,31 @@ type sourceDTO struct {
 	Config models.SourceConfig `json:"config"`
 }
 
+// maskedSecret replaces a stored credential on the way out to a non-admin.
+const maskedSecret = "******"
+
 func toSourceDTO(src models.Source) sourceDTO {
 	var cfg models.SourceConfig
 	_ = jsonUnmarshal(src.Config, &cfg)
 	return sourceDTO{Source: src, Config: cfg}
+}
+
+// maskSourceConfig blanks the credentials in a config. GET /api/sources is open
+// to every signed-in user (the browse page lists sources), so without this any
+// account on the server could read a WebDAV password, an OpenList token or a
+// bilibili cookie — and a bilibili cookie is a whole account, membership
+// included. Non-secret fields stay: the file browser shows a source's address.
+func maskSourceConfig(cfg models.SourceConfig) models.SourceConfig {
+	if cfg.WebDAVPass != "" {
+		cfg.WebDAVPass = maskedSecret
+	}
+	if cfg.Token != "" {
+		cfg.Token = maskedSecret
+	}
+	if cfg.BiliCookie != "" {
+		cfg.BiliCookie = maskedSecret
+	}
+	return cfg
 }
 
 func (s *Server) handleListSources(w http.ResponseWriter, r *http.Request, user *models.User) {
@@ -32,9 +53,14 @@ func (s *Server) handleListSources(w http.ResponseWriter, r *http.Request, user 
 		fail(w, 500, err.Error())
 		return
 	}
+	admin := user != nil && user.IsAdmin()
 	out := make([]sourceDTO, 0, len(srcs))
 	for _, src := range srcs {
-		out = append(out, toSourceDTO(src))
+		dto := toSourceDTO(src)
+		if !admin {
+			dto.Config = maskSourceConfig(dto.Config)
+		}
+		out = append(out, dto)
 	}
 	writeJSON(w, 200, out)
 }
@@ -49,8 +75,8 @@ func (s *Server) handleCreateSource(w http.ResponseWriter, r *http.Request, user
 		fail(w, 400, "名称不能为空")
 		return
 	}
-	if req.Type != "local" && req.Type != "webdav" && req.Type != "openlist" {
-		fail(w, 400, "类型必须是 local/webdav/openlist")
+	if req.Type != "local" && req.Type != "webdav" && req.Type != "openlist" && req.Type != "bilibili" {
+		fail(w, 400, "类型必须是 local/webdav/openlist/bilibili")
 		return
 	}
 	raw, _ := jsonMarshal(req.Config)
@@ -117,6 +143,12 @@ func (s *Server) handleTestSource(w http.ResponseWriter, r *http.Request, user *
 		drv = source.NewWebDAV(req.Config.WebDAVURL, req.Config.WebDAVUser, req.Config.WebDAVPass)
 	case "openlist":
 		drv, err = source.NewOpenList(req.Config.BaseURL, req.Config.Token)
+		if err != nil {
+			fail(w, 400, err.Error())
+			return
+		}
+	case "bilibili":
+		drv, err = source.NewBilibili(req.Config.BiliCookie, req.Config.BiliQuality, req.Config.BiliCodec)
 		if err != nil {
 			fail(w, 400, err.Error())
 			return

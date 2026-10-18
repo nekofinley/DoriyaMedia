@@ -65,20 +65,29 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		return
 	}
 
-	// The decision needs a probe, and probing a cloud-drive file is slow (ffprobe
-	// must pull a window of it). Instead of holding the response for minutes, a
-	// missing probe starts a background job and the request answers immediately
-	// with state=probing; the player polls /api/play/{id}/status and re-requests
-	// once the probe is ready.
-	probe := media.ProbeFromCache(file)
+	// The decision needs a probe. A source that publishes its media as several
+	// streams (bilibili DASH) states its own codecs, so that probe is built from
+	// what the source says; an ordinary file uses the stored probe and, when
+	// there is none, answers immediately with state=probing while a background
+	// job reads it (probing a cloud-drive file is slow — ffprobe must pull a
+	// window of it).
+	ctx, cancel := context.WithTimeout(r.Context(), 150*time.Second)
+	defer cancel()
+
+	probe, perr := s.Engine.ProbeFor(ctx, file, drv)
+	if perr != nil {
+		// The source itself refused to hand out a playable stream (a membership
+		// episode, a region lock). There is nothing to probe and nothing to play,
+		// so the reason is the answer rather than a spinner.
+		fail(w, 502, perr.Error())
+		return
+	}
 	if probe == nil {
 		s.Engine.StartProbe(file, drv)
 		writeJSON(w, 200, s.playPreparingPayload(r, file))
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 150*time.Second)
-	defer cancel()
+	_, multiPart := drv.(source.MultiPart)
 
 	client := s.clientKind(r)
 	force := r.URL.Query().Get("force")
@@ -114,6 +123,9 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		// it can decode is allowed to direct-play even where the server's tables
 		// guessed otherwise. Absent tokens keep the tables' verdict.
 		ClientAudio: reportedAudio(r.URL.Query().Get("caps")),
+		// The source hands out the picture and the sound separately, so the only
+		// mode that can work is a server-side mux.
+		MultiPart: multiPart,
 	})
 
 	// Resume support: tell the HLS packager where the viewer left off, so a
@@ -230,7 +242,7 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 	// as starting at zero. So the client is told where the stream begins in file
 	// time, or it would save progress measured from the resume point and line
 	// subtitles up against the wrong clock.
-	streamStart := s.streamStartFor(dec.Mode, resumeFrom)
+	streamStart := s.streamStartFor(dec.Mode, resumeFrom, multiPart)
 
 	// Safari manages HLS subtitles itself and ignores <track> on a natively
 	// played stream, so it is handed a master playlist carrying the subtitles as
@@ -241,6 +253,14 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 	playlist := "index.m3u8"
 	if nativeSubs {
 		playlist = "master.m3u8"
+	}
+
+	// 弹幕: a source that publishes bullet comments hands the player a URL to
+	// fetch them from. Nothing is read here — an episode's comments are a few
+	// thousand entries, and the player only needs them once it is playing.
+	danmakuURL := ""
+	if _, ok := drv.(source.Danmaku); ok {
+		danmakuURL = fmt.Sprintf("/api/danmaku/%d/comments.json%s", file.ID, signedQuery(s.Cfg.Secret, file.ID, sigTTL))
 	}
 
 	switch dec.Mode {
@@ -323,7 +343,6 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 
 	// item context
 	title := s.playTitle(file)
-
 	srcName := ""
 	if src, err := s.Store.SourceByID(file.SourceID); err == nil {
 		srcName = src.Name
@@ -363,6 +382,9 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		// renditions, so the player manages them (its own menu, its own default)
 		// and the page must not also attach <track> elements.
 		"native_subtitles": nativeSubs,
+		// danmaku_url is where this file's bullet comments can be fetched, when
+		// its source has any. Empty means the player shows no danmaku control.
+		"danmaku_url": danmakuURL,
 	})
 }
 
@@ -372,8 +394,12 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 // session packager off, the on-demand playlist covers the whole file from zero and
 // the player's clock is already file time. The client (progress and seeks) and the
 // subtitle renditions both depend on this agreeing with what the packager does.
-func (s *Server) streamStartFor(mode string, startSec float64) float64 {
-	if startSec <= 0 || !s.Cfg.Playback.HLSSessionPackager {
+//
+// multiPart forces 0 for the same reason as a disabled packager: a source whose
+// media is several streams is served segment by segment from the file's start,
+// however far in the viewer left off, so its clock is file time as well.
+func (s *Server) streamStartFor(mode string, startSec float64, multiPart bool) float64 {
+	if startSec <= 0 || !s.Cfg.Playback.HLSSessionPackager || multiPart {
 		return 0
 	}
 	if mode != "remux" && !strings.HasPrefix(mode, "burn.") {
@@ -715,10 +741,22 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 	// fMP4 that copied HEVC for Apple requires (Apple does not decode HEVC from
 	// MPEG-TS). With the flag off, everything keeps using the on-demand MPEG-TS
 	// path, which needs no temporary disk. See media/session.go.
-	if s.Cfg.Playback.HLSSessionPackager {
+	//
+	// A source whose media is several streams (bilibili DASH) always takes the
+	// session path, whatever the flag says. The on-demand path opens the source
+	// once per segment, and the parts of such a source seek independently: asking
+	// for a later segment lands the picture and the sound in different places,
+	// which a player reports as "Parsed buffers not in DTS sequence" and refuses
+	// to play. One session reads the episode once and writes contiguous segments.
+	_, multiPart := drv.(source.MultiPart)
+	if s.Cfg.Playback.HLSSessionPackager || multiPart {
+		mode := q.Get("m")
+		if multiPart {
+			mode = "remux" // the only mode a two-stream source can take
+		}
 		// Only remux: a video re-encode is no longer offered, so "m=transcode"
 		// from a stale page falls through to the on-demand remux path below.
-		if mode := q.Get("m"); mode == "remux" {
+		if mode == "remux" {
 			if probe, err := s.Engine.EnsureProbe(ctx, file, drv); err == nil {
 				s.serveSessionHLS(w, r, ctx, file, drv, probe,
 					sessionRequest{keyMode: mode, videoMode: mode}, rest, q, segLen, startSec)
@@ -985,6 +1023,21 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		videoCodec = v.CodecName
 	}
 
+	// What ffmpeg will read: one URL for an ordinary file, one per stream for a
+	// source that publishes the picture and the sound separately (bilibili DASH).
+	// Re-resolved here so a link the source refused is replaced (see resolveTarget).
+	inputs, err := s.Engine.SegmentInputs(ctx, file, drv, "")
+	if err != nil {
+		fail(w, 502, "获取源地址失败: "+err.Error())
+		return
+	}
+	// A multi-stream source is packaged in one pass from the start. Its parts seek
+	// independently — asking for 8s lands the picture and the sound in different
+	// places — so there is no honest way to begin mid-file, and one pass over the
+	// whole episode (at many times realtime) is cheaper than re-opening the source
+	// for every segment anyway.
+	multi := len(inputs) > 1
+
 	// Sessions are addressed by segment, so snap the requested position down to a
 	// segment boundary: segment N then always means "N*segLen into the file", and
 	// the playlist's MEDIA-SEQUENCE agrees with the timestamps we serve.
@@ -993,20 +1046,13 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 	}
 	startSeg := 0
 	sessionStart := 0.0
-	if startSec > 0 {
+	if startSec > 0 && !multi {
 		startSeg = int(startSec / segLen)
 		sessionStart = float64(startSeg) * segLen
 		if d := probe.Duration(); d > 0 && sessionStart >= d {
 			// Past the end: nothing to resume, play from the start.
 			startSeg, sessionStart = 0, 0
 		}
-	}
-
-	// Re-resolve so a link the cloud refused is replaced (see resolveTarget).
-	target, headers, err := s.Engine.ProbeTarget(ctx, file, drv)
-	if err != nil {
-		fail(w, 502, "获取源地址失败: "+err.Error())
-		return
 	}
 
 	audioMode := "copy"
@@ -1018,8 +1064,7 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 
 	opts := media.PackagerOptions{
 		FFmpeg:          s.Cfg.FFmpeg,
-		Target:          target,
-		Headers:         headers,
+		Inputs:          inputs,
 		VideoIndex:      videoIndex,
 		AudioOrdinal:    audioOrdinal,
 		VideoMode:       req.videoMode,
@@ -1048,8 +1093,14 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		o := opts
 		o.StartSegment = startSeg
 		o.StartSeconds = float64(startSeg) * segLen
+		if multi {
+			// One session per file, always from the start — and keyed that way, or
+			// the session would claim a start it does not have and every segment
+			// would be shifted by the wrong amount.
+			o.StartSegment, o.StartSeconds = 0, 0
+		}
 		return s.Engine.EnsureSession(ctx,
-			media.SessionKey(file.ID, mode, audioOrdinal, videoIndex, height, startSeg), o)
+			media.SessionKey(file.ID, mode, audioOrdinal, videoIndex, height, o.StartSegment), o)
 	}
 	// Pick the session that answers a playlist request. Two cases pull in opposite
 	// directions: a refreshed playlist during playback must follow the session the
@@ -1117,7 +1168,13 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 			// Outside what is packaged (a seek, forwards or backwards): package
 			// from there instead of waiting for a session that will never reach
 			// it. Yesterday's sessions go, since the player has moved on.
-			s.Engine.CloseStreamSessions(file.ID, mode, audioOrdinal, videoIndex, height, nil)
+			//
+			// A two-stream source keeps its single from-the-start session: there is
+			// nowhere else to start from, so the request waits for the segment to be
+			// packaged instead (packaging runs far faster than playback).
+			if !multi {
+				s.Engine.CloseStreamSessions(file.ID, mode, audioOrdinal, videoIndex, height, nil)
+			}
 			next, err := ensureAt(idx)
 			if err != nil {
 				log.Printf("hls session for file %d failed to start at segment %d: %v", file.ID, idx, err)
@@ -1156,7 +1213,7 @@ func (s *Server) serveHLSSubtitles(w http.ResponseWriter, r *http.Request, ctx c
 	defSubID := media.PickDefaultSubtitle(servable)
 	// Rendition cues are timed against the stream the player is on, which begins
 	// where packaging begins; the VTT endpoint shifts them by this much.
-	streamStart := s.streamStartFor(mode, startSec)
+	streamStart := s.streamStartFor(mode, startSec, false)
 	sig := signedQuery(s.Cfg.Secret, file.ID, sigTTL)
 	startParam := ""
 	if streamStart > 0 {
@@ -1347,4 +1404,45 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	_, _ = w.Write(data)
+}
+
+// ---------- /api/danmaku/{id}/comments.json ----------
+
+// handleDanmaku serves a file's bullet comments (弹幕) as JSON, for a source
+// that publishes them (bilibili). The whole set goes out in one response: they
+// are drawn on a canvas over the picture, so the player wants them before the
+// first frame, not as a live feed.
+func (s *Server) handleDanmaku(w http.ResponseWriter, r *http.Request) {
+	fileID, ok := pathID(r)
+	if !ok {
+		fail(w, 400, "bad id")
+		return
+	}
+	file, err := s.Store.FileByID(fileID)
+	if err != nil {
+		fail(w, 404, "文件不存在")
+		return
+	}
+	drv, err := s.Engine.DriverFor(file)
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	dm, ok := drv.(source.Danmaku)
+	if !ok {
+		fail(w, 404, "该文件没有弹幕")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	comments, err := dm.Comments(ctx, file.Path)
+	if err != nil {
+		fail(w, 502, "弹幕获取失败: "+err.Error())
+		return
+	}
+	// An episode's comments do not change while it is being watched, and the
+	// source caches them too; half an hour keeps a re-watch off the API.
+	w.Header().Set("Cache-Control", "public, max-age=1800")
+	writeJSON(w, 200, map[string]any{"count": len(comments), "comments": comments})
 }

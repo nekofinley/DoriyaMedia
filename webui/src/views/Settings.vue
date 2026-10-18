@@ -42,7 +42,7 @@ let pollTimer = null
 
 // new source form
 const srcType = ref('openlist')
-const srcForm = ref({ name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '' })
+const srcForm = ref({ name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '', bili_cookie: '', bili_quality: 0, bili_codec: 'avc' })
 const testResult = ref(null)
 const testing = ref(false)
 const addingSource = ref(false)
@@ -56,12 +56,16 @@ const sourceTypes = [
   { id: 'openlist', label: 'OpenList / AList', icon: 'cloud', hint: '可 302 直连,最省带宽' },
   { id: 'webdav', label: 'WebDAV', icon: 'globe', hint: '服务器代理播放,支持拖动' },
   { id: 'local', label: '本地目录', icon: 'hdd', hint: '服务器磁盘上的绝对路径' },
+  { id: 'bilibili', label: 'B站番剧', icon: 'tv', hint: '正版番剧,服务端合流 + 弹幕' },
 ]
 
 function buildSourceConfig() {
   const f = srcForm.value
   if (srcType.value === 'local') return { root: f.root }
   if (srcType.value === 'webdav') return { webdav_url: f.webdav_url, webdav_user: f.webdav_user, webdav_pass: f.webdav_pass }
+  if (srcType.value === 'bilibili') {
+    return { bili_cookie: f.bili_cookie, bili_quality: Number(f.bili_quality) || 0, bili_codec: f.bili_codec || 'avc' }
+  }
   return { base_url: f.base_url, token: f.token }
 }
 
@@ -142,7 +146,7 @@ async function addSource() {
     await api.post('/api/sources', {
       name: srcForm.value.name || '未命名源', type: srcType.value, config: buildSourceConfig(),
     })
-    srcForm.value = { name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '' }
+    srcForm.value = { name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '', bili_cookie: '', bili_quality: 0, bili_codec: 'avc' }
     addingSource.value = false
     await loadAll()
     toast.ok('存储源已添加')
@@ -521,7 +525,7 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
             <div class="card-head">
               <div>
                 <div class="card-title"><AppIcon name="plus" :size="16" /> 添加存储源</div>
-                <div class="tiny">支持 OpenList / AList、WebDAV 与服务器本地目录。</div>
+                <div class="tiny">支持 OpenList / AList、WebDAV、服务器本地目录,以及 B 站番剧(正版番剧,服务端合流 + 弹幕)。</div>
               </div>
               <button class="btn sm" @click="addingSource = !addingSource">
                 {{ addingSource ? '收起' : '展开表单' }}
@@ -564,6 +568,39 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                     <div class="field"><label>用户名</label><input v-model="srcForm.webdav_user" /></div>
                     <div class="field"><label>密码</label><input v-model="srcForm.webdav_pass" type="password" /></div>
                   </template>
+                  <template v-else-if="srcType === 'bilibili'">
+                    <div class="field wide">
+                      <label>账号 Cookie(留空只看免费集,且最高 480P)</label>
+                      <textarea
+                        v-model="srcForm.bili_cookie" rows="3"
+                        placeholder="SESSDATA=xxx; bili_jct=xxx; buvid3=xxx;  —— 浏览器 F12 → 应用 → Cookie → bilibili.com 整条复制"
+                      ></textarea>
+                      <div class="tiny">
+                        这一条等同于你的 B 站账号(含大会员),只有管理员能读到;普通用户拿到的是掩码。
+                        想省事可以只填 <code>SESSDATA</code>,但填全更不容易被风控。
+                      </div>
+                    </div>
+                    <div class="field">
+                      <label>清晰度上限</label>
+                      <select v-model.number="srcForm.bili_quality">
+                        <option :value="0">最高(账号能给多少就多少)</option>
+                        <option :value="112">1080P 高码率(需大会员)</option>
+                        <option :value="80">1080P(需登录)</option>
+                        <option :value="64">720P</option>
+                        <option :value="32">480P</option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <label>编码偏好</label>
+                      <select v-model="srcForm.bili_codec">
+                        <option value="avc">AVC / H.264(兼容最好,推荐)</option>
+                        <option value="hevc">HEVC / H.265(更省带宽)</option>
+                        <option value="av1">AV1(最小,但能播的设备最少)</option>
+                        <option value="auto">不限,由清晰度决定</option>
+                      </select>
+                      <div class="tiny">同一清晰度 B 站会同时给几种编码;AVC 是唯一所有客户端都能解、且不需要额外封装的。</div>
+                    </div>
+                  </template>
                   <template v-else>
                     <div class="field">
                       <label>服务器上的绝对路径</label>
@@ -592,10 +629,10 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
 
           <div v-if="sources.length" class="list">
             <div v-for="s in sources" :key="s.id" class="row-card">
-              <span class="r-icon"><AppIcon :name="s.type === 'openlist' ? 'cloud' : s.type === 'webdav' ? 'globe' : 'hdd'" :size="18" /></span>
+              <span class="r-icon"><AppIcon :name="s.type === 'openlist' ? 'cloud' : s.type === 'webdav' ? 'globe' : s.type === 'bilibili' ? 'tv' : 'hdd'" :size="18" /></span>
               <div class="r-main">
                 <div class="r-title">{{ s.name }} <span class="badge">{{ s.type }}</span></div>
-                <div class="tiny truncate">{{ s.config.base_url || s.config.webdav_url || s.config.root || '-' }}</div>
+                <div class="tiny truncate">{{ s.type === 'bilibili' ? (s.config.bili_cookie ? '已配置账号' : '未登录(仅免费集 / 480P)') : (s.config.base_url || s.config.webdav_url || s.config.root || '-') }}</div>
               </div>
               <button class="btn sm danger" @click="delSource(s.id)"><AppIcon name="trash" :size="14" /> 删除</button>
             </div>

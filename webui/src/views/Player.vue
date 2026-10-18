@@ -6,6 +6,7 @@ import AppIcon from '../components/AppIcon.vue'
 import SmartImage from '../components/SmartImage.vue'
 import ToastHost from '../components/ToastHost.vue'
 import { toast } from '../toast.js'
+import { createDanmaku } from '../danmaku.js'
 
 const route = useRoute()
 const router = useRouter()
@@ -17,6 +18,7 @@ const videoEl = ref(null)
 const stageEl = ref(null)
 const playerEl = ref(null)
 let cueObs = null
+let dmObs = null
 const watchEl = ref(null)
 const hls = ref(null)
 const currentAudio = ref(0)
@@ -29,6 +31,27 @@ const streamStart = ref(0)
 // manages them (its own menu and its own default) and the page must not attach
 // <track> elements as well, or both would render at once.
 const nativeSubs = computed(() => !!play.value?.native_subtitles)
+
+/* --------------------------------------------------------------- 弹幕
+ *
+ * A source that publishes bullet comments (bilibili) hands the player a URL in
+ * the play payload. They are drawn on a canvas over the picture, in file time —
+ * the same clock the subtitles and the progress bar use — so the layer keeps
+ * working when a stream starts part-way into the file.
+ */
+const dmCanvas = ref(null)
+const danmakuOn = ref(localStorage.getItem('dm:dmOn') !== '0')
+const danmakuOpacity = ref(Number(localStorage.getItem('dm:dmOpacity') ?? 0.9))
+const danmakuSpeed = ref(Number(localStorage.getItem('dm:dmSpeed') ?? 8))
+const danmakuArea = ref(Number(localStorage.getItem('dm:dmArea') ?? 0.6))
+const danmakuCount = ref(0)
+const danmakuFailed = ref(false)
+const danmakuUrl = computed(() => play.value?.danmaku_url || '')
+/** Ready means there is something to draw; the control hides itself otherwise. */
+const danmakuReady = computed(() => !!danmakuUrl.value && danmakuCount.value > 0 && !danmakuFailed.value)
+let danmaku = null // the renderer
+let dmRaf = 0
+let dmLoadedFor = '' // the URL the current set belongs to
 // Text tracks whose formatting WebVTT can only approximate (ASS typesetting:
 // signs placed to the pixel, karaoke, animation) can be burned into the picture
 // instead. On iOS that is the only way to see the original layout at all, since
@@ -832,12 +855,115 @@ function onTimeUpdate() {
   // deal in is file time, so the session offset is added on the way out.
   if (!scrubbing.value) position.value = v.currentTime + streamStart.value
   if (v.buffered.length) buffered.value = v.buffered.end(v.buffered.length - 1) + streamStart.value
+  // A paused picture draws no frames of its own, so a seek while paused has to
+  // be painted from here.
+  if (v.paused) paintDanmaku()
   const now = Date.now()
   if (now - lastSave > 10000) { lastSave = now; saveProgress() }
 }
 
-function saveProgress() {
+// ---------- 弹幕 ----------
+
+/** The layer draws in file time, like every other clock the page shows. */
+function danmakuTime() {
   const v = videoEl.value
+  return v ? v.currentTime + streamStart.value : 0
+}
+
+function ensureDanmaku() {
+  if (danmaku || !dmCanvas.value) return
+  danmaku = createDanmaku(dmCanvas.value)
+  danmaku.setOptions({
+    opacity: danmakuOpacity.value, speed: danmakuSpeed.value, area: danmakuArea.value,
+  })
+}
+
+function applyDanmakuOptions() {
+  danmaku?.setOptions({
+    opacity: danmakuOpacity.value, speed: danmakuSpeed.value, area: danmakuArea.value, force: true,
+  })
+  paintDanmaku()
+}
+
+/** One frame, for the moments when nothing is moving (a seek, a pause). */
+function paintDanmaku() {
+  if (!danmaku || !danmakuOn.value || !danmakuReady.value) return
+  danmaku.draw(danmakuTime())
+}
+
+function dmFrame() {
+  dmRaf = 0
+  const v = videoEl.value
+  if (!v || !danmaku || !danmakuOn.value || !danmakuReady.value) return
+  danmaku.draw(danmakuTime())
+  // A paused picture needs no frames; the next play or seek paints again.
+  if (!v.paused && !v.ended) dmRaf = requestAnimationFrame(dmFrame)
+}
+
+function kickDanmaku() {
+  if (dmRaf || !danmakuOn.value || !danmakuReady.value) return
+  dmRaf = requestAnimationFrame(dmFrame)
+}
+
+function stopDanmaku() {
+  if (dmRaf) cancelAnimationFrame(dmRaf)
+  dmRaf = 0
+}
+
+function toggleDanmaku() {
+  danmakuOn.value = !danmakuOn.value
+  localStorage.setItem('dm:dmOn', danmakuOn.value ? '1' : '0')
+  if (danmakuOn.value) kickDanmaku()
+  else {
+    stopDanmaku()
+    danmaku?.clear()
+  }
+}
+
+async function loadDanmaku(url) {
+  if (!url || url === dmLoadedFor) return
+  dmLoadedFor = url
+  danmakuFailed.value = false
+  danmakuCount.value = 0
+  stopDanmaku()
+  danmaku?.clear()
+  try {
+    const res = await fetch(url, { credentials: 'same-origin' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    const list = Array.isArray(data?.comments) ? data.comments : []
+    if (disposed || dmLoadedFor !== url) return
+    danmakuCount.value = list.length
+    await nextTick()
+    ensureDanmaku()
+    danmaku?.setComments(list)
+    applyDanmakuOptions()
+    kickDanmaku()
+  } catch {
+    // A source that cannot hand over its comments must not break playback: the
+    // control simply reports that they are missing.
+    danmakuFailed.value = true
+  }
+}
+
+watch(danmakuUrl, (url) => {
+  if (url) loadDanmaku(url)
+  else {
+    dmLoadedFor = ''
+    danmakuCount.value = 0
+    danmakuFailed.value = false
+    stopDanmaku()
+    danmaku?.clear()
+  }
+})
+
+watch([danmakuOpacity, danmakuSpeed, danmakuArea], () => {
+  localStorage.setItem('dm:dmOpacity', String(danmakuOpacity.value))
+  localStorage.setItem('dm:dmSpeed', String(danmakuSpeed.value))
+  localStorage.setItem('dm:dmArea', String(danmakuArea.value))
+})
+
+function saveProgress() {  const v = videoEl.value
   if (!v || !v.duration || !isFinite(v.duration)) return
   api.post('/api/progress', {
     file_id: Number(route.params.fileId),
@@ -1242,6 +1368,15 @@ onMounted(() => {
     cueObs = new ResizeObserver(() => fitCuesToPicture())
     cueObs.observe(videoEl.value)
   }
+  // The 弹幕 canvas is sized from its own box, which moves with fullscreen, a
+  // rotation and a layout change alike.
+  if (typeof ResizeObserver !== 'undefined' && dmCanvas.value) {
+    dmObs = new ResizeObserver(() => {
+      danmaku?.resize()
+      paintDanmaku()
+    })
+    dmObs.observe(dmCanvas.value)
+  }
   window.addEventListener('orientationchange', onViewport)
   document.addEventListener('fullscreenchange', onFsChange)
   document.addEventListener('pointermove', showControls)
@@ -1254,6 +1389,7 @@ onBeforeUnmount(() => {
   disposed = true
   saveProgress()
   destroyHls()
+  stopDanmaku()
   clearTimeout(switchTimer)
   stopProbePoll()
   stopStreamPoll()
@@ -1269,6 +1405,8 @@ onBeforeUnmount(() => {
   document.removeEventListener('touchmove', consumeFullscreenDrag)
   cueObs?.disconnect()
   cueObs = null
+  dmObs?.disconnect()
+  dmObs = null
   window.removeEventListener('pointermove', moveScrub)
   window.removeEventListener('pointerup', endScrub)
 })
@@ -1291,8 +1429,10 @@ onBeforeUnmount(() => {
               @error="onErr"
               @timeupdate="onTimeUpdate"
               @progress="onTimeUpdate"
-              @pause="saveProgress(); isPlaying = false; showControls()"
-              @play="isPlaying = true; showControls()"
+              @pause="saveProgress(); isPlaying = false; showControls(); stopDanmaku()"
+              @play="isPlaying = true; showControls(); kickDanmaku()"
+              @seeking="stopDanmaku()"
+              @seeked="paintDanmaku()"
               @waiting="onWaiting"
               @playing="onPlaying"
               @canplay="onCanPlay"
@@ -1308,6 +1448,10 @@ onBeforeUnmount(() => {
                 />
               </template>
             </video>
+
+            <!-- 弹幕层. Under the controls (z-index 3 against their 4 and up) and
+                 transparent to input, so every gesture still reaches the picture. -->
+            <canvas v-show="danmakuReady && danmakuOn" ref="dmCanvas" class="dm-layer" aria-hidden="true"></canvas>
 
             <!-- On the immersive player the top bar carries the title and the
                  settings; on a watch page both are in the page below, so only
@@ -1709,6 +1853,32 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
+              <div v-if="drawerMode !== 'subs' && danmakuUrl" class="pn-group">
+                <div class="label">
+                  弹幕
+                  <span class="tiny">{{ danmakuFailed ? ' · 读取失败' : danmakuCount ? ` · ${danmakuCount} 条` : '' }}</span>
+                </div>
+                <div class="pn-chips">
+                  <button class="chip" :class="{ on: danmakuOn }" @click="toggleDanmaku">
+                    <AppIcon name="tv" :size="14" /> {{ danmakuOn ? '已开启' : '已关闭' }}
+                  </button>
+                </div>
+                <template v-if="danmakuOn && danmakuReady">
+                  <label class="pn-range">
+                    <span>不透明度</span>
+                    <input v-model.number="danmakuOpacity" type="range" min="0.2" max="1" step="0.1" @input="applyDanmakuOptions" />
+                  </label>
+                  <label class="pn-range">
+                    <span>滚动速度</span>
+                    <input v-model.number="danmakuSpeed" type="range" min="4" max="14" step="1" @input="applyDanmakuOptions" />
+                  </label>
+                  <label class="pn-range">
+                    <span>显示区域</span>
+                    <input v-model.number="danmakuArea" type="range" min="0.25" max="1" step="0.05" @input="applyDanmakuOptions" />
+                  </label>
+                </template>
+              </div>
+
               <div v-if="play?.reason" class="pn-reason tiny">
                 <AppIcon name="sparkles" :size="13" />
                 <span>{{ play.reason }}</span>
@@ -2053,6 +2223,22 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 }
 .lay-phone .panel .pn-group .chip, .lay-tablet .panel .pn-group .chip { white-space: nowrap; }
 .pn-reason { display: flex; gap: 8px; line-height: 1.55; margin-top: auto; padding-top: 16px; border-top: 1px solid var(--line-1); }
+
+/* 弹幕 sliders: label and value share a line, the track takes the rest. */
+.pn-range { display: flex; align-items: center; gap: 10px; width: 100%; max-width: 320px; }
+.pn-range > span { flex: 0 0 62px; font-size: var(--fs-12); color: var(--text-3); }
+.pn-range > input[type='range'] { flex: 1; min-width: 0; accent-color: var(--accent, #ff5c8a); }
+
+
+/* 弹幕层: above the picture, below every control (which start at 4). */
+.dm-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 3;
+  pointer-events: none;
+}
 
 /* In fullscreen the settings are a bar down the side, not a full-width sheet: the
    picture stays behind it and it reads as a panel. On a phone the medium query

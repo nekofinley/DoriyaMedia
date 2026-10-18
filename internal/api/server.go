@@ -282,6 +282,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("HEAD /api/stream/{id}", s.allowPlayerAuth(s.handleStream))
 	mux.HandleFunc("GET /api/hls/{id}/{rest...}", s.allowPlayerAuth(s.handleHLS))
 	mux.HandleFunc("GET /api/subs/{id}/{sub}", s.allowPlayerAuth(s.handleSubtitle))
+	mux.HandleFunc("GET /api/danmaku/{id}/comments.json", s.allowPlayerAuth(s.handleDanmaku))
 
 	// site content (login page wording/layout, footer) — read by every visitor,
 	// written only by the admin from the editing toolbar
