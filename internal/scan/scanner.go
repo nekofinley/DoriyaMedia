@@ -573,19 +573,34 @@ func planShow(childCount map[string]int, libPath, dir, filePath string, parsedSe
 	// The parent groups several show-like children, so it is the show and each
 	// child becomes its own season, named after the folder.
 	subLabel := ""
+	childDir := ""
 	if showDir != "" {
 		parent := parentDir(showDir)
 		if parent != "" &&
 			strings.TrimSuffix(parent, "/") != strings.TrimSuffix(libPath, "/") &&
 			!isTechDir(baseName(parent)) && !IsCategoryDir(baseName(parent)) &&
 			childCount[parent] >= 2 {
+			childDir = showDir
 			subLabel = DisplayName(baseName(showDir))
 			showDir = parent
 		}
 	}
 
 	num, lbl, ok := seasonMetaFor(showDir, filePath)
+	// A child folder that names its own season ("第一季", "Season 2") *is* that
+	// season: the number orders it and the name labels it. Without this every
+	// season of a franchise was a name-only slot with number 0 — bilibili numbers
+	// its seasons, so they came out in an arbitrary order (第三季 before 第一季)
+	// and their numbers were lost.
+	childNum := 0
+	if subLabel != "" {
+		if n, ok := ParseSeasonDir(baseName(childDir)); ok {
+			childNum = n
+		}
+	}
 	switch {
+	case subLabel != "" && childNum > 0:
+		return showDir, childNum, subLabel
 	case subLabel != "" && parsedSeason > 0:
 		return showDir, 0, fmt.Sprintf("%s · 第 %d 季", subLabel, parsedSeason)
 	case subLabel != "" && ok:
@@ -751,10 +766,22 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 			seasonID = it.ID
 			idx.registerSeason(showID, season, seasonName, seasonID)
 		default:
-			if old, err := sc.Store.ItemByID(seasonID); err == nil && old.Name != seasonName {
-				// keep the label in sync on rescans (e.g. "第 91 季" → "OAD")
-				old.Name = seasonName
-				_ = sc.Store.UpdateItemMeta(old)
+			if old, err := sc.Store.ItemByID(seasonID); err == nil {
+				// An episode belongs to the number its season row carries. A name-only
+				// season ("立志篇" / "游郭篇") arrives here with 0 and is handed a number
+				// when its row is created — so the files that arrive after that row
+				// exists have to take that number. They used to keep the 0, which put
+				// every episode of the season in season 0 except the one that created
+				// it, and a list ordered by season then shows the season's first
+				// episode last.
+				if old.Season > 0 {
+					season = old.Season
+				}
+				if old.Name != seasonName {
+					// keep the label in sync on rescans (e.g. "第 91 季" → "OAD")
+					old.Name = seasonName
+					_ = sc.Store.UpdateItemMeta(old)
+				}
 			}
 		}
 
@@ -773,6 +800,12 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 			}
 			epID = it.ID
 			idx.eps[epKey] = epID
+		} else if cur, err := sc.Store.ItemByID(epID); err == nil && (cur.Season != season || cur.Episode != ep) {
+			// Repair what an older scan stored: an episode written as season 0 sorts
+			// to the end of its own season, so a rescan has to correct the row rather
+			// than leave the library in the state that was wrong to begin with.
+			cur.Season, cur.Episode = season, ep
+			_ = sc.Store.UpdateItemMeta(cur)
 		}
 
 		if _, err := sc.Store.UpsertFile(&models.MediaFile{

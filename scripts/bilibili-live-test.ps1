@@ -314,11 +314,24 @@ try {
     if ($youguo.Count -gt 0) {
       # 季条目的名字不该带着 [season …]:那是路径用的,不该出现在界面上。
       Check "季度名去掉了方括号标记" ($youguo[0].name -notmatch '\[season') $youguo[0].name
+      # bilibili 的命名季(游郭篇/SP)没有季号,名字就是它自己;带上"· 第 1 季"是
+      # 从剧集文件名里误读出来的季号,曾经让每一季都显示成第一季。
+      Check "命名季不再被误标成第 1 季" ($youguo[0].name -notmatch '第 \d+ 季') $youguo[0].name
       # 走界面自己用的那个接口:剧集是季节的子条目,翻不了页也无所谓。
       $detail = Invoke-RestMethod -Uri "$base/api/items/$($youguo[0].id)" -WebSession $sess
       $epItems = @($detail.episodes)
       Check "季度下面挂着剧集" ($epItems.Count -ge 3) `
         ("游郭篇 $($epItems.Count) 集,第一集: " + (@($epItems | Sort-Object episode)[0].name))
+      # 一个命名季(立志篇/游郭篇)的季号是建季时分配的,之后进来的剧集必须用同一个
+      # 季号:以前它们带着 0 存进去,按 (season, episode) 排序时这一季的第 1 集就被
+      # 排到了最后,看起来像"第一集在最下面"。
+      $asc = $true
+      for ($i = 1; $i -lt $epItems.Count; $i++) {
+        if ($epItems[$i].episode -lt $epItems[$i - 1].episode) { $asc = $false; break }
+      }
+      Check "季内剧集按集号递增" $asc ("集号: " + (($epItems | ForEach-Object { $_.episode }) -join ","))
+      $seasonNums = @($epItems | ForEach-Object { $_.season } | Sort-Object -Unique)
+      Check "同一季的剧集季号一致" ($seasonNums.Count -eq 1) ("season=" + ($seasonNums -join ","))
     } else {
       Check "季度下面挂着剧集" $false "季度里没有游郭篇"
     }

@@ -321,9 +321,11 @@ func applyNum(p *Parsed, s string) {
 	}
 	p.IsEpisode = true
 	p.Kind = "episode"
-	if p.Season == 0 {
-		p.Season = 1
-	}
+	// A bare number is an episode number and says nothing about the season — the
+	// folder is what decides that. Filling in season 1 here made every folder that
+	// names its seasons look like season 1: bilibili numbers its seasons (第一季 /
+	// 第二季 / 游郭篇), and each one came out labelled "… · 第 1 季" with the real
+	// season number lost.
 }
 
 func pickLonger(a, b string) string {
