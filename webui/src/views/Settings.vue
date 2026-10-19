@@ -42,10 +42,71 @@ let pollTimer = null
 
 // new source form
 const srcType = ref('openlist')
-const srcForm = ref({ name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '', bili_cookie: '', bili_quality: 0, bili_codec: 'avc' })
+const srcForm = ref({ name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '', bili_cookie: '', bili_quality: 0, bili_codec: 'avc', bili_proxy: '' })
 const testResult = ref(null)
 const testing = ref(false)
 const addingSource = ref(false)
+
+// The source being edited, or null when the form is adding one. Editing exists
+// for the fields that were added after a source was created — the bilibili
+// proxy is exactly that: an install with 番剧 already configured would
+// otherwise have to delete the source (and the 媒体库 rows pointing at it) to
+// gain a proxy.
+const editingSource = ref(null)
+
+// The bilibili proxy is checked on its own, before the source exists: the whole
+// point of the field is the region question, and an answer to it is worth
+// having before anything is saved.
+const proxyTesting = ref(false)
+const proxyResult = ref(null)
+
+function blankSrcForm() {
+  return { name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '', bili_cookie: '', bili_quality: 0, bili_codec: 'avc', bili_proxy: '' }
+}
+
+/** Load one source row into the form, so it can be changed in place. */
+function startEditSource(s) {
+  const c = s.config || {}
+  srcType.value = s.type
+  editingSource.value = s.id
+  testResult.value = null
+  proxyResult.value = null
+  srcForm.value = {
+    ...blankSrcForm(),
+    name: s.name || '',
+    root: c.root || '',
+    webdav_url: c.webdav_url || '',
+    webdav_user: c.webdav_user || '',
+    webdav_pass: c.webdav_pass === '******' ? '' : (c.webdav_pass || ''),
+    base_url: c.base_url || '',
+    token: c.token === '******' ? '' : (c.token || ''),
+    bili_cookie: c.bili_cookie === '******' ? '' : (c.bili_cookie || ''),
+    bili_quality: Number(c.bili_quality) || 0,
+    bili_codec: c.bili_codec || 'avc',
+    bili_proxy: c.bili_proxy && c.bili_proxy !== '******' ? c.bili_proxy : '',
+  }
+  addingSource.value = true
+}
+
+function cancelEditSource() {
+  editingSource.value = null
+  srcForm.value = blankSrcForm()
+  testResult.value = null
+  proxyResult.value = null
+  addingSource.value = false
+}
+
+async function testBiliProxy() {
+  proxyTesting.value = true
+  proxyResult.value = null
+  try {
+    proxyResult.value = await api.post('/api/sources/test-proxy', { proxy: srcForm.value.bili_proxy || '' })
+  } catch (e) {
+    proxyResult.value = { ok: false, error: e.message, message: e.message }
+  } finally {
+    proxyTesting.value = false
+  }
+}
 
 // new library form
 const libForm = ref({
@@ -79,7 +140,7 @@ function buildSourceConfig() {
   if (srcType.value === 'local') return { root: f.root }
   if (srcType.value === 'webdav') return { webdav_url: f.webdav_url, webdav_user: f.webdav_user, webdav_pass: f.webdav_pass }
   if (srcType.value === 'bilibili') {
-    return { bili_cookie: f.bili_cookie, bili_quality: Number(f.bili_quality) || 0, bili_codec: f.bili_codec || 'avc' }
+    return { bili_cookie: f.bili_cookie, bili_quality: Number(f.bili_quality) || 0, bili_codec: f.bili_codec || 'avc', bili_proxy: (f.bili_proxy || '').trim() }
   }
   return { base_url: f.base_url, token: f.token }
 }
@@ -150,12 +211,41 @@ async function stopScan(id) {
 }
 
 function stFor(id) { return (scanStates.value || []).find((s) => s.library_id === id) }
+/** One line per source card: what it points at, and for 番剧 whether a proxy is set. */
+function sourceLine(s) {
+  if (s.type === 'bilibili') {
+    const account = s.config.bili_cookie ? '已配置账号' : '未登录(仅免费集 / 480P)'
+    return s.config.bili_proxy ? `${account} · 经代理 ${maskProxy(s.config.bili_proxy)}` : `${account} · 直连(海外 IP 看番剧会被 -10403 拦)`
+  }
+  return s.config.base_url || s.config.webdav_url || s.config.root || '-'
+}
 function fmtClock(ts) {
   if (!ts) return ''
   return new Date(ts * 1000).toLocaleTimeString('zh-CN', { hour12: false })
 }
 function sourceName(id) {
   return sources.value.find((s) => s.id === id)?.name || `源 #${id}`
+}
+
+/**
+ * Hide the secret inside a proxy string for display. An administrator does get
+ * the real value (the edit form has to round-trip it), but there is no reason
+ * for a Shadowsocks password — which is the key itself — to sit on the settings
+ * page in plain sight: a screenshot or a shoulder is enough to leak it.
+ */
+function maskProxy(proxy) {
+  const s = String(proxy || '')
+  if (!s) return ''
+  // ss://METHOD:PASSWORD@host:port
+  if (s.startsWith('ss://')) {
+    const m = s.match(/^ss:\/\/([^:@/]+):([^@]*)@(.*)$/)
+    if (m) return `ss://${m[1]}:******@${m[3]}`
+    return 'ss://******'
+  }
+  // scheme://user:password@host:port
+  const u = s.match(/^([a-z0-9+.-]+):\/\/([^:@/]+):([^@]*)@(.*)$/i)
+  if (u) return `${u[1]}://${u[2]}:******@${u[4]}`
+  return s
 }
 /** One library may scan several places; the card lists them all. */
 function libSourcesLabel(lib) {
@@ -184,13 +274,23 @@ onBeforeUnmount(() => clearInterval(pollTimer))
 
 async function addSource() {
   try {
-    await api.post('/api/sources', {
-      name: srcForm.value.name || '未命名源', type: srcType.value, config: buildSourceConfig(),
-    })
-    srcForm.value = { name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '', bili_cookie: '', bili_quality: 0, bili_codec: 'avc' }
+    const id = editingSource.value
+    if (id) {
+      await api.put(`/api/sources/${id}`, {
+        name: srcForm.value.name || '未命名源', config: buildSourceConfig(),
+      })
+    } else {
+      await api.post('/api/sources', {
+        name: srcForm.value.name || '未命名源', type: srcType.value, config: buildSourceConfig(),
+      })
+    }
+    editingSource.value = null
+    srcForm.value = blankSrcForm()
+    proxyResult.value = null
+    testResult.value = null
     addingSource.value = false
     await loadAll()
-    toast.ok('存储源已添加')
+    toast.ok(id ? '存储源已更新' : '存储源已添加')
   } catch (e) { toast.err(e.message) }
 }
 
@@ -653,6 +753,33 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                       </select>
                       <div class="tiny">同一清晰度 B 站会同时给几种编码;AVC 是唯一所有客户端都能解、且不需要额外封装的。</div>
                     </div>
+
+                    <!-- Region: the reason a server abroad needs this source to
+                         have a way out of its own. -->
+                    <div class="field wide">
+                      <label>代理(可选 —— 服务器在海外时用,番剧才会解锁)</label>
+                      <input
+                        v-model="srcForm.bili_proxy"
+                        placeholder="ss://aes-256-gcm:密码@host:8388  /  socks5://127.0.0.1:1080  /  http://127.0.0.1:7890"
+                      />
+                      <div class="tiny">
+                        B 站按 IP 判断地区,海外 IP 看番剧会报 <code>-10403</code>。填一个落地在中国大陆的代理即可;
+                        这里的流量(接口、CDN 流、服务端合流用的 ffmpeg)都会走它。
+                        支持 <b>Shadowsocks</b>(<code>ss://</code>,aes-128/256-gcm、chacha20-ietf-poly1305)、
+                        <b>SOCKS5</b>(<code>socks5://</code>,可带用户名密码)和 <b>HTTP</b> 代理(<code>http://</code>)。
+                        也可以直接从客户端配置里粘贴 <code>ss://</code> 分享链接或 JSON。
+                      </div>
+                      <div class="btn-row" style="margin-top:10px">
+                        <button class="btn sm" :disabled="proxyTesting" @click="testBiliProxy">
+                          <AppIcon name="wifi" :size="14" /> {{ proxyTesting ? '测试中…' : '测试这个代理' }}
+                        </button>
+                        <span class="tiny">会经这个代理访问 B 站接口,告诉你它看到的地区</span>
+                      </div>
+                      <div v-if="proxyResult" class="flash" :class="proxyResult.ok && proxyResult.mainland ? 'ok' : 'err'" style="margin:10px 0 0">
+                        <AppIcon :name="proxyResult.ok && proxyResult.mainland ? 'check' : 'alert'" :size="16" />
+                        <span>{{ proxyResult.message || proxyResult.error }}</span>
+                      </div>
+                    </div>
                   </template>
                   <template v-else>
                     <div class="field">
@@ -666,14 +793,31 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                   <button class="btn" :disabled="testing" @click="testSource">
                     <AppIcon name="wifi" :size="15" /> {{ testing ? '测试中…' : '测试连接' }}
                   </button>
-                  <button class="btn primary" @click="addSource"><AppIcon name="check" :size="15" /> 添加</button>
+                  <button class="btn primary" @click="addSource">
+                    <AppIcon name="check" :size="15" /> {{ editingSource ? '保存修改' : '添加' }}
+                  </button>
+                  <button v-if="editingSource" class="btn sm" @click="cancelEditSource">取消编辑</button>
+                </div>
+                <div v-if="editingSource" class="tiny" style="margin-top:8px">
+                  正在编辑「{{ srcForm.name || '未命名源' }}」。保存会用表单里的值替换整份配置,
+                  <b>清空的字段就是清空</b>(代理想去掉就清掉它);填错的占位符 <code>******</code> 不会被写回去。
                 </div>
 
                 <Transition name="fade">
                   <div v-if="testResult" class="flash" :class="testResult.ok ? 'ok' : 'err'" style="margin:14px 0 0">
                     <AppIcon :name="testResult.ok ? 'check' : 'alert'" :size="16" />
-                    <span v-if="testResult.ok">连接成功,根目录 {{ testResult.count }} 项:{{ (testResult.entries || []).slice(0, 6).join(', ') }}</span>
+                    <span v-if="testResult.ok">
+                      连接成功,根目录 {{ testResult.count }} 项:{{ (testResult.entries || []).slice(0, 6).join(', ') }}
+                    </span>
                     <span v-else>{{ testResult.error }}</span>
+                  </div>
+                </Transition>
+                <!-- The region answer rides along with the connection test: it
+                     is the fact that decides whether 番剧 will play at all. -->
+                <Transition name="fade">
+                  <div v-if="testResult && testResult.region" class="flash" :class="testResult.region.ok && testResult.region.mainland ? 'ok' : 'err'" style="margin:10px 0 0">
+                    <AppIcon :name="testResult.region.ok && testResult.region.mainland ? 'check' : 'alert'" :size="16" />
+                    <span>{{ testResult.region.message || testResult.region.error }}</span>
                   </div>
                 </Transition>
               </div>
@@ -685,8 +829,9 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
               <span class="r-icon"><AppIcon :name="s.type === 'openlist' ? 'cloud' : s.type === 'webdav' ? 'globe' : s.type === 'bilibili' ? 'tv' : 'hdd'" :size="18" /></span>
               <div class="r-main">
                 <div class="r-title">{{ s.name }} <span class="badge">{{ s.type }}</span></div>
-                <div class="tiny truncate">{{ s.type === 'bilibili' ? (s.config.bili_cookie ? '已配置账号' : '未登录(仅免费集 / 480P)') : (s.config.base_url || s.config.webdav_url || s.config.root || '-') }}</div>
+                <div class="tiny truncate">{{ sourceLine(s) }}</div>
               </div>
+              <button class="btn sm" title="编辑这个源(不用删了重加)" @click="startEditSource(s)"><AppIcon name="wand" :size="14" /> 编辑</button>
               <button class="btn sm danger" @click="delSource(s.id)"><AppIcon name="trash" :size="14" /> 删除</button>
             </div>
           </div>

@@ -51,10 +51,15 @@ type Engine struct {
 	// packaging sessions for HEVC copy to fMP4 (see session.go)
 	sessMu   sync.Mutex
 	sessions map[sessionKey]*Session
+	// startMu serialises session creation (see EnsureSession). One mutex, not
+	// one per key: a packager is started once per playback, so serialising the
+	// spawn costs nothing, and a per-key map would have to be grown and pruned
+	// alongside the sessions it guards.
+	startMu sync.Mutex
 
 	// execProbe runs one ffprobe pass with a given window. Indirection so tests
 	// can drive the probe lifecycle without the ffprobe binary.
-	execProbe func(ctx context.Context, p *Prober, target string, headers map[string]string) (*Probe, error)
+	execProbe func(ctx context.Context, p *Prober, target string, headers map[string]string, proxy string) (*Probe, error)
 
 	// runStream runs one ffmpeg command. Indirection so tests can drive segment
 	// generation (including source failures) without the ffmpeg binary.
@@ -88,8 +93,8 @@ func NewEngine(store *db.Store, cfg *config.Config) *Engine {
 		pre:          preProbeQueue{queued: map[int64]bool{}},
 		stream:       map[int64]*streamProgress{},
 		sessions:     map[sessionKey]*Session{},
-		execProbe: func(ctx context.Context, p *Prober, target string, headers map[string]string) (*Probe, error) {
-			return p.ProbeFile(ctx, target, headers)
+		execProbe: func(ctx context.Context, p *Prober, target string, headers map[string]string, proxy string) (*Probe, error) {
+			return p.ProbeFileVia(ctx, target, headers, proxy)
 		},
 	}
 	// Resolved through e so a hot-reloaded ffmpeg path (SetBins) is picked up.
@@ -333,6 +338,7 @@ func segmentArgs(inputs []Input, start, length float64,
 	args := []string{"-hide_banner", "-loglevel", "error"}
 	for _, in := range inputs {
 		args = HeaderArgs(args, in.Headers)
+		args = ProxyArgs(args, in.Proxy)
 		if isHTTPPath(in.Target) {
 			// reconnect helps mid-segment CDN hiccups for http sources
 			args = append(args, "-reconnect", "1", "-reconnect_streamed", "1")

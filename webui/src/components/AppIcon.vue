@@ -33,6 +33,10 @@ const P = {
   fullscreenExit: 'M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5',
   pip: 'M4 5h16v14H4zM13 12h6v5h-6z',
   subtitles: 'M4 5h16v14H4zM7.5 11h3M13 11h3.5M7.5 14.5h5M15 14.5h1.5',
+  // 弹幕: the bullet comments as a bubble of text over the picture, struck through
+  // for the off state — the control bar's own toggle and its settings button.
+  danmaku: 'M4 5.5h16v10.5H10.5L6.5 19.5v-3.5H4zM7.5 9.5h9M7.5 12.5h5',
+  danmakuOff: 'M4 5.5h16v10.5H10.5L6.5 19.5v-3.5H4zM7.5 9.5h9M7.5 12.5h5M4.5 20.5l15-17',
   audio: 'M4 9.5h3.5L12 5.5v13L7.5 14.5H4zM16.5 9.6a3.6 3.6 0 0 1 0 4.8M19 7.4a7 7 0 0 1 0 9.2',
   speed: 'M12 20a8 8 0 1 1 8-8M12 12l4.5-3.5M12 20h.01',
   quality: 'M4 6h16v12H4zM8 10h8M8 13h5',

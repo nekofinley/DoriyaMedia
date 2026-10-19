@@ -2,14 +2,17 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"doriyamedia/internal/models"
+	"doriyamedia/internal/netproxy"
 	"doriyamedia/internal/source"
 )
 
@@ -43,6 +46,15 @@ func maskSourceConfig(cfg models.SourceConfig) models.SourceConfig {
 	}
 	if cfg.BiliCookie != "" {
 		cfg.BiliCookie = maskedSecret
+	}
+	// A proxy string carries a password, and for Shadowsocks the password *is*
+	// the key: masking it is the same rule as the cookie.
+	if cfg.BiliProxy != "" {
+		if spec, err := netproxy.Parse(cfg.BiliProxy); err == nil {
+			cfg.BiliProxy = spec.Display()
+		} else {
+			cfg.BiliProxy = maskedSecret
+		}
 	}
 	return cfg
 }
@@ -106,7 +118,27 @@ func (s *Server) handleUpdateSource(w http.ResponseWriter, r *http.Request, user
 	if req.Name != "" {
 		src.Name = req.Name
 	}
-	raw, _ := jsonMarshal(req.Config)
+	cfg := req.Config
+	// A masked placeholder means "I could not read this", never "set the secret
+	// to ******": the edit form round-trips a config it was given, and writing
+	// the mask back would lock the source out of its own account. An empty
+	// value is taken at face value — an administrator clearing the box wants
+	// the field cleared (that is how a proxy is switched off).
+	var old models.SourceConfig
+	_ = jsonUnmarshal(src.Config, &old)
+	if cfg.BiliCookie == maskedSecret {
+		cfg.BiliCookie = old.BiliCookie
+	}
+	if cfg.BiliProxy == maskedSecret {
+		cfg.BiliProxy = old.BiliProxy
+	}
+	if cfg.Token == maskedSecret {
+		cfg.Token = old.Token
+	}
+	if cfg.WebDAVPass == maskedSecret {
+		cfg.WebDAVPass = old.WebDAVPass
+	}
+	raw, _ := jsonMarshal(cfg)
 	src.Config = string(raw)
 	if err := s.Store.UpdateSource(src); err != nil {
 		fail(w, 500, err.Error())
@@ -148,7 +180,7 @@ func (s *Server) handleTestSource(w http.ResponseWriter, r *http.Request, user *
 			return
 		}
 	case "bilibili":
-		drv, err = source.NewBilibili(req.Config.BiliCookie, req.Config.BiliQuality, req.Config.BiliCodec)
+		drv, err = source.NewBilibili(req.Config.BiliCookie, req.Config.BiliQuality, req.Config.BiliCodec, req.Config.BiliProxy)
 		if err != nil {
 			fail(w, 400, err.Error())
 			return
@@ -162,9 +194,29 @@ func (s *Server) handleTestSource(w http.ResponseWriter, r *http.Request, user *
 	if req.Type == "local" {
 		root = "/"
 	}
+	// A bilibili source that needs a proxy is usually configured for one reason:
+	// the region check. Answer that question in the same reply, so the settings
+	// page can say "this proxy is seen in China" or "…in the US, 番剧 will be
+	// refused" without a second round trip and without the user having to play
+	// an episode to find out.
+	var region *netproxy.Check
+	if req.Type == "bilibili" && strings.TrimSpace(req.Config.BiliProxy) != "" {
+		if spec, err := netproxy.Parse(req.Config.BiliProxy); err == nil {
+			c := netproxy.CheckProxy(spec, 20*time.Second)
+			region = &c
+		}
+	}
 	entries, err := drv.List(ctx, root)
 	if err != nil {
-		fail(w, 400, "连接失败: "+err.Error())
+		// A failed test still answers 200 with ok:false. The region check is the
+		// diagnosis that makes the failure actionable ("your proxy works but it
+		// lands in Japan"), and a 4xx would make the settings page throw the
+		// body away and show only the error string.
+		resp := map[string]any{"ok": false, "error": "连接失败: " + err.Error()}
+		if region != nil {
+			resp["region"] = region
+		}
+		writeJSON(w, 200, resp)
 		return
 	}
 	names := make([]string, 0, 10)
@@ -178,7 +230,35 @@ func (s *Server) handleTestSource(w http.ResponseWriter, r *http.Request, user *
 			names = append(names, e.Name)
 		}
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "count": len(entries), "entries": names})
+	resp := map[string]any{"ok": true, "count": len(entries), "entries": names}
+	if region != nil {
+		resp["region"] = region
+	}
+	writeJSON(w, 200, resp)
+}
+
+// handleTestProxy checks a proxy setting on its own, before a source exists.
+// The settings form asks this while the user is still typing, so it takes the
+// bare string rather than a whole source config.
+func (s *Server) handleTestProxy(w http.ResponseWriter, r *http.Request, user *models.User) {
+	var req struct {
+		Proxy string `json:"proxy"`
+	}
+	if err := readBody(r, &req); err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	spec, err := netproxy.Parse(req.Proxy)
+	if errors.Is(err, netproxy.ErrNoProxy) {
+		// Empty means direct: report where this server itself is seen.
+		writeJSON(w, 200, netproxy.CheckProxy(netproxy.Spec{}, 20*time.Second))
+		return
+	}
+	if err != nil {
+		writeJSON(w, 400, netproxy.Check{OK: false, Err: err.Error(), Message: err.Error()})
+		return
+	}
+	writeJSON(w, 200, netproxy.CheckProxy(spec, 20*time.Second))
 }
 
 // ---------- libraries ----------

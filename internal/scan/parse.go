@@ -17,7 +17,20 @@ type Parsed struct {
 	Episode   int
 	HasYear   bool
 	IsEpisode bool
+	// Extra marks an entry the source itself says is not a numbered episode of
+	// its season: a 特别篇 / PV / 预告 section entry, or a main-list entry bilibili
+	// labels without a number ("OVA"). ExtraAt orders it inside its section and
+	// ExtraName is the section's own name — the card it belongs on. It is the
+	// source's statement, not a guess, and it outranks anything the title says.
+	Extra     bool
+	ExtraAt   int
+	ExtraName string
 }
+
+// reExtraTag is the marker a source writes into a file name to state that the
+// entry is a section item rather than an episode: [sp#<order>#<section>]. See
+// the bilibili driver's extraTag.
+var reExtraTag = regexp.MustCompile(`\[sp#(\d+)#([^\]]*)\]`)
 
 var videoExts = map[string]bool{
 	".mkv": true, ".mp4": true, ".m4v": true, ".mov": true, ".ts": true, ".m2ts": true,
@@ -170,6 +183,26 @@ func ParseName(filename string) Parsed {
 	original := base
 
 	p := Parsed{}
+
+	// A source that states what an entry is has to be read before the name is.
+	// bilibili publishes 特别篇 / PV / 预告 in sections beside the episodes, and it
+	// names the entries there the way a viewer would describe them — "第3话预告"
+	// is the preview of episode 3, not episode 3 again. Taken as a name, that
+	// title matches the episode patterns below and the preview becomes a second
+	// version of episode 3: two files on one card, and the preview is what plays
+	// when the episode is picked.
+	if m := reExtraTag.FindStringSubmatch(base); m != nil {
+		if at, err := strconv.Atoi(m[1]); err == nil && at > 0 {
+			label := strings.TrimSpace(m[2])
+			if label == "" {
+				label = "特别篇"
+			}
+			return Parsed{
+				Kind: "episode", Title: cleanTitle(reExtraTag.ReplaceAllString(base, " ")),
+				Episode: at, IsEpisode: true, Extra: true, ExtraAt: at, ExtraName: label,
+			}
+		}
+	}
 
 	// anime style: [Group][Show][01][tags]
 	if strings.HasPrefix(strings.TrimSpace(base), "[") || strings.HasPrefix(strings.TrimSpace(base), "【") {

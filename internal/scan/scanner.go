@@ -30,6 +30,11 @@ type fileRec struct {
 	// tree and the wrong rows would be deleted on the next scan.
 	SourceID int64
 	Root     string
+	// SrcType is the kind of source the file was listed by ("bilibili", "local",
+	// …). Some sources already name what they list — bilibili states every
+	// episode's title and marks its section entries — and that naming is better
+	// than anything this package can infer from a path.
+	SrcType string
 }
 
 type Scanner struct {
@@ -161,6 +166,10 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 	// progress attached to them.
 	walked := map[int64]bool{}
 	current := map[int64]bool{}
+	// partial marks sources whose top-level listing is a sample (bilibili's
+	// feed), not an inventory. Cleanup must not read "not in the root listing"
+	// as "deleted" for those.
+	partial := map[int64]bool{}
 	var srcErrs []string
 	for _, place := range places {
 		current[place.SourceID] = true
@@ -177,8 +186,11 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 			srcErrs = append(srcErrs, fmt.Sprintf("%s: %v", src.Name, derr))
 			continue
 		}
+		if pl, ok := drv.(source.PartialLister); ok && pl.PartialListing() {
+			partial[place.SourceID] = true
+		}
 		prog.AddEvent("info", fmt.Sprintf("扫描 %s %s", src.Name, place.Path))
-		f, l, werr := walkTree(ctx, drv, place.Path, sc.Cfg.ScanConcurrency, place.SourceID, onDir)
+		f, l, werr := walkTree(ctx, drv, place.Path, place.Path, sc.Cfg.ScanConcurrency, place.SourceID, src.Type, onDir)
 		for k, v := range l {
 			listings[k] = v
 		}
@@ -211,7 +223,7 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 		st.Current = fmt.Sprintf("发现 %d 个视频文件,正在整理…", len(files))
 	})
 	prog.AddEvent("file", fmt.Sprintf("发现 %d 个视频文件", len(files)))
-	if err := sc.organize(lib, files, prog, current, walked); err != nil {
+	if err := sc.organize(lib, files, prog, current, walked, partial, listings); err != nil {
 		fail("整理失败: " + err.Error())
 		finish()
 		return err
@@ -251,9 +263,86 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 	return nil
 }
 
+// ImportSeries scans one series directory into an existing library, without
+// walking the rest of the source. This is what makes "search a title, click it,
+// import it" possible without scanning bilibili's whole catalogue (thousands of
+// seasons, and a rate limit that such a walk would trip).
+//
+// The walk is a partial listing by definition: cleanup is told so, and can only
+// remove files under directories this import actually read. Rows of every other
+// show in the library are untouched.
+func (sc *Scanner) ImportSeries(ctx context.Context, lib *models.Library, sourceID int64, seriesPath string, prog *models.ScanProgress) (int64, error) {
+	src, err := sc.Store.SourceByID(sourceID)
+	if err != nil {
+		return 0, err
+	}
+	drv, err := source.NewDriver(src)
+	if err != nil {
+		return 0, err
+	}
+	if prog == nil {
+		prog = models.NewScanProgress(lib.ID)
+	}
+	prog.Update(func(st *models.ScanState) {
+		st.LibraryID, st.Running, st.Phase, st.Current = lib.ID, true, "walk", seriesPath
+	})
+	onDir := func(dir string, dirs, found, errs int64, firstErr string) {
+		prog.Update(func(st *models.ScanState) {
+			st.Current = dir
+			st.DirsDone, st.FilesFound, st.WalkErrs = int(dirs), int(found), int(errs)
+			if firstErr != "" && st.FirstErr == "" {
+				st.FirstErr = firstErr
+			}
+		})
+	}
+	// The series directory's parent is the library root as far as the scanner's
+	// naming is concerned: with "/" as the root, the series directory is the
+	// show and each [season N] child is one of its seasons.
+	root := parentDir(seriesPath)
+	if root == "" {
+		root = "/"
+	}
+	files, listings, werr := walkTree(ctx, drv, root, seriesPath, sc.Cfg.ScanConcurrency, sourceID, src.Type, onDir)
+	if len(files) == 0 {
+		if werr != nil {
+			return 0, fmt.Errorf("读取番剧失败: %w", werr)
+		}
+		return 0, fmt.Errorf("没有读到可播放的剧集")
+	}
+	prog.Update(func(st *models.ScanState) {
+		st.Phase, st.Done, st.Total = "organize", 0, len(files)
+	})
+	// The import is a subtree even for a source that calls itself exhaustive:
+	// everything outside it is simply not part of this read.
+	current := map[int64]bool{sourceID: true}
+	walked := map[int64]bool{sourceID: true}
+	partial := map[int64]bool{sourceID: true}
+	if err := sc.organize(lib, files, prog, current, walked, partial, listings); err != nil {
+		return 0, err
+	}
+	return sc.showOfFile(sourceID, files[0].Path), nil
+}
+
+// showOfFile walks one imported file back up to its show.
+func (sc *Scanner) showOfFile(sourceID int64, path string) int64 {
+	f, err := sc.Store.FileBySourcePath(sourceID, path)
+	if err != nil || f == nil {
+		return 0
+	}
+	ep, err := sc.Store.ItemByID(f.ItemID)
+	if err != nil || ep.ParentID == nil {
+		return 0
+	}
+	season, err := sc.Store.ItemByID(*ep.ParentID)
+	if err != nil || season.ParentID == nil {
+		return 0
+	}
+	return *season.ParentID
+}
+
 const maxDepth = 8
 
-func walkTree(ctx context.Context, drv source.Driver, root string, concurrency int, srcID int64, onDir func(dir string, dirs, files, errs int64, firstErr string)) ([]fileRec, map[string][]source.Entry, error) {
+func walkTree(ctx context.Context, drv source.Driver, root, start string, concurrency int, srcID int64, srcType string, onDir func(dir string, dirs, files, errs int64, firstErr string)) ([]fileRec, map[string][]source.Entry, error) {
 	if concurrency <= 0 {
 		concurrency = 4
 	}
@@ -328,7 +417,7 @@ func walkTree(ctx context.Context, drv source.Driver, root string, concurrency i
 			if strings.HasSuffix(low, ".strm") {
 				if url := readStrm(ctx, drv, e.Path); url != "" {
 					mu.Lock()
-					files = append(files, fileRec{Path: url, Dir: dir, Strm: true, SourceID: srcID, Root: root})
+					files = append(files, fileRec{Path: url, Dir: dir, Strm: true, SourceID: srcID, Root: root, SrcType: srcType})
 					mu.Unlock()
 					filesFound.Add(1)
 				}
@@ -341,7 +430,7 @@ func walkTree(ctx context.Context, drv source.Driver, root string, concurrency i
 				continue // skip tiny junk
 			}
 			mu.Lock()
-			files = append(files, fileRec{Path: e.Path, Dir: dir, Size: e.Size, MTime: e.MTime, SourceID: srcID, Root: root})
+			files = append(files, fileRec{Path: e.Path, Dir: dir, Size: e.Size, MTime: e.MTime, SourceID: srcID, Root: root, SrcType: srcType})
 			mu.Unlock()
 			filesFound.Add(1)
 		}
@@ -352,7 +441,11 @@ func walkTree(ctx context.Context, drv source.Driver, root string, concurrency i
 	if root == "" {
 		root = "/"
 	}
-	walkDir(root, 0)
+	start = strings.TrimSuffix(start, "/")
+	if start == "" {
+		start = "/"
+	}
+	walkDir(start, 0)
 	wg.Wait()
 	return files, listings, firstErr
 }
@@ -387,7 +480,7 @@ type movieGroup struct {
 	Files []fileRec
 }
 
-func (sc *Scanner) organize(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked map[int64]bool) error {
+func (sc *Scanner) organize(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked, partial map[int64]bool, listings map[string][]source.Entry) error {
 	// The walk runs for minutes without touching the database, and the first
 	// statement after it is the one that fails. Ping before any real work, so a
 	// connection whose handle went stale during that idle stretch is replaced on
@@ -398,15 +491,15 @@ func (sc *Scanner) organize(lib *models.Library, files []fileRec, prog *models.S
 
 	switch lib.Type {
 	case "series":
-		err := sc.organizeSeries(lib, files, prog, current, walked)
+		err := sc.organizeSeries(lib, files, prog, current, walked, partial, listings)
 		return err
 	default:
-		err := sc.organizeMovies(lib, files, prog, current, walked)
+		err := sc.organizeMovies(lib, files, prog, current, walked, partial, listings)
 		return err
 	}
 }
 
-func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked map[int64]bool) error {
+func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked, partial map[int64]bool, listings map[string][]source.Entry) error {
 	existing, _, err := sc.Store.ItemsByLibrary(lib.ID, "movie", "", "", false, 0, 1000000)
 	if err != nil {
 		log.Printf("organize: load movies failed: %v", err)
@@ -476,7 +569,7 @@ func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *mo
 		})
 		prog.AddEvent("show", fmt.Sprintf("%s%s", g.Title, yearSuffix(g.Year)))
 	}
-	return sc.cleanup(lib, files, current, walked)
+	return sc.cleanup(lib, files, current, walked, partial, listings)
 }
 
 // yearSuffix renders " (2019)" for the feed, empty when the year is unknown.
@@ -526,13 +619,21 @@ func (si *seriesIndex) registerSeason(showID int64, num int, name string, id int
 
 // seasonKeyFor resolves an existing season item for a file, either by number
 // (第 2 季 / OAD slots) or by name (sub-series and arc folders like 化物语).
+// The name is also tried when a number is known: a season that an older scan
+// stored under a free slot (第二季（后半） sat on "第 9 季") is still the season
+// the folder names, and finding it lets the rescan correct its number instead
+// of creating a second copy of it.
 func (si *seriesIndex) seasonKeyFor(showID int64, num int, name string) (int64, bool) {
 	if num > 0 {
-		id, ok := si.seasons[fmt.Sprintf("%d|%d", showID, num)]
+		if id, ok := si.seasons[fmt.Sprintf("%d|%d", showID, num)]; ok {
+			return id, true
+		}
+	}
+	if name != "" {
+		id, ok := si.seasonNames[fmt.Sprintf("%d|%s", showID, NormalizeKey(name))]
 		return id, ok
 	}
-	id, ok := si.seasonNames[fmt.Sprintf("%d|%s", showID, NormalizeKey(name))]
-	return id, ok
+	return 0, false
 }
 
 // dirChildCount counts, for every directory, how many direct child
@@ -616,7 +717,7 @@ func planShow(childCount map[string]int, libPath, dir, filePath string, parsedSe
 	}
 }
 
-func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked map[int64]bool) error {
+func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked, partial map[int64]bool, listings map[string][]source.Entry) error {
 	idx := &seriesIndex{
 		shows:       map[string]int64{},
 		seasons:     map[string]int64{},
@@ -680,6 +781,27 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 	}
 	_ = loadSeasonEps
 
+	// Every file a previous scan organized, mapped to the show that held it. The
+	// provider titles written by the metadata pass are not stable across scans
+	// ("装甲重拳 MEGALOBOX" becomes "MEGALO BOX"), so a show found by name is not
+	// the same show. A file's path is: it is what the source listed, and what the
+	// library keyed its rows by. Following it keeps one folder on one show across
+	// a rename instead of creating a second show on every scan.
+	showByFile, splitShows, err := sc.Store.FileShowIndex(lib.ID)
+	if err != nil {
+		log.Printf("organize: file → show index for library %d failed: %v", lib.ID, err)
+		showByFile = map[string]int64{}
+	}
+	// A show that holds files from several source folders is a grouping an
+	// older scan got wrong (one "TV" show for every single-season bilibili
+	// series). Do not anchor to it: let the files be planned into their real
+	// series, and let cleanup remove the empty remains.
+	for key, showID := range showByFile {
+		if splitShows[showID] {
+			delete(showByFile, key)
+		}
+	}
+
 	childCount := dirChildCount(files)
 
 	// Plan every file first, then insert NUMBERED seasons (第 N 季 / OAD / 剧场版)
@@ -689,9 +811,14 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 	type planned struct {
 		fr      fileRec
 		show    string
+		showID  int64 // the show this file already belonged to, when known
 		season  int
 		label   string
 		episode int
+		// episodeName is the name the source itself gives this entry, when it
+		// gives one. It is better than a provider's guess about which episode of
+		// which season this is, and it is what the card should say.
+		episodeName string
 	}
 	numbered := make([]planned, 0, len(files))
 	named := make([]planned, 0, len(files))
@@ -715,7 +842,22 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 		if showTitle == "" {
 			showTitle = orDefault(stripTitleYear(p.Title), baseName(fr.Path))
 		}
-		pl := planned{fr: fr, show: showTitle, season: season, label: seasonName, episode: p.Episode}
+		epName := ""
+		if p.Extra {
+			// A section entry: its own card, named after the section bilibili put
+			// it in, and never a numbered episode of the season. This is the one
+			// thing that matters about it — the season's episode 3 is a different
+			// file, and the preview of it must not be offered as its "other
+			// version" (which is what played when both were one card).
+			season, seasonName = 0, p.ExtraName
+			if lbl := sourceLabel(fr, showDir); lbl != "" {
+				epName = lbl
+			}
+		} else {
+			epName = sourceLabel(fr, showDir)
+		}
+		pl := planned{fr: fr, show: showTitle, showID: showByFile[fileSourceKey(fr.SourceID, fr.Path)],
+			season: season, label: seasonName, episode: p.Episode, episodeName: epName}
 		if season > 0 {
 			numbered = append(numbered, pl)
 		} else {
@@ -723,11 +865,24 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 		}
 	}
 
+	// A file that was already organized names its show; hand the same answer to
+	// the files of that show which are new this scan, so one folder cannot come
+	// out as an old show and a fresh one at the same time.
+	for _, pl := range append(numbered, named...) {
+		if pl.showID != 0 {
+			idx.shows[NormalizeKey(pl.show)] = pl.showID
+		}
+	}
+
 	for _, pl := range append(numbered, named...) {
 		fr, showTitle, season, seasonName, ep := pl.fr, pl.show, pl.season, pl.label, pl.episode
+		epName := pl.episodeName
 
 		showKey := NormalizeKey(showTitle)
-		showID, ok := idx.shows[showKey]
+		showID, ok := pl.showID, pl.showID != 0
+		if !ok {
+			showID, ok = idx.shows[showKey]
+		}
 		if !ok {
 			it := &models.Item{LibraryID: lib.ID, Type: "show", Name: showTitle}
 			if err := sc.Store.InsertItem(it); err != nil {
@@ -740,16 +895,58 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 
 		seasonID, ok := idx.seasonKeyFor(showID, season, seasonName)
 		if ok && season > 0 {
-			// A named season from an older scan may be sitting on this number:
-			// move it out of the way instead of merging two season into one.
-			if old, err := sc.Store.ItemByID(seasonID); err == nil && old.Name != seasonName &&
-				!isNumericSeasonLabel(old.Name) {
-				moved := idx.nextSeason(showID)
-				old.Season = moved
-				if err := sc.Store.UpdateItemMeta(old); err == nil {
-					delete(idx.seasons, fmt.Sprintf("%d|%d", showID, season))
-					idx.registerSeason(showID, moved, old.Name, seasonID)
-					seasonID, ok = 0, false
+			if old, err := sc.Store.ItemByID(seasonID); err == nil {
+				// A season located by its name may still carry the free number an
+				// older scan gave it; the number in the folder is the real one.
+				if old.Season != season {
+					delete(idx.seasons, fmt.Sprintf("%d|%d", showID, old.Season))
+					old.Season = season
+					if err := sc.Store.UpdateItemMeta(old); err == nil {
+						idx.registerSeason(showID, season, old.Name, seasonID)
+					}
+				}
+				if old.Name != seasonName && !isNumericSeasonLabel(old.Name) {
+					loadSeasonEps(seasonID)
+					clashEP, clash := idx.eps[fmt.Sprintf("%d|%d", seasonID, ep)]
+					// The same file under the same season is not a clash — it is
+					// this show being scanned again. A clash is another file on
+					// the same episode number (中配 / 新编集版), which is what has
+					// to keep its own card.
+					sameFile := false
+					if clash {
+						if fls, err := sc.Store.FilesByItem(clashEP); err == nil {
+							for _, f := range fls {
+								if f.SourceID == fr.SourceID && f.Path == fr.Path {
+									sameFile = true
+									break
+								}
+							}
+						}
+					}
+					if clash && !sameFile {
+						// Another cut of this season: give it its own slot instead
+						// of merging two editions into one card.
+						moved := idx.nextSeason(showID)
+						old.Season = moved
+						if err := sc.Store.UpdateItemMeta(old); err == nil {
+							delete(idx.seasons, fmt.Sprintf("%d|%d", showID, season))
+							idx.registerSeason(showID, moved, old.Name, seasonID)
+							seasonID, ok = 0, false
+						}
+					} else {
+						// 第二季（前半）+ 第二季（后半） are one season told in two
+						// parts: the episode numbers do not overlap, so they belong
+						// on one card. Without this every second half was pushed to
+						// a new slot ("第 9 季") beside its own first half.
+						merged := mergeSeasonLabels(old.Name, seasonName)
+						if merged != "" && merged != old.Name {
+							old.Name = merged
+							_ = sc.Store.UpdateItemMeta(old)
+						}
+						// Do not let the label sync below overwrite a card that now
+						// describes both halves with this file's half.
+						seasonName = old.Name
+					}
 				}
 			}
 		}
@@ -794,18 +991,32 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 		if !ok {
 			pid := seasonID
 			it := &models.Item{LibraryID: lib.ID, Type: "episode", ParentID: &pid,
-				Name: fmt.Sprintf("第 %d 集", ep), Season: season, Episode: ep}
+				Name: orDefault(epName, fmt.Sprintf("第 %d 集", ep)), Season: season, Episode: ep}
 			if err := sc.Store.InsertItem(it); err != nil {
 				return err
 			}
 			epID = it.ID
 			idx.eps[epKey] = epID
-		} else if cur, err := sc.Store.ItemByID(epID); err == nil && (cur.Season != season || cur.Episode != ep) {
-			// Repair what an older scan stored: an episode written as season 0 sorts
-			// to the end of its own season, so a rescan has to correct the row rather
-			// than leave the library in the state that was wrong to begin with.
-			cur.Season, cur.Episode = season, ep
-			_ = sc.Store.UpdateItemMeta(cur)
+		} else if cur, err := sc.Store.ItemByID(epID); err == nil {
+			changed := false
+			if cur.Season != season || cur.Episode != ep {
+				// Repair what an older scan stored: an episode written as season 0 sorts
+				// to the end of its own season, so a rescan has to correct the row rather
+				// than leave the library in the state that was wrong to begin with.
+				cur.Season, cur.Episode = season, ep
+				changed = true
+			}
+			if epName != "" && cur.Name != epName {
+				// The source names this entry, so take its name — including over a
+				// name a provider guessed by episode number, which is how a second
+				// season came to carry the first season's titles. A rescan is what
+				// repairs those rows.
+				cur.Name = epName
+				changed = true
+			}
+			if changed {
+				_ = sc.Store.UpdateItemMeta(cur)
+			}
 		}
 
 		if _, err := sc.Store.UpsertFile(&models.MediaFile{
@@ -821,7 +1032,7 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 		prog.AddEvent("episode", fmt.Sprintf("%s S%02dE%02d", showTitle, season, ep))
 
 	}
-	if err := sc.cleanup(lib, files, current, walked); err != nil {
+	if err := sc.cleanup(lib, files, current, walked, partial, listings); err != nil {
 		log.Printf("organize: cleanup failed (done=%d): %v", progDone(prog), err)
 		return err
 	}
@@ -834,25 +1045,48 @@ func progDone(prog *models.ScanProgress) int {
 	return st.Done
 }
 
-// cleanup deletes files no longer present and prunes childless items.
 // cleanup deletes the files a library no longer holds, and the items left empty.
 //
 // A file is identified by the source it came from *and* its path: a library may
 // scan several sources, and the same path in two of them is two different files.
 //
-// current is the set of sources this library scans now, walked the set this scan
-// managed to read, and the difference between them is the whole point:
+// current is the set of sources this library scans now, so a file whose source
+// is no longer one of them is deleted: the library stopped scanning there, and
+// those rows belong to nobody.
 //
-//   - a file whose source is no longer one of the library's is deleted: the
-//     library stopped scanning there, so those rows belong to nobody;
-//   - a file whose source *is* one of them but was not read this time (a listing
-//     that failed, a drive that was asleep) is left alone — not being able to
-//     read a source is not evidence that its files are gone, and deleting them
-//     would take the rows and the watch progress attached to them with it.
-func (sc *Scanner) cleanup(lib *models.Library, files []fileRec, current, walked map[int64]bool) error {
+// For a source the library still scans, the walk's own directory listings are
+// the evidence. A listing is proof about exactly one directory:
+//
+//   - the file's own directory was read this scan and the file is not among the
+//     files stored, so the row is stale (the file is gone, was filtered out by
+//     size, or is no longer a video);
+//   - a directory further up was read and the folder leading to the file is no
+//     longer in it, so the whole subtree is gone and its rows go with it;
+//   - no directory above the file was read (the drive was asleep, the source
+//     failed, the API rate-limited the listing), so nothing is deleted. Not
+//     being able to read a source is not evidence that its files are gone, and
+//     deleting them would take the rows and the watch progress with them.
+//
+// A partial source (bilibili's feed) is different: its root listing is a sample,
+// so a series missing from it has not necessarily been deleted. There, only the
+// first rule applies — plus a legacy path whose episode is now listed elsewhere
+// (the source restructured its tree, and the same [epN] moved to a new path).
+//
+// The previous version only cleaned a source whose *entire* walk succeeded,
+// which on a bilibili library (hundreds of calls, one rate-limited season) is
+// almost never: every path the tree had before a restructure stayed in the
+// database, and the same series appeared as both the old flat entries and the
+// new series/season tree.
+func (sc *Scanner) cleanup(lib *models.Library, files []fileRec, current, walked, partial map[int64]bool, listings map[string][]source.Entry) error {
 	seen := map[string]bool{}
+	// Episode ids the walk found, for a partial source: a stale path that names
+	// the same [epN] is the old location of a file that now lives elsewhere.
+	seenEp := map[string]bool{}
 	for _, fr := range files {
 		seen[fileSourceKey(fr.SourceID, fr.Path)] = true
+		if tag := fileEpisodeTag(baseName(fr.Path)); tag != "" {
+			seenEp[fileSourceKey(fr.SourceID, tag)] = true
+		}
 	}
 	rows, err := sc.Store.DB.Query(`SELECT f.id, f.source_id, f.path FROM files f JOIN items i ON i.id = f.item_id WHERE i.library_id = ?`, lib.ID)
 	if err != nil {
@@ -870,10 +1104,31 @@ func (sc *Scanner) cleanup(lib *models.Library, files []fileRec, current, walked
 			gone = append(gone, id)
 			continue
 		}
-		if !walked[srcID] {
+		if seen[fileSourceKey(srcID, p)] {
 			continue
 		}
-		if !seen[fileSourceKey(srcID, p)] {
+		if strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://") {
+			// A .strm row stores the URL it points at, not the path the walk
+			// read, so a listing cannot say whether it is gone. Only a source
+			// read to the end can.
+			if walked[srcID] {
+				gone = append(gone, id)
+			}
+			continue
+		}
+		if partial[srcID] {
+			// A feed's root is not an inventory: only the file's own directory
+			// can prove it gone, or the same episode having moved.
+			if fileDirListed(srcID, p, listings) {
+				gone = append(gone, id)
+				continue
+			}
+			if tag := fileEpisodeTag(baseName(p)); tag != "" && seenEp[fileSourceKey(srcID, tag)] {
+				gone = append(gone, id)
+			}
+			continue
+		}
+		if fileGoneFromListings(srcID, p, listings) {
 			gone = append(gone, id)
 		}
 	}
@@ -904,6 +1159,63 @@ func (sc *Scanner) cleanup(lib *models.Library, files []fileRec, current, walked
 	return nil
 }
 
+// fileDirListed reports whether this scan read the directory that holds path.
+// When it did, a file that is not among the walk's files is gone from it.
+func fileDirListed(srcID int64, path string, listings map[string][]source.Entry) bool {
+	dir := parentDir(path)
+	if dir == "" {
+		dir = "/"
+	}
+	_, ok := listings[fmt.Sprintf("%d|%s", srcID, dir)]
+	return ok
+}
+
+// reFileEpisodeTag matches the episode marker a source may keep in a file name
+// ("… [ep395228].mp4"). It is what lets a restructured tree recognise that a
+// path which disappeared is the same episode as one that is now listed.
+var reFileEpisodeTag = regexp.MustCompile(`(?i)\[ep(\d+)\](?:\.[a-z0-9]+)?$`)
+
+func fileEpisodeTag(name string) string {
+	if m := reFileEpisodeTag.FindStringSubmatch(name); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// fileGoneFromListings reports whether a directory this scan read proves that
+// path no longer exists. The walk stores one listing per directory it managed
+// to read, keyed by source and path; a failed (or unread) directory has no entry
+// and proves nothing.
+func fileGoneFromListings(srcID int64, path string, listings map[string][]source.Entry) bool {
+	segs := strings.Split(strings.Trim(path, "/"), "/")
+	if len(segs) < 2 {
+		return false
+	}
+	for i := len(segs) - 1; i >= 0; i-- {
+		dir := "/"
+		if i > 0 {
+			dir = "/" + strings.Join(segs[:i], "/")
+		}
+		ents, ok := listings[fmt.Sprintf("%d|%s", srcID, dir)]
+		if !ok {
+			continue
+		}
+		if i == len(segs)-1 {
+			// The file's own directory was read and the file was not stored.
+			return true
+		}
+		for _, e := range ents {
+			if e.Name == segs[i] {
+				// The folder leading down to the file is still there; whatever
+				// is missing is deeper than what this scan managed to read.
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
 // fileSourceKey identifies a file within a library: the same path on two sources
 // is two different files.
 func fileSourceKey(sourceID int64, path string) string {
@@ -929,6 +1241,24 @@ func parentDir(dir string) string {
 		return ""
 	}
 	return p[:i]
+}
+
+// reBiliSeasonDir matches the id a bilibili season folder carries:
+// "第二季 [season 46085]", "TV [season 3398]", "SP [season 4026]". The bracket
+// is what says the folder is a season rather than a show. A single-season
+// series has exactly one such folder and bilibili names it "TV"; without this
+// marker every one of those series was planned as a show named "TV", and they
+// all merged into one mega-show.
+var reBiliSeasonDir = regexp.MustCompile(`(?i)\s*\[season\s+\d+\]\s*$`)
+
+// biliSeasonTitle returns a bilibili season folder's own title without its id
+// bracket, and whether the folder is one at all.
+func biliSeasonTitle(name string) (string, bool) {
+	n := strings.TrimSpace(name)
+	if !reBiliSeasonDir.MatchString(n) {
+		return "", false
+	}
+	return strings.TrimSpace(reBiliSeasonDir.ReplaceAllString(n, "")), true
 }
 
 // showDirFor finds the "show" directory for an episode file at dir.
@@ -960,6 +1290,16 @@ func showDirFor(libPath, dir string) string {
 	}
 	segs := strings.Split(strings.TrimPrefix(d, "/"), "/")
 	join := func(n int) string { return "/" + strings.Join(segs[:n], "/") }
+	// How many segments the library root itself takes. A source that *is* the
+	// library root ("/", as the bilibili tree is) has none, so the first segment
+	// is already a show. Counting from 1 here is what made a show sitting
+	// directly under the root look like a directory inside a season: the series
+	// folder /装甲重拳 [series 1]/第二季 [season 2]/… resolved to the *season*
+	// folder, and a one-season series never got a show of its own.
+	rootDepth := 0
+	if lib != "" && lib != "/" {
+		rootDepth = len(strings.Split(strings.Trim(lib, "/"), "/"))
+	}
 
 	for i := len(segs) - 1; i >= 1; i-- {
 		if IsContainerDir(segs[i]) {
@@ -967,14 +1307,15 @@ func showDirFor(libPath, dir string) string {
 		}
 		_, isSeason := ParseSeasonDir(segs[i])
 		_, _, isSpecial := SpecialSeasonDir(segs[i])
-		if !isSeason && !isSpecial && !isNumericDir(segs[i]) {
+		_, isBili := biliSeasonTitle(segs[i])
+		if !isSeason && !isSpecial && !isNumericDir(segs[i]) && !isBili {
 			continue
 		}
 		j := i - 1
-		for j >= 1 && (isTechDir(segs[j]) || isNumericDir(segs[j])) {
+		for j >= rootDepth && (isTechDir(segs[j]) || isNumericDir(segs[j])) {
 			j--
 		}
-		if j >= 1 {
+		if j >= rootDepth {
 			return cleanShowDir(join(j+1), lib)
 		}
 		break
@@ -1034,6 +1375,27 @@ func seasonMetaFor(showDir, filePath string) (int, string, bool) {
 		}
 	}
 	for i := len(segs) - 2; i >= start; i-- {
+		// A bilibili season folder carries its id in a bracket. Its title is
+		// what the card should say, and its shape decides the slot: "TV" is the
+		// ordinary first season, "第二季" is season 2, "SP" stays a named
+		// special, and "游郭篇" is a named arc.
+		if title, ok := biliSeasonTitle(segs[i]); ok {
+			seriesTitle := DisplayName(baseName(showDir))
+			if strings.EqualFold(strings.TrimSpace(title), "tv") ||
+				(seriesTitle != "" && NormalizeKey(title) == NormalizeKey(seriesTitle)) {
+				return 1, "第 1 季", true
+			}
+			if n, ok := ParseSeasonDir(title); ok {
+				return n, fmt.Sprintf("第 %d 季", n), true
+			}
+			if strings.EqualFold(strings.TrimSpace(title), "sp") || strings.EqualFold(strings.TrimSpace(title), "sps") {
+				return 0, title, true
+			}
+			if disp, num, ok := SpecialSeasonDir(title); ok {
+				return num, disp, true
+			}
+			return 0, title, true
+		}
 		if n, ok := ParseSeasonDir(segs[i]); ok {
 			return n, fmt.Sprintf("第 %d 季", n), true
 		}
@@ -1063,6 +1425,44 @@ func isNumericSeasonLabel(name string) bool {
 	return reNumericSeasonLabel.MatchString(strings.TrimSpace(name))
 }
 
+// reSeasonPartLabel matches the note a source uses to split one numbered season
+// into broadcast halves: 第二季（前半）/ 第二季（后半）, "Season 2 Part 2", 前篇 /
+// 後編. It is anchored at the end so a name that merely contains 前/后
+// (最后的…, 前后篇) is left alone.
+var reSeasonPartLabel = regexp.MustCompile(`(?i)[\s·•\-—_（(【\[]*(?:前半|后半|前篇|后篇|前編|後編|上篇|下篇|part\s*[12]|part\s*(?:i|ii))(?:[\s·•\-—_）)】\]]*)$`)
+
+// seasonBaseLabel removes a trailing "前半/后半" marker from a season name:
+// "第二季（前半）" and "第二季（后半）" both become "第二季".
+func seasonBaseLabel(name string) string {
+	s := strings.TrimSpace(name)
+	s = reSeasonPartLabel.ReplaceAllString(s, "")
+	return strings.TrimSpace(strings.TrimRight(s, "·•-—_（(【["))
+}
+
+// seasonFamily is what makes two labels the same season: the number when the
+// label carries one ("第二季（前半）", "第 2 季" → 2), the name when it does not
+// ("游郭篇" → 游郭篇).
+func seasonFamily(name string) string {
+	if n, ok := ParseSeasonDir(seasonBaseLabel(name)); ok {
+		return fmt.Sprintf("第%d季", n)
+	}
+	return NormalizeKey(seasonBaseLabel(name))
+}
+
+// mergeSeasonLabels returns the label two parts of one season should share, or
+// the existing label when they are not parts of the same season.
+func mergeSeasonLabels(existing, incoming string) string {
+	if existing == incoming {
+		return existing
+	}
+	if fam := seasonFamily(existing); fam != "" && fam == seasonFamily(incoming) {
+		if base := seasonBaseLabel(existing); base != "" {
+			return base
+		}
+	}
+	return existing
+}
+
 // isTechDir: release-group / quality / junk directories that must not be
 // mistaken for the show title.
 func isTechDir(name string) bool {
@@ -1078,4 +1478,40 @@ func orDefault(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// sourceLabel reads the name the source itself gave an entry, for sources that
+// name what they list.
+//
+// bilibili writes a file as "<series> <its own label>", where the label is the
+// episode's title ("第3话 结婚") or, for a section entry, the section and the
+// entry's name ("PV&其他 第3话预告 新国王"). That is the title the show is
+// published under, it is right for *this* season, and it beats asking a provider
+// to guess which episode of which season a row is — the guess is how a second
+// season ended up carrying the first season's episode titles.
+//
+// Empty for every other source: a local release name is not an episode title.
+func sourceLabel(fr fileRec, showDir string) string {
+	if fr.SrcType != "bilibili" {
+		return ""
+	}
+	stem := baseName(fr.Path)
+	if i := strings.LastIndex(stem, "."); i >= 0 {
+		stem = stem[:i]
+	}
+	label := stem
+	if showDir != "" {
+		series := DisplayName(baseName(showDir))
+		if series != "" && strings.HasPrefix(label, series) {
+			label = label[len(series):]
+		}
+	}
+	label = reExtraTag.ReplaceAllString(label, " ")
+	label = reFileEpisodeTag.ReplaceAllString(label, " ")
+	label = strings.Join(strings.Fields(label), " ")
+	// Nothing but the series name left: there is no label to prefer.
+	if label == "" || NormalizeKey(label) == NormalizeKey(stem) {
+		return ""
+	}
+	return label
 }

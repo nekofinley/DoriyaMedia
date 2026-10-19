@@ -155,6 +155,14 @@ func NewProber(ffprobe string) *Prober {
 
 // ProbeFile runs ffprobe against a local path or a URL with optional headers.
 func (p *Prober) ProbeFile(ctx context.Context, target string, headers map[string]string) (*Probe, error) {
+	return p.ProbeFileVia(ctx, target, headers, "")
+}
+
+// ProbeFileVia is ProbeFile with a proxy: proxy is an http:// URL ffprobe
+// tunnels through, or "" to dial directly. ffprobe's own http protocol only
+// honours an http:// proxy, so a source behind SOCKS5 or Shadowsocks is handed
+// a loopback bridge (see netproxy.Bridge) — the same one its ffmpeg inputs use.
+func (p *Prober) ProbeFileVia(ctx context.Context, target string, headers map[string]string, proxy string) (*Probe, error) {
 	cctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
@@ -183,6 +191,7 @@ func (p *Prober) ProbeFile(ctx context.Context, target string, headers map[strin
 		}
 		args = append(args, "-headers", b.String())
 	}
+	args = ProxyArgs(args, proxy)
 	args = append(args, target)
 
 	cmd := exec.CommandContext(cctx, p.FFProbe, args...)

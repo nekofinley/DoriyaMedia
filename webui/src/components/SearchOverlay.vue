@@ -24,6 +24,11 @@ const loading = ref(false)
 const results = ref([])
 const recents = ref([])
 const active = ref(0)
+// Catalogue hits are titles that exist on the source but not in any library yet.
+const catalog = ref([])
+const catalogLoading = ref(false)
+const catalogWarning = ref('')
+let catalogSeq = 0
 
 watch(() => props.open, async (v) => {
   if (v) {
@@ -33,6 +38,8 @@ watch(() => props.open, async (v) => {
   } else {
     q.value = ''
     results.value = []
+    catalog.value = []
+    catalogLoading.value = false
   }
 })
 
@@ -45,13 +52,24 @@ async function loadRecents() {
 }
 
 let timer = null
+let catalogTimer = null
 watch(q, () => {
   active.value = 0
   clearTimeout(timer)
   const term = q.value.trim()
-  if (!term) { results.value = []; loading.value = false; return }
+  if (!term) {
+    results.value = []
+    catalog.value = []
+    loading.value = false
+    catalogLoading.value = false
+    return
+  }
   loading.value = true
   timer = setTimeout(run, 220)
+  // The catalogue search is a second round trip (bilibili); let it lag the
+  // local results by a keystroke's worth so typing never waits on it.
+  clearTimeout(catalogTimer)
+  catalogTimer = setTimeout(runCatalog, 340)
 })
 
 async function run() {
@@ -79,6 +97,51 @@ async function run() {
   } finally {
     loading.value = false
   }
+}
+
+async function runCatalog() {
+  const term = q.value.trim()
+  // One character matches half of bilibili; wait for a second one.
+  if ([...term].length < 2) { catalog.value = []; catalogWarning.value = ''; return }
+  const seq = ++catalogSeq
+  catalogLoading.value = true
+  catalogWarning.value = ''
+  try {
+    const r = await api.get(`/api/catalog/search?q=${encodeURIComponent(term)}&limit=12`)
+    if (seq !== catalogSeq) return // a newer keystroke already owns the box
+    catalog.value = r.items || []
+    catalogWarning.value = (r.warnings || []).join('; ')
+  } catch (e) {
+    if (seq === catalogSeq) {
+      catalog.value = []
+      catalogWarning.value = e.message
+    }
+  } finally {
+    if (seq === catalogSeq) catalogLoading.value = false
+  }
+}
+
+// bilibili serves covers over http, and its image CDN rejects a foreign
+// referer. Upgrade the scheme, ask for the 320px rendition (the originals are
+// multi-megabyte PNGs), and the <img> is rendered with referrerpolicy=no-referrer.
+function coverOf(url) {
+  if (!url) return ''
+  let u = String(url).replace(/^http:/, 'https:')
+  if (!u.includes('@')) u += '@320w_480h_1c.webp'
+  return u
+}
+
+function openCatalog(hit) {
+  emit('update:open', false)
+  router.push({
+    path: `/import/${hit.source_id}/${hit.season_id}`,
+    query: {
+      library: hit.library_id,
+      title: hit.title,
+      cover: coverOf(hit.cover),
+      year: hit.year || '',
+    },
+  })
 }
 
 const shown = computed(() => (q.value.trim() ? results.value : recents.value))
@@ -121,10 +184,10 @@ function onKeydown(e) {
             <div v-if="!q.trim() && recents.length" class="hint-row">
               <AppIcon name="history" :size="14" /> 最近添加
             </div>
-            <div v-else-if="q.trim() && !loading && !results.length" class="none">
+            <div v-else-if="q.trim() && !loading && !catalogLoading && !results.length && !catalog.length && !catalogWarning" class="none">
               <AppIcon name="search" :size="26" />
               <div class="t">没有找到「{{ q }}」</div>
-              <div class="tiny">试试更短的关键词,或检查媒体库是否已扫描</div>
+              <div class="tiny">媒体库里没有,B 站片库里也没有相近的番剧</div>
             </div>
 
             <div v-if="shown.length" class="results stagger">
@@ -135,6 +198,40 @@ function onKeydown(e) {
                 @mouseenter="active = i"
               />
             </div>
+
+            <!-- Catalogue results: on bilibili, not in any library. Clicking one
+                 imports its whole series, with a live loading page. -->
+            <section v-if="q.trim() && (catalogLoading || catalog.length || catalogWarning)" class="catalog">
+              <div class="catalog-head">
+                <span class="catalog-label"><AppIcon name="cloud" :size="15" /> B 站片库</span>
+                <span class="tiny">未入库 · 点开自动入库</span>
+                <span v-if="catalogLoading" class="tiny cat-loading">搜索中…</span>
+              </div>
+              <div v-if="catalogWarning" class="cat-warn tiny">
+                <AppIcon name="alert" :size="12" /> {{ catalogWarning }}
+              </div>
+              <div class="catalog-grid">
+                <button
+                  v-for="(c, i) in catalog" :key="c.source_id + ':' + c.season_id"
+                  class="catalog-card" :style="{ '--i': Math.min(i, 11) }"
+                  @click="openCatalog(c)"
+                >
+                  <span class="cat-art">
+                    <span class="cat-ph">{{ c.title.slice(0, 2) }}</span>
+                    <img
+                      v-if="coverOf(c.cover)" :src="coverOf(c.cover)" :alt="c.title"
+                      referrerpolicy="no-referrer"
+                      @error="$event.target.style.display = 'none'"
+                    />
+                    <span class="cat-add"><AppIcon name="plus" :size="14" /></span>
+                  </span>
+                  <span class="cat-title truncate">{{ c.title }}</span>
+                  <span class="cat-meta tiny">
+                    {{ [c.year, c.index_show || (c.episodes ? c.episodes + ' 集' : '')].filter(Boolean).join(' · ') || c.library_name }}
+                  </span>
+                </button>
+              </div>
+            </section>
 
             <div v-if="!q.trim() && !recents.length" class="none">
               <AppIcon name="sparkles" :size="26" />
@@ -148,7 +245,7 @@ function onKeydown(e) {
             <span><kbd>↵</kbd> 打开</span>
             <span><kbd>Esc</kbd> 关闭</span>
             <span class="spacer"></span>
-            <span v-if="q.trim()">{{ results.length }} 个结果</span>
+            <span v-if="q.trim()">{{ results.length }} 个库内结果<span v-if="catalog.length"> · {{ catalog.length }} 个未入库</span></span>
           </div>
         </div>
       </div>
@@ -208,6 +305,61 @@ function onKeydown(e) {
 .results :deep(.poster) { width: 100%; }
 .results :deep(.poster.active) { transform: translateY(-4px); }
 .results :deep(.poster.active .art) { border-color: var(--brand); box-shadow: 0 0 0 2px var(--brand), var(--sh-3); }
+
+/* catalogue row — deliberately lighter than the library grid: these cards are
+   not in the library yet, and the plus chip says clicking will add them. */
+.catalog { margin-top: var(--sp-6); padding-top: var(--sp-5); border-top: 1px solid var(--line-1); }
+.catalog-head { display: flex; align-items: center; gap: 10px; margin-bottom: var(--sp-4); }
+.catalog-label {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: var(--fs-13); font-weight: 700; color: var(--text-1);
+}
+.catalog-label svg { color: var(--brand); }
+.cat-loading { margin-left: auto; }
+.cat-warn {
+  display: flex; align-items: center; gap: 6px;
+  margin: -4px 0 var(--sp-4);
+  color: #e5a04b;
+}
+.catalog-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 126px), 1fr));
+  gap: var(--sp-4) var(--sp-3);
+}
+.catalog-card {
+  display: flex; flex-direction: column; gap: 5px;
+  text-align: left; min-width: 0;
+  animation: catalogIn 360ms var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * 28ms);
+}
+.cat-art {
+  position: relative; display: block;
+  aspect-ratio: 2/3; border-radius: var(--r-s);
+  overflow: hidden; background: var(--bg-3);
+  border: 1px solid var(--line-1);
+  transition: border-color var(--t-fast), transform var(--t-fast), box-shadow var(--t-fast);
+}
+.catalog-card:hover .cat-art { border-color: var(--brand); transform: translateY(-3px); box-shadow: var(--sh-3); }
+.cat-art img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
+.cat-ph {
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  font-size: var(--fs-20); font-weight: 800; color: var(--text-4);
+  background: linear-gradient(150deg, var(--bg-2), var(--bg-1));
+}
+.cat-add {
+  position: absolute; right: 7px; bottom: 7px;
+  display: grid; place-items: center;
+  width: 26px; height: 26px; border-radius: 50%;
+  background: var(--brand); color: var(--brand-ink);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  opacity: 0; transform: translateY(5px) scale(0.9);
+  transition: all var(--t-fast);
+}
+.catalog-card:hover .cat-add { opacity: 1; transform: none; }
+.cat-title { font-size: var(--fs-13); font-weight: 650; color: var(--text-1); }
+.cat-meta { color: var(--text-4); }
+@keyframes catalogIn { from { opacity: 0; transform: translateY(8px); } }
 .none {
   display: flex;
   flex-direction: column;

@@ -210,6 +210,7 @@ func packagerArgs(o PackagerOptions) ([]string, error) {
 			target = abs
 		}
 		args = HeaderArgs(args, in.Headers)
+		args = ProxyArgs(args, in.Proxy)
 		if isHTTPPath(target) {
 			args = append(args, "-reconnect", "1", "-reconnect_streamed", "1")
 		}

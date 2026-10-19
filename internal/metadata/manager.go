@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"doriyamedia/internal/config"
 	"doriyamedia/internal/db"
@@ -358,12 +359,26 @@ func (m *Manager) enrichShow(ctx context.Context, drv source.Driver, lib *models
 }
 
 func (m *Manager) enrichEpisode(ctx context.Context, drv source.Driver, lib *models.Library, ep *models.Item, show *models.Item, season *models.Item) {
-	if ep.Name != "" && !strings.HasPrefix(ep.Name, "第") && !strings.HasPrefix(ep.Name, "Episode") {
-		// already has a real name (from a previous run) 鈥?still refresh stills if missing
-		if ep.StillPath != "" {
-			return
-		}
+	// A name the scan took from the source itself is not a guess to be improved
+	// on: bilibili states every episode's title in its listing, and that title is
+	// right for *this* season. Asking a provider by episode number is what gave a
+	// second season the first season's titles, so a real name is kept and the
+	// providers are left to do what they are actually better at — stills, air
+	// dates, overview.
+	keepName := ""
+	if !isPlaceholderEpisodeName(ep) {
+		keepName = ep.Name
 	}
+	if keepName != "" && ep.StillPath != "" {
+		return
+	}
+	defer func() {
+		if keepName != "" && ep.Name != keepName {
+			ep.Name = keepName
+			_ = m.Store.UpdateItemMeta(ep)
+		}
+	}()
+
 	files, err := m.Store.FilesByItem(ep.ID)
 	if err != nil || len(files) == 0 {
 		return
@@ -400,6 +415,21 @@ func (m *Manager) enrichEpisode(ctx context.Context, drv source.Driver, lib *mod
 			}
 		}
 	}
+}
+
+// isPlaceholderEpisodeName reports whether an episode's name is still the one the
+// scan writes when the source gave no title of its own — "第 3 集", "Episode 3",
+// or nothing. Anything else was named by a source, by an nfo, or by an earlier
+// enrichment run, and is worth keeping.
+func isPlaceholderEpisodeName(ep *models.Item) bool {
+	name := strings.TrimSpace(ep.Name)
+	if name == "" {
+		return true
+	}
+	if name == fmt.Sprintf("第 %d 集", ep.Episode) {
+		return true
+	}
+	return strings.HasPrefix(name, "Episode ")
 }
 
 // RefreshItem re-identifies one item, optionally pinning a TMDB id.
@@ -835,7 +865,14 @@ func (m *Manager) tryShowBGM(ctx context.Context, show *models.Item, query strin
 }
 
 // searchBGM finds the best Bangumi subject for a name: exact title match first,
-// then substring match, with the year as a tie-breaker.
+// then a one-character edit, with the year as a tie-breaker.
+//
+// When nothing in the search results is close enough, it retries with spellings
+// that drop one character. Release folder names routinely carry one extra or
+// wrong character ("别再当欧尼酱了" vs "别当欧尼酱了！", "监狱学院" vs "监狱学园"),
+// and the search engine cannot find the subject from the longer spelling at all.
+// Every rewritten search is scored against the *original* name, so a variant
+// keyword can never pick a subject that does not resemble the title.
 func (m *Manager) searchBGM(ctx context.Context, query string, year int) (*BgmSubject, error) {
 	q := strings.TrimSpace(query)
 	if q == "" || len([]rune(q)) < 2 {
@@ -850,18 +887,56 @@ func (m *Manager) searchBGM(ctx context.Context, query string, year int) (*BgmSu
 	if err != nil {
 		return nil, err
 	}
+	if sub := m.bgmSubjectFor(ctx, b, q, year, results); sub != nil {
+		m.logApproxBGM(q, sub)
+		return sub, nil
+	}
+	// A title the engine did not understand well enough to return anything is
+	// not going to be found by deleting a character either; the retries are for
+	// the common case where wrong hits came back instead of the right one.
 	if len(results) == 0 {
 		return nil, nil
 	}
-	best := pickBGM(q, year, results)
+	for _, variant := range bgmQueryVariants(q) {
+		throttle()
+		hits, err := b.Search(ctx, variant, BgmTypeAnime)
+		if err != nil {
+			return nil, err
+		}
+		if sub := m.bgmSubjectFor(ctx, b, q, year, hits); sub != nil {
+			m.logApproxBGM(q, sub)
+			return sub, nil
+		}
+	}
+	return nil, nil
+}
+
+// bgmSubjectFor picks the best hit for query and loads its detail (rating, tags
+// and summary that search results may omit). The detail call is best-effort:
+// the search hit is still usable metadata when it fails.
+func (m *Manager) bgmSubjectFor(ctx context.Context, b *BangumiClient, query string, year int, results []BgmSubject) *BgmSubject {
+	best := pickBGM(query, year, results)
 	if best < 0 {
-		return nil, nil
+		return nil
 	}
-	// Full detail carries rating/tags/summary that search results may omit.
 	if d, err := b.Subject(ctx, results[best].ID); err == nil && d != nil {
-		return d, nil
+		return d
 	}
-	return &results[best], nil
+	return &results[best]
+}
+
+// logApproxBGM leaves a trace when a subject was accepted although neither of
+// its titles equals the filename, so an occasional wrong pick can be spotted
+// and pinned by id from the detail page.
+func (m *Manager) logApproxBGM(query string, sub *BgmSubject) {
+	if sub == nil {
+		return
+	}
+	nq := normTitle(query)
+	if nq == normTitle(sub.NameCN) || nq == normTitle(sub.Name) {
+		return
+	}
+	log.Printf("Bangumi 近似匹配: %q → #%d《%s》", query, sub.ID, preferCN(sub.NameCN, sub.Name))
 }
 
 // pickBGM returns the index of the best matching search result, or -1 when
@@ -877,7 +952,8 @@ func pickBGM(query string, year int, results []BgmSubject) int {
 		switch {
 		case ncn != "" && ncn == nq, norig != "" && norig == nq:
 			score = 100
-		case nearMatch(ncn, nq), nearMatch(norig, nq):
+		case nearMatch(ncn, nq), nearMatch(norig, nq),
+			titleClose(ncn, nq), titleClose(norig, nq):
 			score = 60
 		}
 		if year > 0 && r.Year == year {
@@ -891,6 +967,103 @@ func pickBGM(query string, year int, results []BgmSubject) int {
 		return -1
 	}
 	return best
+}
+
+// titleClose reports whether two normalized titles differ by only a character
+// or two, which is how release folder names usually diverge from the official
+// title ("别再当欧尼酱了" / "别当欧尼酱了", "监狱学院" / "监狱学园").
+func titleClose(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	ra, rb := []rune(a), []rune(b)
+	if len(ra) > len(rb) {
+		ra, rb = rb, ra
+	}
+	short, long := len(ra), len(rb)
+	if short < 3 {
+		return false
+	}
+	common := lcsLen(ra, rb)
+	if long <= 6 {
+		return common >= long-1
+	}
+	return float64(common) >= 0.8*float64(long)
+}
+
+// lcsLen returns the length of the longest common subsequence of a and b.
+func lcsLen(a, b []rune) int {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	prev := make([]int, len(b)+1)
+	cur := make([]int, len(b)+1)
+	for i := 1; i <= len(a); i++ {
+		for j := 1; j <= len(b); j++ {
+			switch {
+			case a[i-1] == b[j-1]:
+				cur[j] = prev[j-1] + 1
+			case prev[j] >= cur[j-1]:
+				cur[j] = prev[j]
+			default:
+				cur[j] = cur[j-1]
+			}
+		}
+		prev, cur = cur, prev
+	}
+	return prev[len(b)]
+}
+
+// bgmQueryVariants returns one-character-deleted spellings of a title, most
+// promising first. Characters that release names tend to add are tried first,
+// so the usual mismatch ("别再…" for "别当…") costs a single extra request.
+// Only Han titles are expanded: dropping a Latin character rarely produces the
+// official title, and TMDB is the better fallback for those.
+func bgmQueryVariants(title string) []string {
+	base := normTitle(title)
+	runes := []rune(base)
+	if len(runes) < 4 || len(runes) > 24 || !hasHan(base) {
+		return nil
+	}
+	const filler = "再又了的之吧呢啊呀啦嘛哦"
+	seen := make([]bool, len(runes))
+	order := make([]int, 0, len(runes))
+	for _, f := range filler {
+		for i, r := range runes {
+			if r == f && !seen[i] {
+				seen[i] = true
+				order = append(order, i)
+			}
+		}
+	}
+	for i := range runes {
+		if !seen[i] {
+			order = append(order, i)
+		}
+	}
+	out := make([]string, 0, len(order))
+	used := map[string]bool{}
+	for _, i := range order {
+		v := string(runes[:i]) + string(runes[i+1:])
+		if len([]rune(v)) < 3 || used[v] {
+			continue
+		}
+		used[v] = true
+		out = append(out, v)
+		if len(out) >= 8 {
+			break
+		}
+	}
+	return out
+}
+
+func hasHan(s string) bool {
+	for _, r := range s {
+		if unicode.Is(unicode.Han, r) {
+			return true
+		}
+	}
+	return false
 }
 
 // nearMatch is substring containment with a length-ratio guard, so a short

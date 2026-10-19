@@ -1156,6 +1156,61 @@ func (s *Store) FilesByItem(itemID int64) ([]models.MediaFile, error) {
 	return out, rows.Err()
 }
 
+// FileShowIndex maps every episode file of a library to the show it currently
+// belongs to, keyed by source and path. A scan uses it to recognise a file it
+// has already organized: a show's name can be overwritten by a metadata
+// provider between two scans (「装甲重拳 MEGALOBOX」 → 「MEGALO BOX」), and a
+// scanner that matched shows by name alone then created a second show for the
+// same folder on every scan. The file's own path is the stable identity.
+//
+// split marks a show whose files do not all sit under one source folder. Such a
+// show is the product of an older, wrong grouping (bilibili's `TV [season N]`
+// folders once made every single-season series one "TV" show); it must not be
+// used as an anchor, or the rescan would preserve the wrong grouping instead of
+// repairing it.
+func (s *Store) FileShowIndex(libraryID int64) (byFile map[string]int64, split map[int64]bool, err error) {
+	rows, err := s.DB.Query(`SELECT f.source_id, f.path, sh.id
+		FROM files f
+		JOIN items ep ON ep.id = f.item_id AND ep.type = 'episode'
+		JOIN items se ON se.id = ep.parent_id AND se.type = 'season'
+		JOIN items sh ON sh.id = se.parent_id AND sh.type = 'show'
+		WHERE sh.library_id = ?`, libraryID)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	byFile = map[string]int64{}
+	roots := map[int64]map[string]bool{}
+	for rows.Next() {
+		var sourceID, showID int64
+		var path string
+		if err := rows.Scan(&sourceID, &path, &showID); err != nil {
+			return nil, nil, err
+		}
+		byFile[fmt.Sprintf("%d|%s", sourceID, path)] = showID
+		root := fmt.Sprintf("%d|%s", sourceID, firstPathSegment(path))
+		if roots[showID] == nil {
+			roots[showID] = map[string]bool{}
+		}
+		roots[showID][root] = true
+	}
+	split = map[int64]bool{}
+	for showID, set := range roots {
+		if len(set) > 1 {
+			split[showID] = true
+		}
+	}
+	return byFile, split, rows.Err()
+}
+
+func firstPathSegment(path string) string {
+	p := strings.TrimPrefix(strings.TrimSpace(path), "/")
+	if i := strings.Index(p, "/"); i >= 0 {
+		return p[:i]
+	}
+	return p
+}
+
 func (s *Store) UpdateFileProbe(id int64, probe string) error {
 	_, err := s.DB.Exec(`UPDATE files SET probe=? WHERE id=?`, probe, id)
 	return err

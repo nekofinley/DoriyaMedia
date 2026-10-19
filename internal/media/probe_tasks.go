@@ -213,7 +213,7 @@ func (e *Engine) doProbe(ctx context.Context, file *models.MediaFile, drv source
 		job.err = err
 		return err
 	}
-	probe, err := e.probeWithFallback(ctx, target, headers)
+	probe, err := e.probeWithFallback(ctx, target, headers, sourceProxyFor(drv))
 	if err != nil {
 		job.err = err
 		return err
@@ -245,13 +245,13 @@ func (e *Engine) doProbe(ctx context.Context, file *models.MediaFile, drv source
 // probeWithFallback probes with the configured (small) window and retries with
 // the deep window when that found nothing usable — some muxes hide streams past
 // a short probe.
-func (e *Engine) probeWithFallback(ctx context.Context, target string, headers map[string]string) (*Probe, error) {
+func (e *Engine) probeWithFallback(ctx context.Context, target string, headers map[string]string, proxy string) (*Probe, error) {
 	quick := *e.prober
 	if e.Cfg != nil {
 		quick.ProbeSizeMB = e.Cfg.Playback.ProbeSizeMB
 		quick.AnalyzeSec = e.Cfg.Playback.ProbeAnalyzeSec
 	}
-	probe, err := e.execProbe(ctx, &quick, target, headers)
+	probe, err := e.execProbe(ctx, &quick, target, headers, proxy)
 	if err == nil && (probe.Video() != nil || len(probe.Streams) > 0) {
 		return probe, nil
 	}
@@ -264,7 +264,7 @@ func (e *Engine) probeWithFallback(ctx context.Context, target string, headers m
 
 	deep := *e.prober
 	deep.ProbeSizeMB, deep.AnalyzeSec = deepProbeSizeMB, deepProbeAnalyzeSec
-	deepProbe, deepErr := e.execProbe(ctx, &deep, target, headers)
+	deepProbe, deepErr := e.execProbe(ctx, &deep, target, headers, proxy)
 	if deepErr == nil && (deepProbe.Video() != nil || len(deepProbe.Streams) > 0) {
 		return deepProbe, nil
 	}

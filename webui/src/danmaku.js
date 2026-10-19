@@ -12,6 +12,11 @@
 const FONT_STACK = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC","Source Han Sans SC",sans-serif'
 const FIXED_SECONDS = 4 // how long a top/bottom comment stays on screen
 const LANE_GAP = 1.45 // lane height as a multiple of the font size
+// The first lane does not start against the very top edge. A glyph's ascent and
+// its outline both reach above the baseline box, and on the topmost lane that is
+// the edge of the canvas: the comment reads as cut off. The gap scales with the
+// text, so every 字号 gets the same optical margin.
+const TOP_PAD_RATIO = 0.5
 
 // The 弹幕类型 switches, as bits. One test per comment emitted is cheaper than
 // walking three booleans, and it runs on the emit path, not every frame.
@@ -35,7 +40,7 @@ function maskOf(types) {
 
 export function createDanmaku(canvas) {
   const ctx = canvas.getContext('2d')
-  const opt = { opacity: 1, speed: 8, area: 0.6, fontScale: 1, mask: KIND_ALL }
+  const opt = { opacity: 1, speed: 8, area: 0.6, fontScale: 1, mask: KIND_ALL, stroke: true }
 
   let comments = [] // sorted by time
   let cursor = 0 // next comment to emit
@@ -48,6 +53,7 @@ export function createDanmaku(canvas) {
   let dpr = 1
   let fontSize = 24
   let laneH = 34
+  let topPad = 10
   let laneCount = 1
   let lastTime = -1
 
@@ -55,6 +61,13 @@ export function createDanmaku(canvas) {
     const box = canvas.getBoundingClientRect()
     const w = Math.max(1, Math.round(box.width))
     const h = Math.max(1, Math.round(box.height))
+    // A hidden layer measures 0×0 — the switch takes it out with display:none, and
+    // a settings change can call resize() in the same tick. Taking that box would
+    // leave a 1×1 layer with no lanes, and nothing would bring it back: the element
+    // is the same size it was, so the observer never fires again. Keep the last
+    // real geometry instead; the next resize, or the observer when the layer is
+    // shown again, sets the new one.
+    if (box.width < 1 || box.height < 1) return
     dpr = Math.min(2, window.devicePixelRatio || 1)
     W = w
     H = h
@@ -67,7 +80,8 @@ export function createDanmaku(canvas) {
     const prevFont = fontSize
     fontSize = Math.max(13, Math.min(25, Math.round(h * 0.05))) * opt.fontScale
     laneH = Math.round(fontSize * LANE_GAP)
-    laneCount = Math.max(1, Math.floor((H * opt.area) / laneH))
+    topPad = Math.round(fontSize * TOP_PAD_RATIO)
+    laneCount = Math.max(1, Math.floor((H * opt.area - topPad) / laneH))
     // Text width is measured against the font size, so a cached width belongs to
     // the size it was measured at. A font change is a user action; clearing the
     // cache costs one measure per comment on the next emit, not per frame.
@@ -185,8 +199,6 @@ export function createDanmaku(canvas) {
       const c = a.c
       const size = sizeOf(c)
       ctx.font = `${fontWeight(c)} ${size}px ${FONT_STACK}`
-      ctx.lineWidth = Math.max(2, Math.round(size / 7))
-      ctx.strokeStyle = 'rgba(0,0,0,0.82)'
       let x
       let y
       if (a.fixed) {
@@ -195,7 +207,7 @@ export function createDanmaku(canvas) {
         x = (W - a.w) / 2
         y = c.mode === 4
           ? areaH - (idx + 1) * laneH
-          : idx * laneH
+          : topPad + idx * laneH
         if (t > (c.mode === 4 ? bottomLanes[idx] : topLanes[idx])) continue
       } else {
         const p = (t - c.t) / opt.speed
@@ -205,10 +217,16 @@ export function createDanmaku(canvas) {
         }
         if (p > 1) continue
         x = W - p * (W + a.w)
-        y = a.lane * laneH
+        y = topPad + a.lane * laneH
       }
       if (y < -laneH || y > H) continue
-      ctx.strokeText(c.text, x, y)
+      // The black outline is what keeps light text readable over a bright
+      // picture, but it also fattens every glyph; the settings can drop it.
+      if (opt.stroke) {
+        ctx.lineWidth = Math.max(2, Math.round(size / 7))
+        ctx.strokeStyle = 'rgba(0,0,0,0.82)'
+        ctx.strokeText(c.text, x, y)
+      }
       ctx.fillStyle = colorOf(c)
       ctx.fillText(c.text, x, y)
       keep.push(a)
@@ -240,6 +258,8 @@ export function createDanmaku(canvas) {
       if (next.speed !== undefined) opt.speed = Math.max(3, next.speed)
       if (next.area !== undefined) opt.area = next.area
       if (next.fontScale !== undefined) opt.fontScale = next.fontScale
+      // Drawing only: the next frame already reads it, so no lanes to rebuild.
+      if (next.stroke !== undefined) opt.stroke = !!next.stroke
       if (typesChanged) {
         // Drop what a switched-off type already had on screen, and forget its
         // lanes, so it cannot hold a slot against a type that is still on. The

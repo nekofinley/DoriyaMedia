@@ -35,6 +35,17 @@ type Driver interface {
 	HasDirect() bool
 }
 
+// PartialLister is an optional Driver capability: a directory listing is a
+// sample, not an inventory. bilibili's root is the account's feed (follows +
+// airing + hot), so a series can be absent from it without having been deleted;
+// a scanner that reads that absence as deletion removes a library's shows
+// whenever they leave the feed. Such a source may only be cleaned at the leaf:
+// a directory that was actually read and no longer holds a file proves that
+// file is gone, while a missing ancestor proves nothing.
+type PartialLister interface {
+	PartialListing() bool
+}
+
 // Part is one upstream stream of a file that is really several of them. It is
 // the shape a DASH source has: the picture and the sound sit at two different
 // URLs, and each one needs its own request headers. A driver that can answer
@@ -46,12 +57,12 @@ type Part struct {
 	// Codec is the ffprobe codec name (h264, hevc, av1, aac…), Tag the
 	// codec_tag_string (hvc1 / hev1 / avc1) and Profile the H.264 profile — the
 	// three things the playback decision actually reads.
-	Codec    string  `json:"codec"`
-	Tag      string  `json:"tag,omitempty"`
-	Profile  string  `json:"profile,omitempty"`
-	Width    int     `json:"width,omitempty"`
-	Height   int     `json:"height,omitempty"`
-	Channels int     `json:"channels,omitempty"`
+	Codec    string `json:"codec"`
+	Tag      string `json:"tag,omitempty"`
+	Profile  string `json:"profile,omitempty"`
+	Width    int    `json:"width,omitempty"`
+	Height   int    `json:"height,omitempty"`
+	Channels int    `json:"channels,omitempty"`
 	// Duration is the stream's length in seconds (0 when the source is silent
 	// about it).
 	Duration float64 `json:"duration,omitempty"`
@@ -83,6 +94,47 @@ type Danmaku interface {
 	Comments(ctx context.Context, path string) ([]Comment, error)
 }
 
+// ProxiedDriver is an optional Driver capability: the source reaches its host
+// through a proxy of its own (bilibili from a server abroad), and everything
+// that fetches its bytes on the server's side has to go through that same proxy
+// — including ffmpeg, which is handed a loopback bridge because it cannot dial
+// SOCKS5 or Shadowsocks itself.
+//
+// The string is the setting as configured, in the forms netproxy.Parse accepts;
+// an empty string means direct, which is what a driver without this interface
+// already means.
+type ProxiedDriver interface {
+	ProxySpec() string
+}
+
+// CatalogSearcher is an optional Driver capability: the source can search its
+// own upstream catalogue for titles a library has not scanned yet, and resolve
+// the directory a catalogue result lives under. The scanner then imports just
+// that series subtree — the whole catalogue is far too large to walk.
+type CatalogSearcher interface {
+	// SearchCatalog finds seasons by keyword, best match first.
+	SearchCatalog(ctx context.Context, keyword string, limit int) ([]CatalogHit, error)
+	// CatalogImportPath returns the virtual directory of the series containing
+	// seasonID, plus the series title for display.
+	CatalogImportPath(ctx context.Context, seasonID int64) (path, title string, err error)
+}
+
+// CatalogHit is one season found in a source's catalogue, before it is in the
+// library. It carries just enough to draw a card and let the user click through.
+type CatalogHit struct {
+	SeasonID int64   `json:"season_id"`
+	Title    string  `json:"title"`
+	Original string  `json:"original_title,omitempty"`
+	Overview string  `json:"overview,omitempty"`
+	Cover    string  `json:"cover,omitempty"`
+	Year     int     `json:"year,omitempty"`
+	Episodes int     `json:"episodes,omitempty"`
+	Score    float64 `json:"score,omitempty"`
+	Index    string  `json:"index_show,omitempty"`
+	Kind     string  `json:"kind,omitempty"`
+}
+
+
 // NewDriver builds a driver from a source row.
 func NewDriver(src *models.Source) (Driver, error) {
 	var cfg models.SourceConfig
@@ -99,7 +151,7 @@ func NewDriver(src *models.Source) (Driver, error) {
 	case "openlist":
 		return NewOpenList(cfg.BaseURL, cfg.Token)
 	case "bilibili":
-		return NewBilibili(cfg.BiliCookie, cfg.BiliQuality, cfg.BiliCodec)
+		return NewBilibili(cfg.BiliCookie, cfg.BiliQuality, cfg.BiliCodec, cfg.BiliProxy)
 	case "url":
 		return &URLDriver{}, nil
 	default:

@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -17,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"doriyamedia/internal/netproxy"
 )
 
 // bilibili.go: bilibili's licensed anime (番剧 / PGC) as a storage source.
@@ -57,9 +61,28 @@ type BilibiliDriver struct {
 	cookie  string
 	quality int    // preferred qn; 0 = highest the account may have
 	codec   string // avc | hevc | av01 | auto
+
+	// proxySpec is this source's own way out, for a machine bilibili's region
+	// check refuses (see SourceConfig.BiliProxy). The zero value means direct:
+	// every request then goes through the shared client exactly as before.
+	proxySpec netproxy.Spec
+	// client is the HTTP client the API calls and the CDN reads go through: the
+	// shared one when there is no proxy, otherwise one dialing through it.
+	client *http.Client
+
+	// buvid is the device id bilibili's risk control wants on API requests. A
+	// cookie captured from a browser can lack buvid3, and the search endpoint
+	// then answers with an HTML 412 after the first few requests. It is fetched
+	// once from /x/frontend/finger/spi and appended to the cookie header.
+	buvidMu    sync.Mutex
+	buvid      string
+	buvidTried bool
 }
 
-func NewBilibili(cookie string, quality int, codec string) (*BilibiliDriver, error) {
+// NewBilibili builds the driver. proxy is the source's own proxy setting in any
+// of the forms netproxy accepts (socks5:// / http:// / ss:// / host:port); an
+// empty string means direct.
+func NewBilibili(cookie string, quality int, codec string, proxy string) (*BilibiliDriver, error) {
 	switch codec {
 	case "", "auto", "avc", "h264", "hevc", "h265", "av1", "av01":
 	default:
@@ -68,7 +91,38 @@ func NewBilibili(cookie string, quality int, codec string) (*BilibiliDriver, err
 	if codec == "" {
 		codec = "avc"
 	}
-	return &BilibiliDriver{cookie: strings.TrimSpace(cookie), quality: quality, codec: codec}, nil
+	d := &BilibiliDriver{cookie: strings.TrimSpace(cookie), quality: quality, codec: codec, client: httpClient}
+	spec, err := netproxy.Parse(proxy)
+	switch {
+	case errors.Is(err, netproxy.ErrNoProxy):
+		return d, nil
+	case err != nil:
+		return nil, fmt.Errorf("bilibili: 代理设置无效: %w", err)
+	}
+	c, err := netproxy.NewClient(spec, 0)
+	if err != nil {
+		return nil, fmt.Errorf("bilibili: 代理无法使用: %w", err)
+	}
+	d.proxySpec, d.client = spec, c
+	return d, nil
+}
+
+// ProxySummary describes the source's proxy for a status line, or "" when it
+// dials directly.
+func (d *BilibiliDriver) ProxySummary() string {
+	if d == nil || d.proxySpec.Raw == "" {
+		return ""
+	}
+	return d.proxySpec.Summary()
+}
+
+// ProxySpec states the proxy as configured, for the playback engine (which has
+// to route ffmpeg's own fetches through it too). Empty means direct.
+func (d *BilibiliDriver) ProxySpec() string {
+	if d == nil {
+		return ""
+	}
+	return d.proxySpec.Raw
 }
 
 // ---------- HTTP ----------
@@ -95,10 +149,73 @@ func (d *BilibiliDriver) headers() map[string]string {
 		"User-Agent": biliUA,
 		"Origin":     "https://www.bilibili.com",
 	}
-	if d.cookie != "" {
-		h["Cookie"] = d.cookie
+	ck := d.cookie
+	d.buvidMu.Lock()
+	if d.buvid != "" {
+		if ck == "" {
+			ck = d.buvid
+		} else {
+			ck += "; " + d.buvid
+		}
+	}
+	d.buvidMu.Unlock()
+	if ck != "" {
+		h["Cookie"] = ck
 	}
 	return h
+}
+
+// ensureBuvid fetches the device id bilibili's risk control expects, once per
+// driver. A browser cookie normally carries buvid3; a cookie copied out of one
+// often does not, and /x/web-interface/search/type then answers with an HTML 412
+// (not the JSON -352) after a few requests. The SPI endpoint is public.
+func (d *BilibiliDriver) ensureBuvid(ctx context.Context) {
+	if strings.Contains(d.cookie, "buvid3=") {
+		return
+	}
+	d.buvidMu.Lock()
+	defer d.buvidMu.Unlock()
+	if d.buvidTried {
+		return
+	}
+	d.buvidTried = true
+
+	req, err := http.NewRequestWithContext(ctx, "GET", biliAPI+"/x/frontend/finger/spi", nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("User-Agent", biliUA)
+	req.Header.Set("Referer", biliReferer)
+	req.Header.Set("Origin", "https://www.bilibili.com")
+	if d.cookie != "" {
+		req.Header.Set("Cookie", d.cookie)
+	}
+	resp, err := d.do(ctx, req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return
+	}
+	var spi struct {
+		Data struct {
+			B3 string `json:"b_3"`
+			B4 string `json:"b_4"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(raw, &spi) != nil || strings.TrimSpace(spi.Data.B3) == "" {
+		return
+	}
+	extra := "buvid3=" + strings.TrimSpace(spi.Data.B3)
+	if b4 := strings.TrimSpace(spi.Data.B4); b4 != "" {
+		extra += "; buvid4=" + b4
+	}
+	d.buvid = extra
 }
 
 // streamHeaders is what the CDN needs. The account cookie is deliberately not
@@ -135,6 +252,7 @@ func biliWaitTurn() {
 
 // getJSON calls one API endpoint and unwraps the envelope.
 func (d *BilibiliDriver) getJSON(ctx context.Context, path string, params url.Values) (json.RawMessage, error) {
+	d.ensureBuvid(ctx)
 	biliWaitTurn()
 	u := biliAPI + path
 	if len(params) > 0 {
@@ -147,7 +265,7 @@ func (d *BilibiliDriver) getJSON(ctx context.Context, path string, params url.Va
 	for k, v := range d.headers() {
 		req.Header.Set(k, v)
 	}
-	resp, err := httpDo(ctx, req)
+	resp, err := d.do(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("bilibili: %s: %w", path, err)
 	}
@@ -157,6 +275,10 @@ func (d *BilibiliDriver) getJSON(ctx context.Context, path string, params url.Va
 		return nil, err
 	}
 	if resp.StatusCode >= 300 {
+		switch resp.StatusCode {
+		case 412, 429:
+			return nil, fmt.Errorf("bilibili: 被 B 站风控/限流(%d),请过几分钟再试", resp.StatusCode)
+		}
 		return nil, fmt.Errorf("bilibili: %s: HTTP %d", path, resp.StatusCode)
 	}
 	var r biliResp
@@ -169,6 +291,18 @@ func (d *BilibiliDriver) getJSON(ctx context.Context, path string, params url.Va
 	return r.payload(), nil
 }
 
+// do sends one request through this source's own client: the shared one when no
+// proxy is configured, otherwise one dialing through the source's proxy. Every
+// bilibili request — API, CDN and 弹幕 — goes through here, because a machine
+// that needs a proxy for the region check needs it for all of them.
+func (d *BilibiliDriver) do(ctx context.Context, req *http.Request) (*http.Response, error) {
+	client := d.client
+	if client == nil {
+		client = httpClient
+	}
+	return client.Do(req.WithContext(ctx))
+}
+
 // biliError turns the codes a viewer can actually meet into something worth
 // reading. Everything else keeps bilibili's own wording.
 func biliError(code int, msg string) error {
@@ -176,7 +310,7 @@ func biliError(code int, msg string) error {
 	case -101:
 		return fmt.Errorf("bilibili: 账号未登录(Cookie 失效或没填)——登录后才能看会员集和高清")
 	case -10403:
-		return fmt.Errorf("bilibili: 该内容在当前地区不可观看")
+		return fmt.Errorf("bilibili: 该内容在当前地区不可观看(-10403);服务器若在海外,请在这个源上配置一个落地在中国大陆的代理")
 	case -404:
 		return fmt.Errorf("bilibili: 内容不存在或已下架")
 	case 87007, 87008:
@@ -374,23 +508,62 @@ func seasonDirOf(title string, seasonID int64) string {
 	return fmt.Sprintf("%s [season %d]", biliClean(title), seasonID)
 }
 
-func episodeFileName(series string, ep *pgcEpisode, sectionTitle string) string {
+// episodeFileName names one entry of a season after bilibili's own words for it.
+//
+// A numbered episode keeps the shape it always had, "<series> 第N话 <标题>"
+// (bilibili's title is the number, its long title the episode's own name), so a
+// rescan does not move every file of a library to a new path — a path is what a
+// library keys its rows by, and moving them would take the watch progress with
+// it.
+//
+// Everything else in a season listing is *not* an episode, and must not be
+// readable as one: bilibili keeps 特别篇 / PV / 预告 in sections beside the
+// episodes, named as a viewer would describe them ("第3话预告" — the preview of
+// episode 3). That name contains "第3话", so a scanner reading it as a name sees
+// episode 3 again and the preview ends up as a second version of episode 3 — and
+// that is what plays when the episode is picked. The section is what the entry
+// actually belongs to, so its own label is carried as a marker (extraTag) that
+// the scanner reads before anything else: order within the section, and the
+// section's name.
+func episodeFileName(series string, ep *pgcEpisode, section string, at int) string {
 	num := strings.TrimSpace(ep.Title)
 	name := biliClean(series)
+	marker := ""
 	switch {
-	case sectionTitle != "":
-		name += " " + biliClean(sectionTitle+num)
+	case section != "":
+		name += " " + biliClean(section)
+		if num != "" {
+			name += " " + biliClean(num)
+		}
+		marker = extraTag(at, section)
 	case num != "":
 		if _, err := strconv.Atoi(num); err == nil {
 			name += " 第" + num + "话"
 		} else {
+			// "OVA" / "SP1" / "剧场版": a real entry bilibili does not number.
+			// Its own word is the best label there is — as a card of its own,
+			// not as a version of episode 1.
 			name += " " + biliClean(num)
+			marker = extraTag(at, num)
 		}
 	}
 	if lt := strings.TrimSpace(ep.LongTitle); lt != "" {
 		name += " " + biliClean(lt)
 	}
+	if marker != "" {
+		name += " " + marker
+	}
 	return fmt.Sprintf("%s [ep%d].mp4", name, ep.ID)
+}
+
+// extraTag is the marker that says an entry is a section item: [sp#<order>#<section>].
+// It goes before the [ep<id>] tag, which has to stay last because that is what
+// identifies the file. Brackets and the separator are stripped from the label so
+// the marker itself stays parseable whatever bilibili calls the section.
+func extraTag(at int, label string) string {
+	label = biliClean(label)
+	label = strings.NewReplacer("#", " ", "[", " ", "]", " ").Replace(label)
+	return fmt.Sprintf("[sp#%d#%s]", at, strings.Join(strings.Fields(label), " "))
 }
 
 func lastSegment(p string) string {
@@ -775,6 +948,143 @@ func (d *BilibiliDriver) followSeasons(ctx context.Context) ([]pgcIndexItem, err
 	return v.([]pgcIndexItem), nil
 }
 
+// ---------- catalogue search (search → import) ----------
+
+// biliCatalogItem is one hit of /x/web-interface/search/type?search_type=media_bangumi.
+type biliCatalogItem struct {
+	SeasonID       int64  `json:"season_id"`
+	MediaID        int64  `json:"media_id"`
+	Title          string `json:"title"`
+	OrgTitle       string `json:"org_title"`
+	Cover          string `json:"cover"`
+	Desc           string `json:"desc"`
+	IndexShow      string `json:"index_show"`
+	SeasonType     int    `json:"season_type"`
+	SeasonTypeName string `json:"season_type_name"`
+	PubTime        int64  `json:"pubtime"`
+	EpSize         int    `json:"ep_size"`
+	MediaScore     struct {
+		Score float64 `json:"score"`
+	} `json:"media_score"`
+}
+
+var reCatalogTag = regexp.MustCompile(`<[^>]*>`)
+
+// catalogText removes the <em class="keyword"> highlight a search hit wraps its
+// match in, and decodes the entities bilibili leaves around it.
+func catalogText(s string) string {
+	s = reCatalogTag.ReplaceAllString(s, "")
+	return strings.TrimSpace(html.UnescapeString(s))
+}
+
+// parseCatalogHits converts the search payload into hits. getJSON has already
+// unwrapped the API envelope, so this is the data object itself. Only 番剧 is
+// kept: the search endpoint also matches films and documentaries, and those do
+// not belong in a series library.
+func parseCatalogHits(raw []byte, limit int) ([]CatalogHit, error) {
+	var payload struct {
+		Result []biliCatalogItem `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("bilibili: 搜索结果无法解析: %w", err)
+	}
+	seen := map[int64]bool{}
+	out := make([]CatalogHit, 0, len(payload.Result))
+	for _, it := range payload.Result {
+		if it.SeasonType != 1 || it.SeasonID <= 0 || seen[it.SeasonID] {
+			continue
+		}
+		title := catalogText(it.Title)
+		if title == "" {
+			continue
+		}
+		seen[it.SeasonID] = true
+		cover := strings.Replace(it.Cover, "http://", "https://", 1)
+		year := 0
+		if it.PubTime > 0 {
+			year = time.Unix(it.PubTime, 0).Year()
+		}
+		out = append(out, CatalogHit{
+			SeasonID: it.SeasonID,
+			Title:    title,
+			Original: catalogText(it.OrgTitle),
+			Overview: strings.TrimSpace(it.Desc),
+			Cover:    cover,
+			Year:     year,
+			Episodes: it.EpSize,
+			Score:    it.MediaScore.Score,
+			Index:    strings.TrimSpace(it.IndexShow),
+			Kind:     it.SeasonTypeName,
+		})
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// SearchCatalog finds 番剧 in bilibili's public catalogue. The catalogue is what
+// the library's root cannot show: 我的追番 + 正在更新 + 热门 are a sample, so a
+// title the viewer wants can be absent from the tree and still be on bilibili.
+func (d *BilibiliDriver) SearchCatalog(ctx context.Context, keyword string, limit int) ([]CatalogHit, error) {
+	keyword = strings.TrimSpace(keyword)
+	if keyword == "" {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 30 {
+		limit = 20
+	}
+	// The search endpoint is the one bilibili rate-limits hardest; caching per
+	// keyword keeps a viewer typing in the search box from spending the source's
+	// request budget.
+	key := "catalog-search:" + strings.ToLower(keyword)
+	v, err := biliCached(key, 10*time.Minute, func() (any, error) {
+		raw, err := d.getJSON(ctx, "/x/web-interface/search/type", url.Values{
+			"search_type": {"media_bangumi"},
+			"keyword":     {keyword},
+			"page":        {"1"},
+		})
+		if err != nil {
+			return nil, err
+		}
+		return parseCatalogHits(raw, 30)
+	})
+	if err != nil {
+		return nil, err
+	}
+	hits := v.([]CatalogHit)
+	if len(hits) > limit {
+		hits = hits[:limit]
+	}
+	return hits, nil
+}
+
+// CatalogImportPath resolves the series directory a catalogue hit belongs to.
+// Importing a season means importing its whole series: the virtual tree groups
+// every 季度 of a franchise under one series directory, and the scanner turns
+// that directory into one show with its seasons.
+func (d *BilibiliDriver) CatalogImportPath(ctx context.Context, seasonID int64) (string, string, error) {
+	if seasonID <= 0 {
+		return "", "", fmt.Errorf("bilibili: 无效的季度 ID")
+	}
+	key, title, err := d.franchiseOf(ctx, seasonID)
+	if err != nil {
+		return "", "", err
+	}
+	if key == 0 {
+		key = seasonID
+	}
+	if strings.TrimSpace(title) == "" {
+		if s, err := d.season(ctx, seasonID); err == nil {
+			title = strings.TrimSpace(s.Title)
+		}
+	}
+	if strings.TrimSpace(title) == "" {
+		title = fmt.Sprintf("番剧 %d", seasonID)
+	}
+	return VirtualJoin("/", seriesDir(title, key)), title, nil
+}
+
 // episodeEntries lists one season's episodes and its extra sections. Paths are
 // built under the directory that was actually listed, so the same 季度 reached
 // through two paths still resolves to its own episodes.
@@ -794,19 +1104,21 @@ func (d *BilibiliDriver) episodeEntries(ctx context.Context, dir string, seasonI
 		}
 	}
 	out := make([]Entry, 0, len(s.Episodes)+4)
-	add := func(ep *pgcEpisode, section string) {
-		name := episodeFileName(series, ep, section)
+	// at is the entry's own position within its list. It is what the section
+	// marker records, so a 特别篇 that is not numbered still has a stable order.
+	add := func(ep *pgcEpisode, section string, at int) {
+		name := episodeFileName(series, ep, section, at)
 		out = append(out, Entry{
 			Name: name, Path: VirtualJoin(dir, name),
 			IsDir: false, MTime: ep.PubTime,
 		})
 	}
 	for i := range s.Episodes {
-		add(&s.Episodes[i], "")
+		add(&s.Episodes[i], "", i+1)
 	}
 	for _, sec := range s.Section {
 		for i := range sec.Episodes {
-			add(&sec.Episodes[i], sec.Title)
+			add(&sec.Episodes[i], sec.Title, i+1)
 		}
 	}
 	return out, nil
@@ -948,22 +1260,44 @@ func (d *BilibiliDriver) playInfo(ctx context.Context, ref biliEpisodeRef, epID 
 	if err := json.Unmarshal(raw, &info); err != nil {
 		return nil, err
 	}
-	if err := checkPlayInfo(&info); err != nil {
+	if err := checkPlayInfo(&info, ref.Duration); err != nil {
 		return nil, err
 	}
 	return &info, nil
 }
 
-// checkPlayInfo rejects the shapes that carry no streams. A membership episode
-// is the one that matters: for an account without a membership bilibili answers
-// code 0, is_preview 1 and no DASH at all. That is not an error the API reports,
-// so it has to be recognised here or the viewer gets a player that never starts.
-func checkPlayInfo(info *pgcPlayInfo) error {
-	if info.Dash != nil && len(info.Dash.Video) > 0 {
-		return nil
-	}
+// checkPlayInfo rejects the shapes that carry no streams — or carry the wrong
+// ones. A membership episode is the case that matters most: for an account
+// without a membership bilibili answers code 0, is_preview 1 and no DASH at
+// all. That is not an error the API reports, so it has to be recognised here or
+// the viewer gets a player that never starts.
+//
+// Two further answers are refused for the same reason: they are not the
+// episode, but they do play.
+//
+//   - is_preview 1 *with* a DASH block is the trial clip: a few minutes of the
+//     episode at 360p with a 64 kbit/s audio track. It used to pass this check
+//     (there is video, so nothing looked wrong) and the viewer was shown a
+//     couple of minutes of it instead of the episode.
+//   - a DASH block whose duration is far short of the episode's is the same
+//     thing wearing a different flag, and a sample/trailer answer looks exactly
+//     like it. episodeMS is the length the season listing stated, 0 when it did
+//     not.
+func checkPlayInfo(info *pgcPlayInfo, episodeMS int64) error {
 	if info.IsPreview == 1 {
 		return fmt.Errorf("bilibili: 这一集需要大会员(当前账号只能试看)")
+	}
+	if info.Dash != nil && len(info.Dash.Video) > 0 {
+		if episodeMS > 0 && info.Dash.Duration > 0 {
+			got := int64(info.Dash.Duration) * 1000
+			// 20% of slack: a listing's duration is rounded, and an episode can
+			// carry a slightly longer opening than the number states.
+			if got*5 < episodeMS*4 {
+				return fmt.Errorf("bilibili: 只拿到 %d 秒的片段,整集约 %d 秒——这一集没有按正片下发(试看或样片)",
+					info.Dash.Duration, episodeMS/1000)
+			}
+		}
+		return nil
 	}
 	return fmt.Errorf("bilibili: 这一集没有可播放的流(可能已下架或需要大会员)")
 }
@@ -977,6 +1311,24 @@ var avcProfiles = map[string]string{
 	"42": "Baseline", "4d": "Main", "58": "Extended",
 	"64": "High", "6e": "High 10", "7a": "High 4:4:4",
 	"f4": "High 4:4:4 Predictive",
+}
+
+// hevcProfiles maps the profile_idc field of an RFC 6381 HEVC codec string
+// ("hvc1.2.4.L150.90" → "2") to the profile name ffprobe reports. It matters
+// because Main 10 is what bilibili's HDR rungs carry and plenty of consumer
+// decoders that advertise HEVC only handle 8-bit Main.
+var hevcProfiles = map[string]string{
+	"1": "Main", "2": "Main 10", "3": "Main Still Picture", "4": "Rext",
+}
+
+// hevcProfile reads the profile out of an HEVC codec string.
+func hevcProfile(codecs string) string {
+	if parts := strings.Split(codecs, "."); len(parts) >= 2 {
+		if p, ok := hevcProfiles[parts[1]]; ok {
+			return p
+		}
+	}
+	return "Main"
 }
 
 // codecOf turns a DASH codecs string into (ffprobe codec, codec_tag_string,
@@ -993,9 +1345,9 @@ func codecOf(codecs string) (name, tag, profile string) {
 		}
 		return "h264", c[:4], profile
 	case strings.HasPrefix(c, "hev1"):
-		return "hevc", "hev1", "Main"
+		return "hevc", "hev1", hevcProfile(c)
 	case strings.HasPrefix(c, "hvc1"):
-		return "hevc", "hvc1", "Main"
+		return "hevc", "hvc1", hevcProfile(c)
 	case strings.HasPrefix(c, "av01"):
 		return "av1", "av01", "Main"
 	case strings.HasPrefix(c, "mp4a"), strings.HasPrefix(c, "aac"):
@@ -1048,26 +1400,89 @@ func codecMatches(codecs, wanted string) bool {
 	return strings.HasPrefix(codecs, strings.ToLower(wanted))
 }
 
-// pickVideo chooses one representation: the highest quality the account may
-// have, and within it the most playable codec.
+// biliQNHDR and biliQNDolbyVision are the quality rungs bilibili publishes as
+// HDR and as Dolby Vision. Both are HEVC Main 10 in BT.2020 with a PQ transfer
+// function, and neither survives a plain stream copy to a normal client: the
+// picture needs tone mapping (HDR) or a Dolby Vision decoder (DV), and without
+// them the same frames come out washed out at best and green/purple at worst.
+// The player sees a picture that looks like a different scene, not a slightly
+// wrong colour, so these rungs are only ever a last resort.
+const (
+	biliQNHDR         = 125
+	biliQNDolbyVision = 126
+)
+
+// isHDR reports whether this representation needs tone mapping (or a Dolby
+// Vision decoder) before a viewer can see it as intended.
+func (r biliRep) isHDR() bool {
+	if r.ID == biliQNHDR || r.ID == biliQNDolbyVision {
+		return true
+	}
+	c := strings.ToLower(strings.TrimSpace(r.Codecs))
+	return strings.HasPrefix(c, "dvhe") || strings.HasPrefix(c, "dvh1") ||
+		strings.HasPrefix(c, "dva1") || strings.HasPrefix(c, "dvav")
+}
+
+// pickVideo chooses one representation: the configured codec when the account
+// has it, an SDR one rather than an HDR/Dolby Vision one, and within that the
+// highest quality and the heaviest variant.
+//
+// The order is deliberate, and it is not the obvious one. Quality used to come
+// first, with the codec only breaking ties — which made the source setting a
+// no-op: an account entitled to 4K got the HDR rung (qn 125) on every episode
+// whatever "bili_codec" said, and a client that copied it showed the picture
+// with the wrong luminance and colours. A configured codec is a statement about
+// what the viewer's machine can decode, so it now wins over a higher rung; if
+// the account has no stream in that codec the ladder is used as before.
 func (d *BilibiliDriver) pickVideo(reps []biliRep) (biliRep, bool) {
-	best := biliRep{}
-	found := false
+	cands := make([]biliRep, 0, len(reps))
 	for _, r := range reps {
-		if repURL(r) == "" {
-			continue
+		if repURL(r) != "" {
+			cands = append(cands, r)
 		}
-		if !found {
-			best, found = r, true
-			continue
+	}
+	if len(cands) == 0 {
+		return biliRep{}, false
+	}
+
+	// 1. The configured codec, when the ladder actually offers it.
+	if d.codec != "" && d.codec != "auto" {
+		var matching []biliRep
+		for _, r := range cands {
+			if codecMatches(strings.ToLower(r.Codecs), d.codec) {
+				matching = append(matching, r)
+			}
 		}
+		if len(matching) > 0 {
+			cands = matching
+		}
+	}
+
+	// 2. SDR over HDR/Dolby Vision: a copy of the latter is not the picture the
+	// viewer is supposed to see, and no client here tone maps it.
+	var sdr []biliRep
+	for _, r := range cands {
+		if !r.isHDR() {
+			sdr = append(sdr, r)
+		}
+	}
+	if len(sdr) > 0 {
+		cands = sdr
+	}
+
+	best := cands[0]
+	for _, r := range cands[1:] {
 		if betterRep(r, best, d.codec) {
 			best = r
 		}
 	}
-	return best, found
+	return best, true
 }
 
+// betterRep orders two representations that have already passed the codec and
+// SDR filters: the higher quality rung first, then the better-ranked codec (a
+// no-op when the configured codec was matched above), then the heavier variant
+// of the same rung.
 func betterRep(a, b biliRep, wanted string) bool {
 	if a.ID != b.ID {
 		return a.ID > b.ID
@@ -1081,19 +1496,46 @@ func betterRep(a, b biliRep, wanted string) bool {
 	return a.Bandwidth > b.Bandwidth
 }
 
-// pickAudio chooses the highest-bitrate audio track.
+// pickAudio chooses the audio track to mux: the highest bitrate among the
+// tracks the packager can copy.
+//
+// Copying is the point. bilibili lists its Dolby (ec-3) and Hi-Res (flac) tracks
+// in this same array when the title has them, and taking one by bitrate alone
+// makes things worse, not better: the packager has no way to carry E-AC-3 or
+// FLAC into the output, so it re-encodes the track to 192 kbit/s AAC — measurably
+// worse than the plain 320 kbit/s AAC it passed over, and heard as "muffled".
+// The AAC ladder is what can be handed through untouched.
 func pickAudio(reps []biliRep) (biliRep, bool) {
 	best := biliRep{}
 	found := false
+	var fallback biliRep
+	haveFallback := false
 	for _, r := range reps {
 		if repURL(r) == "" {
+			continue
+		}
+		if !isAACAudio(r.Codecs) {
+			if !haveFallback || r.Bandwidth > fallback.Bandwidth {
+				fallback, haveFallback = r, true
+			}
 			continue
 		}
 		if !found || r.Bandwidth > best.Bandwidth {
 			best, found = r, true
 		}
 	}
-	return best, found
+	if found {
+		return best, true
+	}
+	// No AAC at all: an unusual answer, but a track is better than silence.
+	return fallback, haveFallback
+}
+
+// isAACAudio reports whether a DASH codecs string is AAC, the one audio codec
+// this source's output can carry without re-encoding it.
+func isAACAudio(codecs string) bool {
+	c := strings.ToLower(strings.TrimSpace(codecs))
+	return strings.HasPrefix(c, "mp4a")
 }
 
 // repURL is the address to fetch a representation from: the main CDN one, or the
@@ -1187,7 +1629,7 @@ func (d *BilibiliDriver) Open(ctx context.Context, path string) (io.ReadCloser, 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := httpDo(ctx, req)
+	resp, err := d.do(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -1239,7 +1681,7 @@ func (d *BilibiliDriver) fetchComments(ctx context.Context, cid int64) ([]Commen
 	for k, v := range d.headers() {
 		req.Header.Set(k, v)
 	}
-	resp, err := httpDo(ctx, req)
+	resp, err := d.do(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("bilibili: 拉取弹幕失败: %w", err)
 	}
@@ -1308,3 +1750,8 @@ func looksLikeXML(b []byte) bool {
 	}
 	return i < len(b) && b[i] == '<'
 }
+
+// PartialListing is true: the root is 我的追番 + 正在更新 + 热门, not the whole
+// catalogue. A 番剧 leaving those lists is still there, and must not take its
+// library rows with it.
+func (d *BilibiliDriver) PartialListing() bool { return true }

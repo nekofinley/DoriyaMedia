@@ -53,6 +53,14 @@ func TestBilibiliSeasonFoldersKeepTheirNumberAndName(t *testing.T) {
 			wantShow: root + "/鬼灭之刃 [series 26801]", wantSeason: 0, wantLabel: "SP",
 		},
 		{
+			// A single-season 番剧 uses a folder literally named "TV". Treating
+			// it as the show made every such series one "TV" mega-show.
+			name: "bilibili's TV folder is a season, not a show", childCount: 1,
+			dir:      "/热门番剧/冰菓 [series 3398]/TV [season 3398]",
+			file:     "/热门番剧/冰菓 [series 3398]/TV [season 3398]/冰菓 第1话 古典部系列 [ep1].mp4",
+			wantShow: root + "/冰菓 [series 3398]", wantSeason: 1, wantLabel: "第 1 季",
+		},
+		{
 			name:     "an ordinary show is unaffected",
 			dir:      "/Cartoon/咒术回战/第 2 季",
 			file:     "/Cartoon/咒术回战/第 2 季/第 01 话.mkv",

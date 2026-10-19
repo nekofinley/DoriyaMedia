@@ -71,17 +71,48 @@ type sessionKey struct {
 	// different start is a different packaging job, so seeking backwards starts a
 	// fresh session instead of reusing one that is already past that point.
 	start int
+	// variant names the source stream the output was packaged from, for a source
+	// whose ladder can change between two plays (bilibili re-resolves its streams
+	// and the rung it hands back varies). Empty for every ordinary file, whose
+	// bytes cannot become something else between two plays.
+	variant string
 }
 
 // SessionKey identifies one packaging session. The type is deliberately
 // unexported: callers obtain a value here and hand it straight back to
 // EnsureSession.
 func SessionKey(fileID int64, mode string, audio, vindex, height, start int) sessionKey {
-	return sessionKey{fileID: fileID, mode: mode, audio: audio, vindex: vindex, height: height, start: start}
+	return SessionKeyVariant(fileID, mode, audio, vindex, height, start, "")
+}
+
+// SessionKeyVariant is SessionKey for a source whose stream is not fixed by the
+// file alone: variant separates the packaging jobs of two different streams of
+// the same file, so a session cached for one of them is never served for the
+// other.
+func SessionKeyVariant(fileID int64, mode string, audio, vindex, height, start int, variant string) sessionKey {
+	return sessionKey{fileID: fileID, mode: mode, audio: audio, vindex: vindex,
+		height: height, start: start, variant: sanitizeVariant(variant)}
+}
+
+// sanitizeVariant keeps a variant filesystem-safe: it becomes part of a
+// directory name, and "-" separates the key's fields.
+func sanitizeVariant(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	var b strings.Builder
+	for _, r := range v {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func (k sessionKey) dirName() string {
-	return fmt.Sprintf("%d-%s-a%d-v%d-h%d-s%d", k.fileID, k.mode, k.audio, k.vindex, k.height, k.start)
+	name := fmt.Sprintf("%d-%s-a%d-v%d-h%d-s%d", k.fileID, k.mode, k.audio, k.vindex, k.height, k.start)
+	if k.variant != "" {
+		name += "-" + k.variant
+	}
+	return name
 }
 
 // Session is one packaging session and its output directory.
@@ -531,11 +562,12 @@ func looksComplete(dir string) bool {
 }
 
 // parseSessionDirName reverses sessionKey.dirName. The mode never contains a
-// dash, so the fields split unambiguously.
+// dash, so the fields split unambiguously; a seventh field is the variant, which
+// older directories do not have.
 func parseSessionDirName(name string) (sessionKey, bool) {
 	var k sessionKey
 	parts := strings.Split(name, "-")
-	if len(parts) != 6 {
+	if len(parts) != 6 && len(parts) != 7 {
 		return k, false
 	}
 	fileID, err := strconv.ParseInt(parts[0], 10, 64)
@@ -553,13 +585,35 @@ func parseSessionDirName(name string) (sessionKey, bool) {
 	if !ok1 || !ok2 || !ok3 || !ok4 {
 		return k, false
 	}
-	return sessionKey{fileID: fileID, mode: parts[1], audio: audio, vindex: vindex, height: height, start: start}, true
+	variant := ""
+	if len(parts) == 7 {
+		variant = sanitizeVariant(parts[6])
+		if variant == "" {
+			return k, false
+		}
+	}
+	return sessionKey{fileID: fileID, mode: parts[1], audio: audio, vindex: vindex,
+		height: height, start: start, variant: variant}, true
 }
 
 // EnsureSession returns the live session for key, reusing a completed one when
 // the cache still holds it, and starting a packager otherwise.
+//
+// Creation is serialised. Two requests for the same stream arrive together on
+// every fresh playback — the media playlist and the init segment are fetched at
+// the same instant — and both used to miss the map, both start an ffmpeg, and
+// both write init.mp4, index.m3u8 and seg00000.m4s into the *same* directory.
+// The loser then closed itself with remove=true, deleting the output the winner
+// was still writing. What a player sees at that point is a stream assembled from
+// two packagers and then partly deleted: segments that decode to the wrong
+// picture, and a retry (a refresh) that works because by then the directory has
+// settled. The lock makes the second request wait and take the finished session
+// instead.
 func (e *Engine) EnsureSession(ctx context.Context, key sessionKey, opts PackagerOptions) (*Session, error) {
 	e.gcSessions()
+
+	e.startMu.Lock()
+	defer e.startMu.Unlock()
 
 	e.sessMu.Lock()
 	if s, ok := e.sessions[key]; ok {
@@ -594,10 +648,13 @@ func (e *Engine) EnsureSession(ctx context.Context, key sessionKey, opts Package
 	s := &Session{key: key, dir: dir, pack: p, cancel: cancel, lastUsed: time.Now(), startedAt: time.Now(), startSeconds: opts.StartSeconds}
 
 	e.sessMu.Lock()
-	// Another request may have won the race; keep only one session per key.
+	// Another request may have won the race; keep only one session per key. It
+	// cannot happen under the creation lock, but the check stays as the invariant
+	// it is — and if it ever does, the loser must not touch the directory it
+	// shares with the winner.
 	if existing, ok := e.sessions[key]; ok {
 		e.sessMu.Unlock()
-		s.close(true)
+		s.close(false)
 		existing.Touch()
 		return existing, nil
 	}

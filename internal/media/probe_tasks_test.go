@@ -34,7 +34,7 @@ func (fakeDriver) ProbeURL(context.Context, string) (string, map[string]string, 
 }
 func (fakeDriver) HasDirect() bool { return true }
 
-func newTestEngine(t *testing.T, probe func(ctx context.Context, p *Prober, target string, headers map[string]string) (*Probe, error)) *Engine {
+func newTestEngine(t *testing.T, probe func(ctx context.Context, p *Prober, target string, headers map[string]string, proxy string) (*Probe, error)) *Engine {
 	t.Helper()
 	store, err := db.Open(filepath.Join(t.TempDir(), "probe-test.db"))
 	if err != nil {
@@ -126,7 +126,7 @@ func TestProbeStatusIdleBeforeStart(t *testing.T) {
 
 func TestStartProbeReachesReadyAndPersists(t *testing.T) {
 	var calls atomic.Int32
-	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string) (*Probe, error) {
+	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string, string) (*Probe, error) {
 		calls.Add(1)
 		return videoProbe("hevc"), nil
 	})
@@ -155,7 +155,7 @@ func TestStartProbeIsSingleFlight(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var calls atomic.Int32
-	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string) (*Probe, error) {
+	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string, string) (*Probe, error) {
 		if calls.Add(1) == 1 {
 			close(entered)
 		}
@@ -183,7 +183,7 @@ func TestStartProbeIsSingleFlight(t *testing.T) {
 
 func TestStartProbeSkippedWhenProbeCached(t *testing.T) {
 	var calls atomic.Int32
-	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string) (*Probe, error) {
+	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string, string) (*Probe, error) {
 		calls.Add(1)
 		return videoProbe("h264"), nil
 	})
@@ -202,7 +202,7 @@ func TestStartProbeSkippedWhenProbeCached(t *testing.T) {
 
 func TestStartProbeCooldownThenRetry(t *testing.T) {
 	var passes atomic.Int32
-	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string) (*Probe, error) {
+	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string, string) (*Probe, error) {
 		passes.Add(1)
 		return nil, errors.New("源请求失败")
 	})
@@ -250,7 +250,7 @@ func TestStartProbeCooldownThenRetry(t *testing.T) {
 }
 
 func TestProbeWithoutVideoStreamFailsInsteadOfLooping(t *testing.T) {
-	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string) (*Probe, error) {
+	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string, string) (*Probe, error) {
 		return &Probe{Streams: []ProbeStream{{Index: 0, CodecType: "audio", CodecName: "aac"}}}, nil
 	})
 	file := testFile()
@@ -277,7 +277,7 @@ func TestProbeUsesConfiguredWindowAndFallsBackToDeep(t *testing.T) {
 	var mu sync.Mutex
 	var got []call
 
-	e := newTestEngine(t, func(_ context.Context, p *Prober, _ string, _ map[string]string) (*Probe, error) {
+	e := newTestEngine(t, func(_ context.Context, p *Prober, _ string, _ map[string]string, _ string) (*Probe, error) {
 		mu.Lock()
 		got = append(got, call{p.ProbeSizeMB, p.AnalyzeSec})
 		mu.Unlock()
@@ -310,7 +310,7 @@ func TestProbeUsesConfiguredWindowAndFallsBackToDeep(t *testing.T) {
 
 func TestProbeStopsAtShallowWindowWhenItSuffices(t *testing.T) {
 	var calls atomic.Int32
-	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string) (*Probe, error) {
+	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string, string) (*Probe, error) {
 		calls.Add(1)
 		return videoProbe("h264"), nil
 	})
@@ -331,7 +331,7 @@ func TestEnsureProbeJoinsInflightBackgroundProbe(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var calls atomic.Int32
-	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string) (*Probe, error) {
+	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string, string) (*Probe, error) {
 		if calls.Add(1) == 1 {
 			close(entered)
 		}
@@ -376,7 +376,7 @@ func TestEnsureProbeJoinsInflightBackgroundProbe(t *testing.T) {
 func TestEnsureProbeHonoursContextCancellation(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	e := newTestEngine(t, func(ctx context.Context, _ *Prober, _ string, _ map[string]string) (*Probe, error) {
+	e := newTestEngine(t, func(ctx context.Context, _ *Prober, _ string, _ map[string]string, _ string) (*Probe, error) {
 		select {
 		case <-entered:
 		default:
@@ -401,7 +401,7 @@ func TestEnsureProbeHonoursContextCancellation(t *testing.T) {
 
 func TestPreProbeSkipsProbedFilesAndCountsProgress(t *testing.T) {
 	var calls atomic.Int32
-	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string) (*Probe, error) {
+	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string, string) (*Probe, error) {
 		calls.Add(1)
 		return videoProbe("h264"), nil
 	})
@@ -442,7 +442,7 @@ func TestPreProbeSkipsProbedFilesAndCountsProgress(t *testing.T) {
 }
 
 func TestPreProbeCountsFailures(t *testing.T) {
-	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string) (*Probe, error) {
+	e := newTestEngine(t, func(context.Context, *Prober, string, map[string]string, string) (*Probe, error) {
 		return nil, fmt.Errorf("网盘取直链失败")
 	})
 	f := testFile()

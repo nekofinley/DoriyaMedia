@@ -34,7 +34,7 @@ func TestCodecOf(t *testing.T) {
 // stateless across a restart.
 func TestVirtualPathsRoundTrip(t *testing.T) {
 	ep := &pgcEpisode{ID: 267851, Title: "1", LongTitle: "残酷"}
-	name := episodeFileName("鬼灭之刃", ep, "")
+	name := episodeFileName("鬼灭之刃", ep, "", 1)
 	if !strings.HasSuffix(name, ".mp4") {
 		t.Fatalf("episode name %q is not a video file", name)
 	}
@@ -68,12 +68,26 @@ func TestVirtualPathsRoundTrip(t *testing.T) {
 
 func TestEpisodeFileNameSections(t *testing.T) {
 	ep := &pgcEpisode{ID: 5, Title: "PV1", LongTitle: "正式预告"}
-	got := episodeFileName("某番", ep, "")
+	got := episodeFileName("某番", ep, "", 1)
 	if !strings.Contains(got, "PV1") || !strings.Contains(got, "正式预告") || !strings.Contains(got, "[ep5]") {
 		t.Fatalf("unexpected name for a non-numeric episode: %q", got)
 	}
+	// A section entry carries the section it came from as a marker, and the marker
+	// has to survive the [epN] tag being last: that tag is what identifies the file.
+	sec := episodeFileName("国王排名", &pgcEpisode{ID: 427417, Title: "第3话预告", LongTitle: "新国王"}, "PV&其他", 2)
+	if !strings.Contains(sec, "[sp#2#PV&其他]") {
+		t.Fatalf("a section entry lost its marker: %q", sec)
+	}
+	if !strings.HasSuffix(sec, "[ep427417].mp4") {
+		t.Fatalf("a section entry lost its identifying tag: %q", sec)
+	}
+	// A numbered episode of the main list keeps the shape it has always had, so a
+	// rescan does not move every file (and take the watch progress with it).
+	if main := episodeFileName("某番", &pgcEpisode{ID: 9, Title: "3", LongTitle: "标题"}, "", 3); main != "某番 第3话 标题 [ep9].mp4" {
+		t.Fatalf("a numbered episode changed shape: %q", main)
+	}
 	// Titles carry characters a path may not.
-	dirty := episodeFileName(`A/B:C*D?E"F<G>H|I`, &pgcEpisode{ID: 1, Title: "1"}, "")
+	dirty := episodeFileName(`A/B:C*D?E"F<G>H|I`, &pgcEpisode{ID: 1, Title: "1"}, "", 1)
 	if strings.ContainsAny(strings.SplitN(dirty, " ", 2)[0], `/\:*?"<>|`) {
 		t.Fatalf("separators survived sanitising: %q", dirty)
 	}
@@ -91,8 +105,9 @@ func TestBiliClean(t *testing.T) {
 	}
 }
 
-// The ladder is walked from the top: the best quality the account may have, and
-// within one rung the codec most clients can decode.
+// The ladder is walked from the top, but the configured codec comes first: that
+// setting exists because a viewer knows what their machine decodes, and a higher
+// rung in a codec they cannot decode is not a better answer.
 func TestPickVideo(t *testing.T) {
 	d := &BilibiliDriver{codec: "avc"}
 	reps := []biliRep{
@@ -103,15 +118,20 @@ func TestPickVideo(t *testing.T) {
 		{ID: 112, Codecs: "av01.0.12M.08", BaseURL: "u112av1", Bandwidth: 2000},
 	}
 	got, ok := d.pickVideo(reps)
-	if !ok || got.ID != 112 {
-		t.Fatalf("pickVideo chose %d/%s, want the highest quality (112)", got.ID, got.Codecs)
+	if !ok || got.BaseURL != "u80avc" {
+		t.Fatalf("pickVideo chose %d/%s, want the AVC rung the account has (80)", got.ID, got.Codecs)
 	}
-	// Without the AV1-only rung, the AVC variant of 80 wins over HEVC.
-	got, _ = d.pickVideo(reps[:4])
-	if got.BaseURL != "u80avc" {
-		t.Fatalf("pickVideo chose %q, want the AVC variant of the same quality", got.BaseURL)
+	// With no AVC on offer at all the ladder decides, exactly as before.
+	noAVC := []biliRep{
+		{ID: 80, Codecs: "hev1.1.6.L120.90", BaseURL: "u80hevc", Bandwidth: 900},
+		{ID: 112, Codecs: "av01.0.12M.08", BaseURL: "u112av1", Bandwidth: 2000},
 	}
-	// An explicit HEVC preference is honoured.
+	got, _ = d.pickVideo(noAVC)
+	if got.BaseURL != "u112av1" {
+		t.Fatalf("pickVideo chose %q without an AVC rung, want the highest quality", got.BaseURL)
+	}
+	// An explicit HEVC preference is honoured, and within it the AVC variant is
+	// no longer preferred.
 	dh := &BilibiliDriver{codec: "hevc"}
 	got, _ = dh.pickVideo(reps[:4])
 	if got.BaseURL != "u80hevc" {
@@ -120,6 +140,40 @@ func TestPickVideo(t *testing.T) {
 	// Entries with no address at all are not candidates.
 	if _, ok := d.pickVideo([]biliRep{{ID: 80, Codecs: "avc1.640028"}}); ok {
 		t.Fatal("pickVideo accepted a representation with no URL")
+	}
+}
+
+// An HDR (qn 125) or Dolby Vision (qn 126) rung is not a better picture for a
+// plain stream copy: without tone mapping or a DV decoder the client renders the
+// same frames with the wrong luminance and colours. SDR wins even though its
+// quality id is lower.
+func TestPickVideoAvoidsHDR(t *testing.T) {
+	d := &BilibiliDriver{codec: "auto"}
+	reps := []biliRep{
+		{ID: 125, Codecs: "hvc1.2.4.H150.90", BaseURL: "u125hdr", Bandwidth: 4400},
+		{ID: 120, Codecs: "hev1.1.6.L153.90", BaseURL: "u120hevc", Bandwidth: 2700},
+		{ID: 120, Codecs: "avc1.640033", BaseURL: "u120avc", Bandwidth: 5400},
+	}
+	got, _ := d.pickVideo(reps)
+	if got.BaseURL == "u125hdr" {
+		t.Fatal("pickVideo chose the HDR rung for a plain copy")
+	}
+	if got.BaseURL != "u120avc" {
+		t.Fatalf("pickVideo chose %q, want the SDR AVC variant of 4K", got.BaseURL)
+	}
+	// Dolby Vision is recognised from the codec string even at another id.
+	dv := []biliRep{
+		{ID: 120, Codecs: "dvh1.08.06", BaseURL: "u120dv", Bandwidth: 3000},
+		{ID: 112, Codecs: "hev1.1.6.L150.90", BaseURL: "u112hevc", Bandwidth: 900},
+	}
+	got, _ = d.pickVideo(dv)
+	if got.BaseURL != "u112hevc" {
+		t.Fatalf("pickVideo chose %q, want the SDR rung beside a Dolby Vision one", got.BaseURL)
+	}
+	// An HDR-only ladder still plays: it is the last resort, not a refusal.
+	got, ok := d.pickVideo([]biliRep{{ID: 125, Codecs: "hvc1.2.4.H150.90", BaseURL: "u125hdr"}})
+	if !ok || got.BaseURL != "u125hdr" {
+		t.Fatalf("pickVideo refused an HDR-only ladder: %q/%v", got.BaseURL, ok)
 	}
 }
 
@@ -132,20 +186,56 @@ func TestPickAudio(t *testing.T) {
 	if !ok || got.BaseURL != "a192" {
 		t.Fatalf("pickAudio chose %q, want the highest bitrate", got.BaseURL)
 	}
+	// A Dolby or Hi-Res track has a higher bitrate but cannot be copied into the
+	// output: it would be re-encoded to 192k AAC, which is worse than handing the
+	// plain 320k AAC through untouched.
+	got, ok = pickAudio([]biliRep{
+		{ID: 30280, Codecs: "mp4a.40.2", BaseURL: "a320", Bandwidth: 320000},
+		{ID: 30250, Codecs: "ec-3", BaseURL: "dolby", Bandwidth: 448000},
+		{ID: 30251, Codecs: "fLaC", BaseURL: "hires", Bandwidth: 1400000},
+	})
+	if !ok || got.BaseURL != "a320" {
+		t.Fatalf("pickAudio chose %q, want the copyable AAC track", got.BaseURL)
+	}
+	// If the answer offers nothing copyable, a track still beats silence.
+	got, ok = pickAudio([]biliRep{{ID: 30250, Codecs: "ec-3", BaseURL: "dolby", Bandwidth: 448000}})
+	if !ok || got.BaseURL != "dolby" {
+		t.Fatalf("pickAudio refused an E-AC-3-only answer: %q/%v", got.BaseURL, ok)
+	}
 }
 
 // A membership episode comes back as code 0 with no DASH at all, so the only
-// place it can be recognised is here.
+// place it can be recognised is here. A trial clip is the same thing with a
+// DASH block attached, and used to slip through: it plays, so nothing looked
+// wrong, and the viewer got a few minutes of the episode instead of the episode.
 func TestCheckPlayInfoRefusesPreviewEpisode(t *testing.T) {
-	if err := checkPlayInfo(&pgcPlayInfo{IsPreview: 1}); err == nil {
+	if err := checkPlayInfo(&pgcPlayInfo{IsPreview: 1}, 0); err == nil {
 		t.Fatal("a preview (会员) episode must not resolve to streams")
 	}
-	if err := checkPlayInfo(&pgcPlayInfo{}); err == nil {
+	if err := checkPlayInfo(&pgcPlayInfo{}, 0); err == nil {
 		t.Fatal("an episode with no dash must not resolve to streams")
 	}
 	ok := &pgcPlayInfo{Dash: &pgcDash{Video: []biliRep{{ID: 80, BaseURL: "u"}}}}
-	if err := checkPlayInfo(ok); err != nil {
+	if err := checkPlayInfo(ok, 0); err != nil {
 		t.Fatalf("a playable episode was refused: %v", err)
+	}
+	// A preview that carries a DASH block is still a trial, not the episode.
+	trial := &pgcPlayInfo{IsPreview: 1, Dash: &pgcDash{Video: []biliRep{{ID: 16, BaseURL: "u"}}}}
+	if err := checkPlayInfo(trial, 0); err == nil {
+		t.Fatal("a preview with a DASH block must be refused")
+	}
+	// A DASH block that is minutes short of the episode is a sample, whatever the
+	// flags say.
+	whole := func() *pgcPlayInfo {
+		return &pgcPlayInfo{Dash: &pgcDash{Video: []biliRep{{ID: 80, BaseURL: "u"}}, Duration: 1421}}
+	}
+	if err := checkPlayInfo(whole(), 1421000); err != nil {
+		t.Fatalf("a full-length episode was refused: %v", err)
+	}
+	short := whole()
+	short.Dash.Duration = 360 // the six-minute trial
+	if err := checkPlayInfo(short, 1421000); err == nil {
+		t.Fatal("a six-minute answer for a 23-minute episode must be refused")
 	}
 }
 
@@ -155,14 +245,14 @@ func TestCheckPlayInfoRefusesPreviewEpisode(t *testing.T) {
 // which the scanner would read as two shows.
 func TestFranchiseTitle(t *testing.T) {
 	cases := []struct{ title, seasonTitle, want string }{
-		{"鬼灭之刃", "立志篇", "鬼灭之刃"},              // first season: nothing to strip
-		{"鬼灭之刃 柱训练篇", "柱训练篇", "鬼灭之刃"},        // a sequel names its own season
-		{"鬼灭之刃 游郭篇 中配版", "游郭篇 中配版", "鬼灭之刃"},  // ...even a dubbed one
+		{"鬼灭之刃", "立志篇", "鬼灭之刃"},             // first season: nothing to strip
+		{"鬼灭之刃 柱训练篇", "柱训练篇", "鬼灭之刃"},       // a sequel names its own season
+		{"鬼灭之刃 游郭篇 中配版", "游郭篇 中配版", "鬼灭之刃"}, // ...even a dubbed one
 		{"间谍过家家 第二季", "第二季", "间谍过家家"},
 		{"间谍过家家 第一季(粤配)", "第一季(粤配)", "间谍过家家"},
-		{"冰菓", "冰菓", "冰菓"},                   // season_title == title: keep it
-		{"某番", "", "某番"},                     // nothing to go on
-		{"游郭篇", "柱训练篇", "游郭篇"},               // not a suffix: leave it alone
+		{"冰菓", "冰菓", "冰菓"},     // season_title == title: keep it
+		{"某番", "", "某番"},       // nothing to go on
+		{"游郭篇", "柱训练篇", "游郭篇"}, // not a suffix: leave it alone
 	}
 	for _, c := range cases {
 		if got := franchiseTitle(c.title, c.seasonTitle); got != c.want {

@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"time"
 
 	"doriyamedia/internal/models"
+	"doriyamedia/internal/netproxy"
 	"doriyamedia/internal/source"
 )
 
@@ -159,17 +161,24 @@ func (e *Engine) ProbeFor(ctx context.Context, file *models.MediaFile, drv sourc
 }
 
 // Input is one ffmpeg input: a URL (or filesystem path) plus the request headers
-// it needs. An ordinary file has one; a source that publishes the picture and
-// the sound separately has two, in that order.
+// it needs and, when the source sits behind one, the proxy to reach it through.
+// An ordinary file has one; a source that publishes the picture and the sound
+// separately has two, in that order.
 type Input struct {
 	Target  string
 	Headers map[string]string
+	// Proxy is an http:// URL ffmpeg tunnels through (see ProxyArgs). It is set
+	// for a source that configures its own proxy, and it is a loopback bridge
+	// rather than the proxy itself, because ffmpeg cannot dial SOCKS5 or
+	// Shadowsocks.
+	Proxy string
 }
 
 // SegmentInputs resolves what a playback has to read: every part for a source
 // that publishes several, otherwise the single target. `rejected` forces a fresh
 // resolution of the link the caller just saw refused.
 func (e *Engine) SegmentInputs(ctx context.Context, file *models.MediaFile, drv source.Driver, rejected string) ([]Input, error) {
+	proxy := sourceProxyFor(drv)
 	if _, ok := drv.(source.MultiPart); ok {
 		parts, err := e.PartsFor(ctx, file, drv, rejected)
 		if err != nil {
@@ -177,7 +186,7 @@ func (e *Engine) SegmentInputs(ctx context.Context, file *models.MediaFile, drv 
 		}
 		ins := make([]Input, 0, len(parts))
 		for _, p := range parts {
-			ins = append(ins, Input{Target: p.URL, Headers: p.Headers})
+			ins = append(ins, Input{Target: p.URL, Headers: p.Headers, Proxy: proxy})
 		}
 		if len(ins) > 0 {
 			return ins, nil
@@ -187,7 +196,7 @@ func (e *Engine) SegmentInputs(ctx context.Context, file *models.MediaFile, drv 
 	if err != nil {
 		return nil, err
 	}
-	return []Input{{Target: target, Headers: headers}}, nil
+	return []Input{{Target: target, Headers: headers, Proxy: proxy}}, nil
 }
 
 // sameInputs reports whether two segment input sets read the same URLs, which is
@@ -202,4 +211,29 @@ func sameInputs(a, b []Input) bool {
 		}
 	}
 	return true
+}
+
+// sourceProxyFor answers the loopback bridge URL a driver's ffmpeg inputs must
+// tunnel through, or "" when the driver has no proxy of its own.
+//
+// Only a source that configures its own proxy has one: the scraper proxies are
+// deliberately not inherited, because they are configured for TMDB / Bangumi and
+// a source that needs a different route says so itself. A bridge failure is
+// logged and treated as "no proxy" rather than failing the playback here — the
+// request will then fail at the source, with the source's own message.
+func sourceProxyFor(drv source.Driver) string {
+	pd, ok := drv.(source.ProxiedDriver)
+	if !ok {
+		return ""
+	}
+	spec, err := netproxy.Parse(pd.ProxySpec())
+	if err != nil {
+		return ""
+	}
+	b, err := netproxy.BridgeFor(spec)
+	if err != nil {
+		log.Printf("ffmpeg proxy bridge for %s: %v", spec.Summary(), err)
+		return ""
+	}
+	return b.URL()
 }

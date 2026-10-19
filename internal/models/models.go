@@ -78,6 +78,17 @@ type SourceConfig struct {
 	BiliCookie  string `json:"bili_cookie,omitempty"`
 	BiliQuality int    `json:"bili_quality,omitempty"` // preferred qn; 0 = best the account has
 	BiliCodec   string `json:"bili_codec,omitempty"`   // avc | hevc | av01 | auto
+	// BiliProxy routes this source's traffic — the API calls, the CDN streams
+	// and the ffmpeg that muxes them — through a proxy of its own. bilibili
+	// answers -10403 (该内容在当前地区不可观看) for a request from outside the
+	// licensed region, so a server abroad needs a way back in; the scraper
+	// proxies are configured for TMDB / Bangumi and are often a different
+	// subscription, hence a field of its own. Empty means direct.
+	//
+	// The same credential rule applies: a proxy string carries a password
+	// (Shadowsocks' password is the key itself), so it is masked for anyone who
+	// is not an administrator.
+	BiliProxy string `json:"bili_proxy,omitempty"`
 }
 
 type Library struct {

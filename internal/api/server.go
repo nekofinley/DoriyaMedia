@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"doriyamedia/internal/auth"
@@ -46,6 +47,12 @@ type Server struct {
 	// SubtitleAudits holds the per-library "which BDRip episodes have no
 	// subtitles" audits and their last results. See subaudit.go.
 	SubtitleAudits *subtitleAuditRegistry
+
+	// imports holds "search a bilibili title, click it, import it" jobs. They are
+	// short-lived and in memory: a job is only useful while its loading page is
+	// polling. See catalog_handlers.go.
+	importsMu sync.Mutex
+	imports   map[string]*importJob
 }
 
 func New(store *db.Store, cfg *config.Config, scanner *scan.Scanner, meta *metadata.Manager, engine *media.Engine, webFS fs.FS, version string) *Server {
@@ -53,6 +60,7 @@ func New(store *db.Store, cfg *config.Config, scanner *scan.Scanner, meta *metad
 		Store: store, Cfg: cfg, Scanner: scanner, Metadata: meta, Engine: engine,
 		WebFS: webFS, DevWeb: cfg.DevWebDir, Version: version,
 		SubtitleAudits: newSubtitleAuditRegistry(),
+		imports:        map[string]*importJob{},
 		// Ten wrong passwords per address per five minutes is far more than a
 		// person needs and far too slow to guess with; five signups per hour
 		// keeps a shared address (a family, a dorm) working while stopping a
@@ -251,6 +259,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/sources/{id}", s.requireAdmin(s.handleUpdateSource))
 	mux.HandleFunc("DELETE /api/sources/{id}", s.requireAdmin(s.handleDeleteSource))
 	mux.HandleFunc("POST /api/sources/test", s.requireAdmin(s.handleTestSource))
+	mux.HandleFunc("POST /api/sources/test-proxy", s.requireAdmin(s.handleTestProxy))
 
 	// libraries
 	mux.HandleFunc("GET /api/libraries", s.requireAuth(s.handleListLibraries))
@@ -272,6 +281,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/items/{id}", s.requireAuth(s.handleItemDetail))
 	mux.HandleFunc("POST /api/items/{id}/refresh", s.requireAuth(s.handleItemRefresh))
 	mux.HandleFunc("GET /api/img/{id}/{kind}", s.handleImage)
+
+	// catalogue search → import (a bilibili title the library has not scanned)
+	mux.HandleFunc("GET /api/catalog/search", s.requireAuth(s.handleCatalogSearch))
+	mux.HandleFunc("POST /api/catalog/import", s.requireAuth(s.handleCatalogImport))
+	mux.HandleFunc("GET /api/import/{id}", s.requireAuth(s.handleImportStatus))
 
 	// playback
 	mux.HandleFunc("GET /api/play/{id}", s.requireAuth(s.handlePlay))

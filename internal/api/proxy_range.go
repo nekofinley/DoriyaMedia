@@ -136,6 +136,16 @@ func reportedAudio(caps string) map[string]bool {
 
 // proxyRemote streams an upstream response, keeping range semantics honest.
 func proxyRemote(w http.ResponseWriter, r *http.Request, target string, headers map[string]string) {
+	proxyRemoteVia(w, r, target, headers, proxyClient)
+}
+
+// proxyRemoteVia is proxyRemote with an explicit client, so a source that
+// reaches the network through its own proxy (bilibili from a server abroad) has
+// its bytes fetched the same way its API calls are.
+func proxyRemoteVia(w http.ResponseWriter, r *http.Request, target string, headers map[string]string, client *http.Client) {
+	if client == nil {
+		client = proxyClient
+	}
 	ctx := r.Context()
 	req, err := http.NewRequestWithContext(ctx, r.Method, target, nil)
 	if err != nil {
@@ -157,7 +167,7 @@ func proxyRemote(w http.ResponseWriter, r *http.Request, target string, headers 
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", "DoriyaMedia/0.1")
 	}
-	resp, err := proxyClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		if ctx.Err() == nil {
 			fail(w, 502, "源请求失败: "+err.Error())
@@ -189,7 +199,7 @@ func proxyRemote(w http.ResponseWriter, r *http.Request, target string, headers 
 	// HEAD that the upstream rejects: learn what we can with a one-byte GET so the
 	// player still sees a length and range support.
 	if r.Method == http.MethodHead && resp.StatusCode >= 400 {
-		if size, ranges, ok := probeSizeByRange(ctx, target, headers); ok {
+		if size, ranges, ok := probeSizeByRange(ctx, target, headers, client); ok {
 			w.Header().Set("Accept-Ranges", ranges)
 			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 			w.Header().Set("Cache-Control", "no-store")
@@ -244,7 +254,7 @@ func serveSlicedRange(w http.ResponseWriter, resp *http.Response, want byteRange
 
 // probeSizeByRange asks for the first byte and reads the total out of the reply,
 // for upstreams that refuse HEAD.
-func probeSizeByRange(ctx context.Context, target string, headers map[string]string) (int64, string, bool) {
+func probeSizeByRange(ctx context.Context, target string, headers map[string]string, client *http.Client) (int64, string, bool) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return 0, "", false
@@ -256,7 +266,7 @@ func probeSizeByRange(ctx context.Context, target string, headers map[string]str
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", "DoriyaMedia/0.1")
 	}
-	resp, err := proxyClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, "", false
 	}

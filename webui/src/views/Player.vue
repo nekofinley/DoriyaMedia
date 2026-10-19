@@ -41,8 +41,9 @@ const nativeSubs = computed(() => !!play.value?.native_subtitles)
  */
 const dmCanvas = ref(null)
 /* Bilibili's own 弹幕设置, in its order: the areas its panel names, the five
- * font sizes, and the three types of comment. The stored numbers are what the
- * renderer takes — a fraction of the canvas, a multiplier, seconds to cross. */
+ * font sizes, and the three types of comment — plus one thing Bilibili does not
+ * offer, turning off the black outline. The stored numbers are what the renderer
+ * takes — a fraction of the canvas, a multiplier, seconds to cross. */
 const DM_AREAS = [
   { value: 0.25, label: '1/4 屏' },
   { value: 0.5, label: '半屏' },
@@ -103,6 +104,11 @@ const danmakuSpeed = ref(Math.min(DM_SPEED_MAX, Math.max(DM_SPEED_MIN, dmStored(
 const danmakuArea = ref(dmNearest(dmStored('dm:dmArea', DM_DEFAULTS.area), DM_AREAS))
 const danmakuFont = ref(dmNearest(dmStored('dm:dmFont', DM_DEFAULTS.font), DM_FONTS))
 const danmakuTypes = ref(dmStoredTypes())
+/** The black outline that keeps light text readable over a bright picture. On by
+ *  default; off is for viewers who want plain type. It is also the part that
+ *  would otherwise reach above the first lane, so the renderer gives every lane
+ *  a small top margin as well (see TOP_PAD_RATIO in danmaku.js). */
+const danmakuStroke = ref(localStorage.getItem('dm:dmStroke') !== '0')
 const dmOpacityPct = computed(() => Math.round(danmakuOpacity.value * 100))
 /** The slider reads 慢 → 快, so its value is the crossing time reversed: the
  *  right-hand end is the renderer's smallest number of seconds. */
@@ -112,6 +118,10 @@ const danmakuFailed = ref(false)
 const danmakuUrl = computed(() => play.value?.danmaku_url || '')
 /** Ready means there is something to draw; the control hides itself otherwise. */
 const danmakuReady = computed(() => !!danmakuUrl.value && danmakuCount.value > 0 && !danmakuFailed.value)
+/** Whether this file has 弹幕 at all: the two bar buttons answer only that. A
+ *  source without them (every non-bilibili file) gets no button rather than a
+ *  switch that can never do anything. */
+const dmControl = computed(() => !!danmakuUrl.value && !danmakuFailed.value)
 let danmaku = null // the renderer
 let dmRaf = 0
 let dmLoadedFor = '' // the URL the current set belongs to
@@ -133,6 +143,17 @@ const panelOpen = ref(false)
 /** Which face the drawer shows: the subtitles, or everything else. */
 const panelMode = ref('settings')
 const menuOpen = ref(false)
+/** The 弹幕 popup, opened by its own button in the control bar. It is a separate
+ *  surface from the settings drawer on purpose: the drawer is the picture, the
+ *  tracks and the mode, and the bullet-comment options are the one group a viewer
+ *  reaches for while watching — often enough to want it one tap from the picture,
+ *  next to the switch that turns the layer on and off. */
+const dmMenuOpen = ref(false)
+/** The 选集 popup: the season's episodes, next to the subtitle button, so a viewer
+ *  can jump to another episode without leaving the picture. Only the theater shows
+ *  the button — a watch page already has its grid or sidebar under the picture. */
+const epMenuOpen = ref(false)
+const epListEl = ref(null)
 // locked: in fullscreen, every control but the lock button stops answering taps,
 // so a hand moving across the screen cannot pause, seek or leave by accident.
 const locked = ref(false)
@@ -180,6 +201,12 @@ function onViewport() {
   vp.value = { w: window.innerWidth, h: window.innerHeight }
   // The picture's box moved with the window, and so did the place the cues belong.
   fitCuesToPicture()
+  // And so did the buttons the two popups hang off: a rotation or a resize that
+  // turns the theater into a watch page (or the other way round) would otherwise
+  // leave an open popup anchored to where its button used to be.
+  menuOpen.value = false
+  dmMenuOpen.value = false
+  epMenuOpen.value = false
 }
 
 const touchOnly = (() => {
@@ -215,7 +242,7 @@ const theaterChrome = computed(() => !isStacked.value || fsActive.value)
  * text below instead. */
 const stageBar = computed(() => theaterChrome.value || layout.value === 'phone')
 const chromeHidden = computed(() => theaterChrome.value && !controlsVisible.value &&
-  isPlaying.value && !menuOpen.value && !panelOpen.value)
+  isPlaying.value && !menuOpen.value && !dmMenuOpen.value && !epMenuOpen.value && !panelOpen.value)
 
 const modeClass = computed(() => `mode-${play.value?.mode || 'direct'}`)
 const MODE_LABELS = { direct: '302 直连', proxy: '代理播放', remux: 'HLS 转封装', unsupported: '无法播放' }
@@ -283,7 +310,8 @@ const forceModes = [
 
 // The play decision answers "what do I play", not "what else is on here", so the
 // siblings are fetched separately: episode → its season → that season's episodes.
-// Only the watch-page layouts ever ask, so a desktop plays exactly as before.
+// Every layout asks now — the theater's 选集 popup needs the list just as the
+// watch page's grid and sidebar do.
 const queue = ref(null)   // { season, show, episodes }
 const meta = ref(null)    // the item behind the current file (overview, air date…)
 let queueFor = 0          // item id the queue was loaded for
@@ -292,7 +320,7 @@ let queueAgain = false
 
 async function loadQueue() {
   const itemId = play.value?.item_id
-  if (!isStacked.value || !itemId || queueFor === itemId) return
+  if (!itemId || queueFor === itemId) return
   if (queueBusy) { queueAgain = true; return }
   queueBusy = true
   try {
@@ -344,6 +372,7 @@ function epSub(ep) {
 function playEpisode(ep) {
   const id = epFile(ep)
   if (!id || id === Number(route.params.fileId)) return
+  epMenuOpen.value = false
   saveProgress()
   router.replace(`/play/${id}`)
   // Picking an episode from the grid would otherwise leave the viewer looking at
@@ -382,10 +411,12 @@ const overview = computed(() => {
  * the subtitles in fullscreen produced the whole settings sheet — which is the
  * thing this separates. On a watch page the two are still one tab, in order. */
 function openPanel(mode) {
-  if (panelInline.value) { tab.value = 'settings'; menuOpen.value = false; return }
+  if (panelInline.value) { tab.value = 'settings'; menuOpen.value = false; dmMenuOpen.value = false; epMenuOpen.value = false; return }
   if (panelOpen.value && panelMode.value === mode) { panelOpen.value = false; return }
   panelMode.value = mode
   menuOpen.value = false
+  dmMenuOpen.value = false
+  epMenuOpen.value = false
   panelOpen.value = true
 }
 /** 'all' where the panel is a watch-page tab, otherwise the face that was asked for. */
@@ -400,6 +431,8 @@ function togglePanel() { openPanel('settings') }
  * tap target competing with the picture behind it. A mouse keeps the popup, where
  * it is the quick way to the speed and mode. */
 function toggleMenu() {
+  dmMenuOpen.value = false
+  epMenuOpen.value = false
   if (panelInline.value) { tab.value = 'settings'; return }
   if (touchOnly) { openPanel('settings'); return }
   menuOpen.value = !menuOpen.value
@@ -1078,14 +1111,14 @@ function ensureDanmaku() {
   danmaku = createDanmaku(dmCanvas.value)
   danmaku.setOptions({
     opacity: danmakuOpacity.value, speed: danmakuSpeed.value, area: danmakuArea.value,
-    fontScale: danmakuFont.value, types: danmakuTypes.value,
+    fontScale: danmakuFont.value, types: danmakuTypes.value, stroke: danmakuStroke.value,
   })
 }
 
 function applyDanmakuOptions() {
   danmaku?.setOptions({
     opacity: danmakuOpacity.value, speed: danmakuSpeed.value, area: danmakuArea.value,
-    fontScale: danmakuFont.value, types: danmakuTypes.value,
+    fontScale: danmakuFont.value, types: danmakuTypes.value, stroke: danmakuStroke.value,
   })
   paintDanmaku()
 }
@@ -1117,12 +1150,18 @@ function toggleDanmakuType(key) {
   applyDanmakuOptions()
 }
 
+function toggleDanmakuStroke() {
+  danmakuStroke.value = !danmakuStroke.value
+  applyDanmakuOptions()
+}
+
 function resetDanmakuOptions() {
   danmakuOpacity.value = DM_DEFAULTS.opacity
   danmakuSpeed.value = DM_DEFAULTS.speed
   danmakuArea.value = DM_DEFAULTS.area
   danmakuFont.value = DM_DEFAULTS.font
   danmakuTypes.value = { scroll: true, top: true, bottom: true }
+  danmakuStroke.value = true
   applyDanmakuOptions()
 }
 
@@ -1154,11 +1193,44 @@ function stopDanmaku() {
 function toggleDanmaku() {
   danmakuOn.value = !danmakuOn.value
   localStorage.setItem('dm:dmOn', danmakuOn.value ? '1' : '0')
-  if (danmakuOn.value) kickDanmaku()
-  else {
+  if (danmakuOn.value) {
+    // The layer was display:none and has this tick's box back only after the DOM
+    // update, so the geometry and the frame are taken after it. One more frame is
+    // painted straight away: a paused picture runs no loop, and the layer has to be
+    // on the screen the moment it is switched back on, not at the next seek.
+    nextTick(() => {
+      danmaku?.resize()
+      paintDanmaku()
+      kickDanmaku()
+    })
+  } else {
+    // Only the loop stops: the layer itself is hidden by the template, and the
+    // comments stay loaded for the next time it is switched on. Dropping them here
+    // would leave a blank layer until the page reloaded, because the loader hands
+    // its list over once per URL.
     stopDanmaku()
-    danmaku?.clear()
   }
+  toast.info(danmakuOn.value ? '弹幕已开启' : '弹幕已关闭', 1300)
+}
+
+/** The 弹幕 button: its own popup, not the settings drawer. Opening it closes the
+ *  other popup, because both hang off the same corner of the control bar. */
+function toggleDmMenu() {
+  dmMenuOpen.value = !dmMenuOpen.value
+  if (dmMenuOpen.value) { menuOpen.value = false; epMenuOpen.value = false }
+}
+
+/** The 选集 button. The three bar popups are one corner, so only one is open at a
+ *  time; the list scrolls the current episode into view, since a season can be
+ *  longer than the popup is tall. */
+function toggleEpMenu() {
+  epMenuOpen.value = !epMenuOpen.value
+  if (!epMenuOpen.value) return
+  menuOpen.value = false
+  dmMenuOpen.value = false
+  nextTick(() => {
+    epListEl.value?.querySelector('.on')?.scrollIntoView({ block: 'nearest' })
+  })
 }
 
 async function loadDanmaku(url) {
@@ -1198,11 +1270,12 @@ watch(danmakuUrl, (url) => {
   }
 })
 
-watch([danmakuOpacity, danmakuSpeed, danmakuArea, danmakuFont], () => {
+watch([danmakuOpacity, danmakuSpeed, danmakuArea, danmakuFont, danmakuStroke], () => {
   localStorage.setItem('dm:dmOpacity', String(danmakuOpacity.value))
   localStorage.setItem('dm:dmSpeed', String(danmakuSpeed.value))
   localStorage.setItem('dm:dmArea', String(danmakuArea.value))
   localStorage.setItem('dm:dmFont', String(danmakuFont.value))
+  localStorage.setItem('dm:dmStroke', danmakuStroke.value ? '1' : '0')
 })
 
 // Toggles replace the object, so a shallow watch sees every change; deep is
@@ -1433,6 +1506,8 @@ function toggleLock() {
   locked.value = !locked.value
   if (locked.value) {
     menuOpen.value = false
+    dmMenuOpen.value = false
+    epMenuOpen.value = false
     panelOpen.value = false
     toast.info('已锁定按键,点左侧锁图标解锁', 2600)
   } else {
@@ -1600,7 +1675,7 @@ function showControls() {
   controlsVisible.value = true
   clearTimeout(hideTimer)
   if (!theaterChrome.value) return   // a page keeps its buttons; only the theater fades
-  if (isPlaying.value && !menuOpen.value && !panelOpen.value) {
+  if (isPlaying.value && !menuOpen.value && !dmMenuOpen.value && !epMenuOpen.value && !panelOpen.value) {
     hideTimer = setTimeout(() => { controlsVisible.value = false }, 3200)
   }
 }
@@ -1619,7 +1694,15 @@ function onKey(e) {
   else if (k === 'm') toggleMute()
   else if (k === 'f') toggleFullscreen()
   else if (k === 'p') togglePip()
-  else if (k === 'escape') { if (panelOpen.value) panelOpen.value = false; else if (menuOpen.value) menuOpen.value = false }
+  // Bilibili's own key for the layer, and the toggle button has to keep working
+  // from the keyboard as the drawer's chip always did.
+  else if (k === 'd' && dmControl.value) toggleDanmaku()
+  else if (k === 'escape') {
+    if (panelOpen.value) panelOpen.value = false
+    else if (menuOpen.value) menuOpen.value = false
+    else if (dmMenuOpen.value) dmMenuOpen.value = false
+    else if (epMenuOpen.value) epMenuOpen.value = false
+  }
   else if (/^[0-9]$/.test(k) && videoEl.value?.duration) {
     videoEl.value.currentTime = (Number(k) / 10) * videoEl.value.duration
   }
@@ -1637,7 +1720,7 @@ function onKey(e) {
 function consumeFullscreenDrag(e) {
   if (!fsActive.value) return
   const t = e.target
-  if (t instanceof Element && t.closest('.panel, .ctl-menu')) return
+  if (t instanceof Element && t.closest('.panel, .ctl-menu, .dm-menu, .ep-menu')) return
   if (e.cancelable) e.preventDefault()
 }
 
@@ -1746,9 +1829,11 @@ onBeforeUnmount(() => {
                  transparent to input, so every gesture still reaches the picture. -->
             <canvas v-show="danmakuReady && danmakuOn" ref="dmCanvas" class="dm-layer" aria-hidden="true"></canvas>
 
-            <!-- On the immersive player the top bar carries the title and the
-                 settings; on a watch page both are in the page below, so only
-                 the way back stays on the picture. -->
+            <!-- On the immersive player the top bar carries the title; on a watch
+                 page that lives in the page below, so only the way back stays on
+                 the picture. The settings entry is the gear in the control bar —
+                 the bar is where every other control is, and a second gear over
+                 the title was one more thing to explain. -->
             <div v-if="stageBar" class="top-bar">
               <button class="icon-btn solid round" aria-label="返回" @click="goBack">
                 <AppIcon name="arrowLeft" :size="19" />
@@ -1765,12 +1850,6 @@ onBeforeUnmount(() => {
                     <span v-if="currentSize" class="tiny">{{ currentSize }}</span>
                   </div>
                 </div>
-                <button
-                  class="icon-btn solid round" :class="{ on: panelOpen }"
-                  aria-label="播放设置" @click="togglePanel"
-                >
-                  <AppIcon name="list" :size="19" />
-                </button>
               </template>
             </div>
 
@@ -1896,6 +1975,45 @@ onBeforeUnmount(() => {
 
               <span class="spacer"></span>
 
+              <!-- 选集: only the theater needs it. A watch page already shows the
+                   episodes under the picture (a grid on a phone, the sidebar on a
+                   tablet), so the button would be a second copy of a list that is
+                   already on screen. -->
+              <div v-if="theaterChrome && episodes.length > 1" class="menu-wrap">
+                <button
+                  class="icon-btn" :class="{ on: epMenuOpen }"
+                  aria-label="选集" title="选集" :aria-expanded="epMenuOpen"
+                  @click="toggleEpMenu"
+                >
+                  <AppIcon name="grid" :size="19" />
+                </button>
+                <Transition name="fade">
+                  <div v-if="epMenuOpen" class="ctl-menu ep-menu" @pointerdown.stop>
+                    <div class="ep-head">
+                      <span class="cm-title mb-0">选集</span>
+                      <span class="tiny">{{ episodes.length }} 集</span>
+                    </div>
+                    <div ref="epListEl" class="ep-list">
+                      <button
+                        v-for="(ep, i) in episodes" :key="ep.id"
+                        class="ep-item" :class="{ on: ep.id === play?.item_id }"
+                        :aria-current="ep.id === play?.item_id ? 'true' : undefined"
+                        :aria-label="epName(ep, i)"
+                        :title="epSub(ep) ? `${epName(ep, i)} · ${epSub(ep)}` : epName(ep, i)"
+                        @click="playEpisode(ep)"
+                      >
+                        <span class="ep-no num">{{ epNo(ep, i) }}</span>
+                        <span class="ep-copy">
+                          <span class="ep-name truncate">{{ epName(ep, i) }}</span>
+                          <span v-if="epSub(ep)" class="tiny truncate">{{ epSub(ep) }}</span>
+                        </span>
+                        <AppIcon v-if="ep.id === play?.item_id" name="play" :size="13" filled />
+                      </button>
+                    </div>
+                  </div>
+                </Transition>
+              </div>
+
               <button
                 v-if="!nativeSubs && (play?.subtitles || []).length" class="icon-btn"
                 :class="{ on: activeSub }" aria-label="字幕" title="字幕"
@@ -1903,6 +2021,113 @@ onBeforeUnmount(() => {
               >
                 <AppIcon name="subtitles" :size="19" />
               </button>
+
+              <!-- 弹幕: the switch, and the settings button that opens the panel —
+                   two controls, not one. Turning the layer on and off is what a
+                   viewer does mid-episode; tuning it is what they do once. They
+                   live in the bar under the picture, next to the volume and the
+                   subtitles, and not in the settings drawer: the drawer is the
+                   picture, the tracks and the playback mode, and reaching into it
+                   for a one-tap toggle means opening a panel over the video. -->
+              <template v-if="dmControl">
+                <button
+                  class="icon-btn" :class="{ on: danmakuOn }" :aria-pressed="danmakuOn"
+                  :aria-label="danmakuOn ? '关闭弹幕' : '开启弹幕'"
+                  :title="danmakuOn ? '弹幕已开启' : '弹幕已关闭'" @click="toggleDanmaku"
+                >
+                  <AppIcon :name="danmakuOn ? 'danmaku' : 'danmakuOff'" :size="19" />
+                </button>
+
+                <div class="menu-wrap">
+                  <button
+                    class="icon-btn" :class="{ on: dmMenuOpen }" aria-label="弹幕设置"
+                    title="弹幕设置" :aria-expanded="dmMenuOpen" @click="toggleDmMenu"
+                  >
+                    <AppIcon name="sliders" :size="19" />
+                  </button>
+                  <Transition name="fade">
+                    <div v-if="dmMenuOpen" class="ctl-menu dm-menu" @pointerdown.stop>
+                      <div class="dm-head">
+                        <span class="cm-title mb-0">弹幕设置</span>
+                        <span class="tiny">
+                          {{ danmakuFailed ? '读取失败' : danmakuCount ? `${danmakuCount} 条` : '读取中…' }}
+                        </span>
+                      </div>
+                      <div class="dm-settings">
+                        <div class="pn-group">
+                          <div class="label">显示区域</div>
+                          <div class="pn-chips dm-opts">
+                            <button
+                              v-for="o in DM_AREAS" :key="o.value" class="chip sm"
+                              :class="{ on: danmakuArea === o.value }" @click="setDanmakuArea(o.value)"
+                            >{{ o.label }}</button>
+                          </div>
+                        </div>
+
+                        <div class="pn-group">
+                          <div class="label">不透明度 <span class="tiny">{{ dmOpacityPct }}%</span></div>
+                          <label class="pn-range">
+                            <input
+                              type="range" min="0" max="100" step="1" aria-label="弹幕不透明度"
+                              :value="dmOpacityPct" @input="onDanmakuOpacity"
+                            />
+                          </label>
+                        </div>
+
+                        <div class="pn-group">
+                          <div class="label">字号</div>
+                          <div class="pn-chips dm-opts">
+                            <button
+                              v-for="o in DM_FONTS" :key="o.value" class="chip sm"
+                              :class="{ on: danmakuFont === o.value }" @click="setDanmakuFont(o.value)"
+                            >{{ o.label }}</button>
+                          </div>
+                        </div>
+
+                        <div class="pn-group">
+                          <div class="label">速度</div>
+                          <label class="pn-range">
+                            <span class="tiny">慢</span>
+                            <input
+                              type="range" :min="DM_SPEED_MIN" :max="DM_SPEED_MAX" step="1" aria-label="弹幕速度"
+                              :value="dmSpeedSlider" @input="onDanmakuSpeed"
+                            />
+                            <span class="tiny">快</span>
+                          </label>
+                        </div>
+
+                        <div class="pn-group">
+                          <div class="label">弹幕类型</div>
+                          <div class="pn-chips dm-opts">
+                            <button
+                              v-for="t in DM_TYPES" :key="t.key" class="chip sm"
+                              :class="{ on: danmakuTypes[t.key] }" @click="toggleDanmakuType(t.key)"
+                            >{{ t.label }}</button>
+                          </div>
+                        </div>
+
+                        <!-- The one boolean in this panel: a switch, not a chip,
+                             because "off" has no name of its own. -->
+                        <div class="pn-group dm-toggle">
+                          <div class="label">字体黑边</div>
+                          <button
+                            type="button" class="switch" :class="{ on: danmakuStroke }"
+                            role="switch" :aria-checked="danmakuStroke"
+                            :title="danmakuStroke ? '字体黑边已开启' : '字体黑边已关闭'"
+                            aria-label="字体黑边" @click="toggleDanmakuStroke"
+                          ></button>
+                        </div>
+
+                        <div class="pn-group">
+                          <div class="pn-chips dm-opts">
+                            <button class="chip sm" @click="resetDanmakuOptions">恢复默认</button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </Transition>
+                </div>
+              </template>
 
               <div class="menu-wrap">
                 <button
@@ -1933,6 +2158,14 @@ onBeforeUnmount(() => {
                     <button class="cm-item" @click="togglePip(); menuOpen = false">
                       <span class="cm-label"><AppIcon name="pip" :size="15" /> 画中画</span>
                       <span class="tiny">{{ pipActive ? '已开启' : '小窗播放' }}</span>
+                    </button>
+                    <!-- The full drawer used to hang off the top bar's list button.
+                         That button is gone, so its remaining job — versions, audio
+                         tracks, the reason the server picked this mode — lands here,
+                         one level under the quick settings. -->
+                    <button class="cm-item" @click="togglePanel">
+                      <span class="cm-label"><AppIcon name="layers" :size="15" /> 全部播放设置</span>
+                      <span class="tiny">版本 · 音轨</span>
                     </button>
                   </div>
                 </Transition>
@@ -2146,80 +2379,6 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <div v-if="drawerMode !== 'subs' && danmakuUrl" class="pn-group">
-                <div class="label">
-                  弹幕
-                  <span class="tiny">{{ danmakuFailed ? ' · 读取失败' : danmakuCount ? ` · ${danmakuCount} 条` : '' }}</span>
-                </div>
-                <div class="pn-chips">
-                  <button class="chip" :class="{ on: danmakuOn }" @click="toggleDanmaku">
-                    <AppIcon name="tv" :size="14" /> {{ danmakuOn ? '已开启' : '已关闭' }}
-                  </button>
-                </div>
-                <!-- Bilibili's 弹幕设置: one row per choice. The options sit on a
-                     line rather than in the drawer's stacked column, which is
-                     the only new shape this panel needs. -->
-                <div v-if="danmakuOn && danmakuReady" class="dm-settings">
-                  <div class="pn-group">
-                    <div class="label">显示区域</div>
-                    <div class="pn-chips dm-opts">
-                      <button
-                        v-for="o in DM_AREAS" :key="o.value" class="chip sm"
-                        :class="{ on: danmakuArea === o.value }" @click="setDanmakuArea(o.value)"
-                      >{{ o.label }}</button>
-                    </div>
-                  </div>
-
-                  <div class="pn-group">
-                    <div class="label">不透明度 <span class="tiny">{{ dmOpacityPct }}%</span></div>
-                    <label class="pn-range">
-                      <input
-                        type="range" min="0" max="100" step="1" aria-label="弹幕不透明度"
-                        :value="dmOpacityPct" @input="onDanmakuOpacity"
-                      />
-                    </label>
-                  </div>
-
-                  <div class="pn-group">
-                    <div class="label">字号</div>
-                    <div class="pn-chips dm-opts">
-                      <button
-                        v-for="o in DM_FONTS" :key="o.value" class="chip sm"
-                        :class="{ on: danmakuFont === o.value }" @click="setDanmakuFont(o.value)"
-                      >{{ o.label }}</button>
-                    </div>
-                  </div>
-
-                  <div class="pn-group">
-                    <div class="label">速度</div>
-                    <label class="pn-range">
-                      <span class="tiny">慢</span>
-                      <input
-                        type="range" :min="DM_SPEED_MIN" :max="DM_SPEED_MAX" step="1" aria-label="弹幕速度"
-                        :value="dmSpeedSlider" @input="onDanmakuSpeed"
-                      />
-                      <span class="tiny">快</span>
-                    </label>
-                  </div>
-
-                  <div class="pn-group">
-                    <div class="label">弹幕类型</div>
-                    <div class="pn-chips dm-opts">
-                      <button
-                        v-for="t in DM_TYPES" :key="t.key" class="chip sm"
-                        :class="{ on: danmakuTypes[t.key] }" @click="toggleDanmakuType(t.key)"
-                      >{{ t.label }}</button>
-                    </div>
-                  </div>
-
-                  <div class="pn-group">
-                    <div class="pn-chips dm-opts">
-                      <button class="chip sm" @click="resetDanmakuOptions">恢复默认</button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
               <div v-if="play?.reason" class="pn-reason tiny">
                 <AppIcon name="sparkles" :size="13" />
                 <span>{{ play.reason }}</span>
@@ -2261,6 +2420,7 @@ onBeforeUnmount(() => {
       <span><kbd>←</kbd><kbd>→</kbd> 快退/快进 10s</span>
       <span><kbd>F</kbd> 全屏</span>
       <span><kbd>M</kbd> 静音</span>
+      <span v-if="dmControl"><kbd>D</kbd> 弹幕</span>
       <span><kbd>Esc</kbd> 返回</span>
     </div>
 
@@ -2570,14 +2730,94 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 .pn-range > span { flex: 0 0 62px; font-size: var(--fs-12); color: var(--text-3); }
 .pn-range > input[type='range'] { flex: 1; min-width: 0; accent-color: var(--accent, #ff5c8a); }
 
-/* 弹幕设置: bilibili's panel as one block in the drawer. Its four or five
-   choices per row do not fit the drawer's stacked .pn-chips; a wrapping row is
-   the one shape those groups need that the drawer does not already have. The
-   ranges here carry their own endpoints and value, so those spans size to their
+/* ============================ 弹幕 popup ================================== */
+/* Bilibili's own settings panel, in the control bar's popup shape: its own button
+   under the picture opens it, so it is not a block in (.panel) any more. It keeps
+   the drawer's group markup — .pn-group/.pn-chips/.pn-range — because the two are
+   the same kind of list; what it needs of its own is a narrow column, wrapping
+   chip rows rather than the drawer's stacked ones, and a head with the count.
+   The ranges carry their own endpoints and value, so those spans size to their
    text instead of taking the 62px label column. */
-.dm-settings { display: flex; flex-direction: column; gap: 10px; width: 100%; }
-.pn-chips.dm-opts { flex-direction: row; flex-wrap: wrap; gap: 6px; }
-.dm-settings .pn-range > span { flex: 0 0 auto; }
+.dm-menu { width: min(300px, calc(100vw - 24px)); }
+.dm-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+.dm-settings { display: flex; flex-direction: column; gap: 12px; }
+.dm-settings .pn-group { gap: 6px; }
+/* A popup is a short surface, so its options stay compact: the drawer's roomy
+   34px chip is a touch target for a list that can afford one. */
+.dm-menu .pn-chips.dm-opts { flex-direction: row; flex-wrap: wrap; gap: 6px; }
+.dm-menu .pn-group .chip { min-height: 30px; padding: 5px 10px; }
+.dm-menu .pn-range { max-width: none; }
+.dm-menu .pn-range > span { flex: 0 0 auto; }
+
+/* The panel's one boolean: its label and the knob share a row. It reuses the
+   site's .switch, so only the button plumbing is undone here. */
+.dm-settings .dm-toggle {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 10px;
+}
+.dm-settings .dm-toggle .label { margin: 0; }
+.dm-settings .dm-toggle .switch { appearance: none; padding: 0; }
+
+/* A watch page has the whole page under the picture, so the popup drops from its
+   button instead of rising over the video: in the theater the bar sits at the foot
+   of the screen and up is the only way out, but here a popup twice the height of
+   the control strip would cover the picture it is about — on a phone the picture,
+   the seek bar and the buttons are all inside one screen. */
+.lay-phone:not(.fs) .dm-menu, .lay-tablet:not(.fs) .dm-menu {
+  top: calc(100% + 8px);
+  bottom: auto;
+  max-height: none;
+}
+
+/* ============================ 选集 popup ================================== */
+/* The season as a list, hung off the 选集 button beside the subtitle one: number,
+   name, and the air date or version count when the episode has one. The current
+   episode is marked and scrolled into view, so a 24-episode season does not open
+   at episode 1 every time. */
+.ep-menu { width: min(360px, calc(100vw - 24px)); }
+.ep-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.ep-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* Never taller than the screen it opened on; the list scrolls itself. */
+  max-height: min(420px, calc(100dvh - 220px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.ep-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: var(--r-s);
+  text-align: left;
+  color: var(--text-2);
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.ep-item:hover { background: rgba(255, 255, 255, 0.07); color: var(--text-1); }
+.ep-item.on { background: var(--brand-tint); color: var(--text-1); }
+.ep-item.on svg { color: var(--brand); }
+.ep-no {
+  flex: 0 0 auto;
+  min-width: 28px;
+  height: 24px;
+  padding: 0 6px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-xs);
+  background: rgba(255, 255, 255, 0.08);
+  font-size: var(--fs-12);
+  font-weight: 650;
+  color: var(--text-2);
+}
+.ep-item.on .ep-no { background: var(--brand); color: var(--brand-ink); }
+.ep-copy { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+.ep-name { font-size: var(--fs-13); }
 
 
 /* 弹幕层: above the picture, below every control (which start at 4). */

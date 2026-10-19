@@ -13,6 +13,8 @@ const routes = [
   { path: '/library/:id', component: () => import('./views/Library.vue'), meta: { title: '媒体库', overlay: true } },
   { path: '/item/:id', component: () => import('./views/Detail.vue'), meta: { title: '详情', overlay: true } },
   { path: '/season/:id', component: () => import('./views/Season.vue'), meta: { title: '剧集', overlay: true } },
+  // A catalogue hit being imported: its own live loading page, then the show.
+  { path: '/import/:sourceId/:seasonId', component: () => import('./views/Import.vue'), meta: { title: '入库' } },
   { path: '/browse/:id?', component: () => import('./views/Browse.vue'), meta: { title: '文件' } },
   { path: '/play/:fileId', component: () => import('./views/Player.vue'), meta: { fullscreen: true, title: '播放' } },
   // admin: the settings backend is the admin's alone. The API already answers

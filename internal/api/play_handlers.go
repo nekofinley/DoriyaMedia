@@ -18,6 +18,7 @@ import (
 
 	"doriyamedia/internal/media"
 	"doriyamedia/internal/models"
+	"doriyamedia/internal/netproxy"
 	"doriyamedia/internal/scan"
 	"doriyamedia/internal/source"
 )
@@ -523,7 +524,7 @@ func (s *Server) handlePlayStatus(w http.ResponseWriter, r *http.Request, user *
 	}
 	// stream carries segment-generation progress once playback starts, so the
 	// player can show how much is ready and whether the server keeps up.
-	writeJSON(w, 200, map[string]any{		"file_id": id,
+	writeJSON(w, 200, map[string]any{"file_id": id,
 		"state":   st.State, // idle | probing | ready | failed
 		"elapsed": st.Elapsed,
 		"error":   st.Error,
@@ -710,7 +711,27 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		fail(w, 502, "获取源地址失败: "+err.Error())
 		return
 	}
-	proxyRemote(w, r, target, headers)
+	proxyRemoteVia(w, r, target, headers, sourceHTTPClient(drv))
+}
+
+// sourceHTTPClient is the client to fetch a source's bytes with: the shared
+// streaming client, unless the source reaches the network through a proxy of
+// its own (a bilibili source abroad), in which case its bytes must leave the
+// same way its API calls do.
+func sourceHTTPClient(drv source.Driver) *http.Client {
+	pd, ok := drv.(source.ProxiedDriver)
+	if !ok || pd.ProxySpec() == "" {
+		return proxyClient
+	}
+	spec, err := netproxy.Parse(pd.ProxySpec())
+	if err != nil {
+		return proxyClient
+	}
+	c, err := netproxy.NewClient(spec, 0)
+	if err != nil {
+		return proxyClient
+	}
+	return c
 }
 
 // proxyRemote and the range handling live in proxy_range.go.
@@ -1135,6 +1156,19 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 	}
 	base := fmt.Sprintf("/api/hls/%d", file.ID)
 
+	// Packaging output is identified by the stream it was made from as well as by
+	// the file. A source that re-resolves its ladder on every play (bilibili) can
+	// hand back a different rung the second time — 4K HDR one play, 1080p AVC the
+	// next — and a session cached for the other rung is a different picture, not a
+	// different encoding of the same one. Naming the rung in the key keeps the two
+	// apart; an ordinary file has one stream and no variant.
+	variant := ""
+	if multi {
+		if v := probe.Video(); v != nil && v.CodecName != "" && v.Width > 0 {
+			variant = fmt.Sprintf("%s%d", v.CodecName, v.Width)
+		}
+	}
+
 	// Packaging can only start where a session is; which session answers a
 	// request depends on where in the file the request asks for.
 	height := s.Cfg.Playback.TranscodeHeight
@@ -1149,7 +1183,7 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 			o.StartSegment, o.StartSeconds = 0, 0
 		}
 		return s.Engine.EnsureSession(ctx,
-			media.SessionKey(file.ID, mode, audioOrdinal, videoIndex, height, o.StartSegment), o)
+			media.SessionKeyVariant(file.ID, mode, audioOrdinal, videoIndex, height, o.StartSegment, variant), o)
 	}
 	// Pick the session that answers a playlist request. Two cases pull in opposite
 	// directions: a refreshed playlist during playback must follow the session the

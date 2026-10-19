@@ -268,12 +268,15 @@ func TestFranchisePromotion(t *testing.T) {
 			wantShow:   "/热门番剧/间谍过家家 [series 41410]", wantSeason: 2, wantLabel: "第 2 季",
 		},
 		{
-			name:       "bilibili 只有一季的番:季度目录自己当剧",
+			// A one-season 番剧 still belongs to its series: the season folder is
+			// a season (bilibili's own "TV" folder is the common case), not a
+			// show of its own.
+			name:       "bilibili 只有一季的番:季度仍归到系列下",
 			libPath:    "/热门番剧",
 			dir:        "/热门番剧/冰菓 [series 3398]/冰菓 [season 3398]",
 			file:       "/热门番剧/冰菓 [series 3398]/冰菓 [season 3398]/冰菓 第1话 古典部系列 [ep1].mp4",
 			childCount: map[string]int{"/热门番剧/冰菓 [series 3398]": 1},
-			wantShow:   "/热门番剧/冰菓 [series 3398]/冰菓 [season 3398]", wantSeason: 1, wantLabel: "第 1 季",
+			wantShow:   "/热门番剧/冰菓 [series 3398]", wantSeason: 1, wantLabel: "第 1 季",
 		},
 	}
 	for _, c := range cases {

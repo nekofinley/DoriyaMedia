@@ -68,3 +68,14 @@ func HeaderArgs(args []string, headers map[string]string) []string {
 	args = append(args, "-headers", b.String())
 	return args
 }
+
+// ProxyArgs tells ffmpeg to reach the input through a proxy. The value is an
+// http:// URL — the only form ffmpeg's own http protocol honours, which is why a
+// SOCKS5 or Shadowsocks source is handed a loopback bridge instead (see
+// netproxy.Bridge). It is an input option, so it goes before -i.
+func ProxyArgs(args []string, proxy string) []string {
+	if strings.TrimSpace(proxy) == "" {
+		return args
+	}
+	return append(args, "-http_proxy", proxy)
+}
