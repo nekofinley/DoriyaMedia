@@ -1136,7 +1136,9 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 			fail(w, 502, "打包会话启动失败: "+err.Error())
 			return
 		}
-		if err := sess.WaitForFile(ctx, sess.PlaylistPath(), 45*time.Second); err != nil {
+		// The playlist is rewritten in place as the packager runs, so "it exists"
+		// is not "it is readable": a half-written manifest is fatal to a player.
+		if err := sess.WaitForPlaylist(ctx, 45*time.Second); err != nil {
 			fail(w, 502, "打包播放列表未就绪: "+err.Error())
 			return
 		}
@@ -1153,6 +1155,13 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		sess, err := streamSession()
 		if err != nil {
 			fail(w, 502, "打包会话启动失败: "+err.Error())
+			return
+		}
+		// ffmpeg writes the init segment in place, so it has to be waited for
+		// until it is no longer growing — half of it makes the whole stream
+		// undecodable.
+		if err := sess.WaitForInit(ctx, 45*time.Second); err != nil {
+			fail(w, 502, "初始化分片未就绪: "+err.Error())
 			return
 		}
 		s.serveSessionFile(w, r, ctx, sess, sess.InitPath(), false)

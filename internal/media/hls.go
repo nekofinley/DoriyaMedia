@@ -284,30 +284,38 @@ func (e *Engine) Segment(ctx context.Context, file *models.MediaFile, drv source
 		return 0, err
 	}
 
-	cw := &countWriter{w: out}
+	// The segment is collected before it is sent, so a failed attempt leaves the
+	// response untouched (see segBuf). That is what makes the failure retryable:
+	// a truncated fMP4 reaching the player looks exactly like a decoding error, and
+	// players do not retry those.
+	buf := &segBuf{}
+	defer buf.Close()
+
+	cw := &countWriter{w: buf}
 	runErr := e.runStream(ctx, segmentArgs(inputs, start, length, videoMode, audioMode, audioOrdinal, videoIndex, transcodeHeight), cw)
 	if runErr == nil {
-		return cw.n, nil
+		return buf.WriteTo(out)
 	}
-	// A partly written segment cannot be retried into the same response, and a
-	// cancelled request must not start more work against the source.
-	if cw.n > 0 || ctx.Err() != nil {
-		return cw.n, runErr
+	// Nothing has reached the client, so a cancelled request must not start more
+	// work against the source — but a failed one can still be retried.
+	if ctx.Err() != nil {
+		return 0, runErr
 	}
 
 	retryInputs, rerr := e.SegmentInputs(ctx, file, drv, inputs[0].Target)
 	if rerr != nil || sameInputs(retryInputs, inputs) {
-		return cw.n, runErr
+		return 0, runErr
 	}
 	log.Printf("hls segment %d @%.0fs: source refused the link, retrying with a fresh one: %v",
 		file.ID, start, runErr)
 
-	cw2 := &countWriter{w: out}
+	buf.Reset()
+	cw2 := &countWriter{w: buf}
 	if err2 := e.runStream(ctx, segmentArgs(retryInputs, start, length, videoMode, audioMode, audioOrdinal, videoIndex, transcodeHeight), cw2); err2 != nil {
-		return cw2.n, fmt.Errorf("attempt 1: %w; attempt 2 with a fresh source link: %v", runErr, err2)
+		return 0, fmt.Errorf("attempt 1: %w; attempt 2 with a fresh source link: %v", runErr, err2)
 	}
 	log.Printf("hls segment %d @%.0fs: recovered with a fresh source link", file.ID, start)
-	return cw2.n, nil
+	return buf.WriteTo(out)
 }
 
 // segmentArgs builds the ffmpeg command line for one segment.

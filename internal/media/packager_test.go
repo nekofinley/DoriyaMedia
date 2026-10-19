@@ -200,9 +200,35 @@ func TestPackagerArgsCodecTag(t *testing.T) {
 	}
 }
 
+// Segments must be renamed into place, not written where they are served from.
+// Measured without this flag: a segment was observable at 0 bytes growing to
+// 14 MB, and a player handed that reports a media error instead of retrying.
+func TestPackagerArgsWriteSegmentsAtomically(t *testing.T) {
+	args, err := packagerArgs(PackagerOptions{
+		Target: "/tmp/x.mkv", VideoIndex: 0, AudioOrdinal: 0,
+		VideoMode: "copy", Dir: "/tmp/out",
+	})
+	if err != nil {
+		t.Fatalf("packagerArgs: %v", err)
+	}
+	flags := ""
+	for i, a := range args {
+		if a == "-hls_flags" && i+1 < len(args) {
+			flags = args[i+1]
+		}
+	}
+	if !strings.Contains(flags, "temp_file") {
+		t.Fatalf("-hls_flags must include temp_file, got %q (args: %v)", flags, args)
+	}
+	// A playlist that grows as it is packaged is what lets playback start early;
+	// dropping it to get atomic writes would trade one bug for a worse one.
+	if !containsPair(args, "-hls_playlist_type", "event") {
+		t.Fatalf("the playlist must stay an event playlist, got %v", args)
+	}
+}
+
 func containsPair(args []string, a, b string) bool {
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == a && args[i+1] == b {
+	for i := 0; i+1 < len(args); i++ {		if args[i] == a && args[i+1] == b {
 			return true
 		}
 	}

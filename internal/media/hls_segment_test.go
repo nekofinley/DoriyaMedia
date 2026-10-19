@@ -1,6 +1,7 @@
 package media
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -102,8 +103,14 @@ func TestSegmentRetriesWithFreshLinkWhenSourceRefuses(t *testing.T) {
 	}
 }
 
-// A segment that already sent bytes cannot be retried into the same response.
-func TestSegmentDoesNotRetryAfterPartialWrite(t *testing.T) {
+// A segment that fails halfway must leave the response untouched. Streaming the
+// bytes as ffmpeg produced them delivered a truncated fMP4, which a player cannot
+// tell apart from a decoding failure — it reports a media error instead of asking
+// for the segment again, and a stream that would have played shows as broken.
+//
+// Nothing sent also means the fresh-link retry is still available, even though the
+// first attempt had produced output before dying.
+func TestSegmentSendsNothingWhenAttemptsFail(t *testing.T) {
 	drv := &stubDriver{}
 	calls := 0
 	e := newTestEngine(t, nil)
@@ -115,19 +122,51 @@ func TestSegmentDoesNotRetryAfterPartialWrite(t *testing.T) {
 		return errors.New("boom after writing")
 	}
 
+	var client bytes.Buffer
 	file := testFile()
-	n, err := e.Segment(context.Background(), file, drv, 4, 4, "remux", "copy", 0, 0, 1080, io.Discard)
+	n, err := e.Segment(context.Background(), file, drv, 4, 4, "remux", "copy", 0, 0, 1080, &client)
 	if err == nil {
-		t.Fatal("want the write error to surface")
+		t.Fatal("want the failure to surface")
 	}
-	if n != int64(len("partial")) {
-		t.Fatalf("bytes = %d, want %d", n, len("partial"))
+	if n != 0 || client.Len() != 0 {
+		t.Fatalf("client got %d bytes (%q), want nothing: a truncated segment is worse than none",
+			n, client.String())
 	}
-	if calls != 1 {
-		t.Fatalf("ffmpeg runs = %d, want 1 (no retry once bytes were sent)", calls)
+	if calls != 2 {
+		t.Fatalf("ffmpeg runs = %d, want 2: a failed attempt leaves room for the fresh-link retry", calls)
 	}
-	if c := drv.count(); c != 1 {
-		t.Fatalf("source resolutions = %d, want 1 (no needless re-mint)", c)
+	if c := drv.count(); c != 2 {
+		t.Fatalf("source resolutions = %d, want 2", c)
+	}
+}
+
+// ...and a recovered attempt arrives complete, not stitched together with what the
+// failed one had produced.
+func TestSegmentSendsOnlyTheSuccessfulAttempt(t *testing.T) {
+	drv := &stubDriver{}
+	e := newTestEngine(t, nil)
+	first := true
+	e.runStream = func(_ context.Context, args []string, out io.Writer) error {
+		if first {
+			first = false
+			_, _ = out.Write([]byte("partial-"))
+			return errors.New("Error opening input: Server returned 403 Forbidden (access denied)")
+		}
+		_, err := out.Write([]byte("complete"))
+		return err
+	}
+
+	var client bytes.Buffer
+	file := testFile()
+	n, err := e.Segment(context.Background(), file, drv, 4, 4, "remux", "copy", 0, 0, 1080, &client)
+	if err != nil {
+		t.Fatalf("Segment must recover with a fresh link, got: %v", err)
+	}
+	if got := client.String(); got != "complete" {
+		t.Fatalf("client got %q, want exactly the successful attempt", got)
+	}
+	if n != int64(len("complete")) {
+		t.Fatalf("bytes = %d, want %d", n, len("complete"))
 	}
 }
 

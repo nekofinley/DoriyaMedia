@@ -315,6 +315,17 @@ func packagerArgs(o PackagerOptions) ([]string, error) {
 		// on the first segments instead of waiting for the whole file.
 		"-hls_playlist_type", "event",
 		"-hls_list_size", "0",
+		// temp_file: write each segment to <name>.tmp and rename it once it is
+		// complete. Without it ffmpeg writes segNNNNN.m4s in place, so the file
+		// exists — and is served — while it is still half written; a player that
+		// reads one in that window gets a truncated fMP4, reports a media error and
+		// gives up, and the same stream plays on the next attempt. Measured: a
+		// segment was observable at 0 bytes growing to 14 MB.
+		//
+		// It covers media segments only: ffmpeg still writes the init segment and
+		// the playlist in place, which is why the session waits for those two to
+		// settle rather than merely exist (see Session.WaitForPlaylist/WaitForInit).
+		"-hls_flags", "temp_file",
 		"-hls_fmp4_init_filename", packagerInitName,
 		"-hls_segment_filename", packagerSegmentPattern,
 		packagerPlaylistName,

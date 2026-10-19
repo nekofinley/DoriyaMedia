@@ -800,7 +800,7 @@ function serverPreparing() {
 /** Is this failure "not ready yet" rather than "the wrong mode"? */
 function keepWaiting(code) {
   const c = cands.value[candIdx.value]
-  if (!c || candTries >= RETRY_DELAYS.length) return false
+  if (!c) return false
   const waited = Date.now() - candSince
   // The patience window is about *starting*: a stream that never produced a
   // picture and has been retried for a minute is not going to. One that was
@@ -808,18 +808,23 @@ function keepWaiting(code) {
   // attempt however long it has been running, since a mode switch reloads the
   // whole stream (and jumps back to the last saved position).
   if (!candMeta && waited > CAND_PATIENCE_MS) return false
-  // A fresh attempt swallowing the previous one's abort is not a failure.
-  if (code === 1 && waited < 1500) return false
-  // Decode error: the data arrived and the decoder refused it — believe it.
-  if (code === 3) return false
+  // A decode error normally means the data arrived and the decoder refused it — a
+  // verdict on the codec, not on the mode. Before the first frame, though, it is
+  // also what a fragment that arrived cut short looks like, so a stream that has
+  // not started yet gets one more attempt before the codec is blamed.
+  if (code === 3) return !candMeta && candTries < 1
   // Network-flavoured errors are worth another attempt whatever the mode.
-  if (code === 1 || code === 2) return true
+  if (code === 1 || code === 2) return candTries < RETRY_DELAYS.length
   // SRC_NOT_SUPPORTED is ambiguous: a native-HLS player (iOS) reports it for a
   // manifest whose first segments are still being produced, and that is a verdict
-  // on nothing. While the server is packaging, wait; and an HLS attempt gets a
-  // minimum dwell either way, because its first segment is the slowest thing here.
+  // on nothing. While the server is still packaging, waiting is not "retrying a
+  // broken mode" — it is the only honest thing to do, and the alternative is a
+  // failure card for a stream that is about to start. Past that, an HLS attempt
+  // gets a minimum dwell either way, because its first segment is the slowest
+  // thing here.
   if (c.kind !== 'hls' || candMeta) return false
-  return serverPreparing() || waited < HLS_DWELL_MS
+  if (serverPreparing()) return true
+  return candTries < RETRY_DELAYS.length && waited < HLS_DWELL_MS
 }
 
 function retryCand(code) {
@@ -893,11 +898,16 @@ function onErr() {
   // for the same underlying cause. Acting twice would skip a candidate.
   const at = Date.now()
   if (at - errHandledAt < 500) return
+  const code = Number(videoEl.value?.error?.code) || 0
+  // An abort moments after attaching is the previous attempt being swallowed by
+  // this one — a verdict on nothing. Ignoring it is not the same as failing it:
+  // spending a retry here, or worse, showing the failure card, is how a working
+  // stream gets declared broken before it has had a chance to start.
+  if (code === 1 && at - candSince < 1500) return
   errHandledAt = at
   // Not every error is a verdict on the mode: a slow first segment looks exactly
   // like a broken one from here, and switching modes on it is how a working
   // strategy gets replaced by one this client can never play.
-  const code = Number(videoEl.value?.error?.code) || 0
   if (keepWaiting(code)) { retryCand(code); return }
   if (candIdx.value < cands.value.length - 1) {
     toast.info('该方式播放失败,自动切换…')

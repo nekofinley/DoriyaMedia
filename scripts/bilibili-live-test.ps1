@@ -123,11 +123,15 @@ try {
   }
 
   # 上一轮留下的库/源会让数量断言不准:先清空。
-  foreach ($old in @(Invoke-RestMethod -Uri "$base/api/libraries" -WebSession $sess)) {
-    Invoke-RestMethod -Uri "$base/api/libraries/$($old.id)" -Method Delete -WebSession $sess | Out-Null
+  # 注意 @($null) 会变成一个含 $null 的数组,把 URL 拼成 /api/libraries/ 而落到静态兜底,
+  # 所以先按 id 过滤。
+  $staleLibs = @(Invoke-RestMethod -Uri "$base/api/libraries" -WebSession $sess | Where-Object { $_ -and $_.id })
+  foreach ($l in $staleLibs) {
+    Invoke-RestMethod -Uri "$base/api/libraries/$($l.id)" -Method Delete -WebSession $sess | Out-Null
   }
-  foreach ($old in @(Invoke-RestMethod -Uri "$base/api/sources" -WebSession $sess)) {
-    Invoke-RestMethod -Uri "$base/api/sources/$($old.id)" -Method Delete -WebSession $sess | Out-Null
+  $staleSrcs = @(Invoke-RestMethod -Uri "$base/api/sources" -WebSession $sess | Where-Object { $_ -and $_.id })
+  foreach ($s in $staleSrcs) {
+    Invoke-RestMethod -Uri "$base/api/sources/$($s.id)" -Method Delete -WebSession $sess | Out-Null
   }
 
   $src = PostJson "$base/api/sources" @{

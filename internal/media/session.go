@@ -241,29 +241,79 @@ func (s *Session) Failed() error {
 // exits without producing it, or ctx/max elapses. Waiting (instead of answering
 // 404) keeps the player from treating a not-yet-packaged segment as fatal.
 func (s *Session) WaitForFile(ctx context.Context, path string, max time.Duration) error {
+	return s.waitFor(ctx, path, max, func(os.FileInfo) bool { return true })
+}
+
+// WaitForPlaylist blocks until the media playlist is there in one complete piece.
+//
+// ffmpeg rewrites index.m3u8 in place every time a segment is finished — the file
+// is truncated and rewritten, so at any instant it may hold a prefix of the next
+// version. Handing that to a player is a manifest it cannot parse, which it treats
+// as fatal: the picture never starts, and the same stream plays on a retry.
+//
+// A playlist is only ever rewritten by appending whole lines, so one that ends in a
+// newline and carries the header is a version ffmpeg finished writing.
+func (s *Session) WaitForPlaylist(ctx context.Context, max time.Duration) error {
+	path := s.PlaylistPath()
+	return s.waitFor(ctx, path, max, func(fi os.FileInfo) bool {
+		raw, err := os.ReadFile(path)
+		if err != nil || len(raw) == 0 {
+			return false
+		}
+		text := string(raw)
+		return strings.HasSuffix(text, "\n") && strings.Contains(text, "#EXTM3U")
+	})
+}
+
+// WaitForInit blocks until the fMP4 initialization segment is complete.
+//
+// temp_file makes ffmpeg rename finished media segments into place, but it writes
+// this one directly — measured: init.mp4 exists at 0 bytes and grows to its full
+// size. A player that reads it in that window has an unusable initialization
+// segment for the whole stream, so it is worth the two samples it takes to tell a
+// finished write from one in progress.
+func (s *Session) WaitForInit(ctx context.Context, max time.Duration) error {
+	path := s.InitPath()
+	var lastSize int64 = -1
+	return s.waitFor(ctx, path, max, func(fi os.FileInfo) bool {
+		stable := fi.Size() > 0 && fi.Size() == lastSize
+		lastSize = fi.Size()
+		return stable
+	})
+}
+
+// waitFor polls until ready accepts the file's state, packaging ends, or the
+// context or the deadline runs out.
+func (s *Session) waitFor(ctx context.Context, path string, max time.Duration, ready func(os.FileInfo) bool) error {
 	deadline := time.Now().Add(max)
 	var done <-chan struct{}
 	if s.pack != nil {
 		done = s.pack.Done()
 	}
+	check := func() bool {
+		fi, err := os.Stat(path)
+		if err != nil || fi.Size() == 0 || !ready(fi) {
+			return false
+		}
+		s.Touch()
+		return true
+	}
 	for {
-		if fi, err := os.Stat(path); err == nil && fi.Size() > 0 {
-			s.Touch()
+		if check() {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-done:
-			if fi, err := os.Stat(path); err == nil && fi.Size() > 0 {
-				s.Touch()
+			if check() {
 				return nil
 			}
 			if err := s.pack.Err(); err != nil {
 				return fmt.Errorf("packaging %s failed: %w (%s)", filepath.Base(path), err, s.pack.Stderr())
 			}
 			return fmt.Errorf("packaging ended before %s was written", filepath.Base(path))
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(60 * time.Millisecond):
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timed out waiting for %s", filepath.Base(path))
@@ -411,25 +461,34 @@ func (e *Engine) LoadCache() {
 	e.evictCache(nil)
 }
 
-// looksComplete reports whether a directory holds a usable packaged session:
-// the playlist, the init segment and at least one media segment.
+// looksComplete reports whether a directory holds a usable packaged session: the
+// playlist, the init segment, and every segment the playlist names.
+//
+// That last part matters more than it looks. A packager killed mid-run leaves a
+// playlist that already lists a segment it never finished writing — with
+// -hls_flags temp_file the half-written file stays behind as <name>.tmp — and
+// adopting such a directory as a finished cache sends the player to a segment
+// that nothing is going to produce.
 func looksComplete(dir string) bool {
-	if fi, err := os.Stat(filepath.Join(dir, packagerPlaylistName)); err != nil || fi.Size() == 0 {
+	raw, err := os.ReadFile(filepath.Join(dir, packagerPlaylistName))
+	if err != nil || len(raw) == 0 {
 		return false
 	}
 	if fi, err := os.Stat(filepath.Join(dir, packagerInitName)); err != nil || fi.Size() == 0 {
 		return false
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false
-	}
-	for _, e := range entries {
-		if !e.IsDir() && reSessionSegment.MatchString(e.Name()) {
-			return true
+	segments := 0
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || !reSessionSegment.MatchString(line) {
+			continue
 		}
+		if fi, err := os.Stat(filepath.Join(dir, line)); err != nil || fi.Size() == 0 {
+			return false
+		}
+		segments++
 	}
-	return false
+	return segments > 0
 }
 
 // parseSessionDirName reverses sessionKey.dirName. The mode never contains a
