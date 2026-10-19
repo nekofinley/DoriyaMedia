@@ -140,6 +140,11 @@ const fsActive = ref(false)
 const pipActive = ref(false)
 const scrubbing = ref(false)
 const scrubTime = ref(0)
+// A saved position the stream has not packaged yet, in file seconds: the playhead
+// goes there once the packaging reaches it (see onLoadedMetadata).
+const resumeAt = ref(0)
+// Where playback last ran out of stream (see onEnded): one reconnect per position.
+let endedAt = -1
 const hoverTime = ref(null)
 const hoverX = ref(0)
 const forceMode = ref('')      // current override, reapplied when re-fetching
@@ -424,14 +429,14 @@ let disposed = false
 
 /* ------------------------------------------------------------------ playback */
 
-async function loadDecision(force) {
+async function loadDecision(force, at) {
   error.value = ''
   fatal.value = ''
   isLoading.value = true
   forceMode.value = force || ''
   stopProbePoll()
   try {
-    play.value = await fetchPlay()
+    play.value = await fetchPlay(at)
   } catch (e) {
     fatal.value = e.message
     isLoading.value = false
@@ -506,12 +511,15 @@ const clientCaps = (() => {
   }
 })()
 
-function fetchPlay() {
+function fetchPlay(at) {
   const params = new URLSearchParams({ client: detectClient() })
   if (forceMode.value) params.set('force', forceMode.value)
   if (burnSub.value) params.set('burn', String(burnSub.value))
   if (currentAudio.value) params.set('a', String(currentAudio.value))
   if (clientCaps) params.set('caps', clientCaps)
+  // An explicit seek position, in file seconds. The server answers with the session
+  // boundary it snapped to (stream_start), so the element's clock stays aligned.
+  if (at > 0) params.set('at', String(Math.floor(at)))
   return api.get(`/api/play/${route.params.fileId}?${params}`)
 }
 
@@ -694,6 +702,11 @@ let candSince = 0      // when it was attached
 let candMeta = false   // the element reported metadata for it
 let switchTimer = null // pending retry, so two error events cannot race
 let errHandledAt = 0   // when a failure was last acted on (one failure, two events)
+// The last thing the server said about a failure, if it said anything. A 502 from
+// the packager ("packaging index.m3u8 failed: ...") explains far more than "decode
+// or network error" can, and it is the difference between a bug report that can be
+// acted on and one that cannot.
+let lastServerReason = ''
 
 // 候选链:主决策 + 后端下发的备用方案(直连/代理/转封装)。
 // 后端只会下发这个客户端真的能用的方案,并已按"便宜→贵"排好序。
@@ -733,10 +746,11 @@ async function startCand(i) {
   if (i >= cands.value.length) {
     isLoading.value = false
     const tried = cands.value.map(candName).join(' → ')
-    fatal.value = `所有播放方式都失败了(已尝试:${tried})。可以换一条音轨,或手动指定一种方式重试。`
+    fatal.value = `所有播放方式都失败了(已尝试:${tried})。可以换一条音轨,或手动指定一种方式重试。` +
+      (lastServerReason ? `\n服务端说:${lastServerReason}` : '')
     return
   }
-  if (candFor !== i) { candFor = i; candTries = 0; candMeta = false }
+  if (candFor !== i) { candFor = i; candTries = 0; candMeta = false; lastServerReason = ''; resumeAt.value = 0 }
   candSince = Date.now()
   candIdx.value = i
   const c = cands.value[i]
@@ -793,7 +807,14 @@ function serverPreparing() {
   const s = streamStatus.value
   if (!s) return false
   if (Number(s.segments_ready) > 0) return false   // there is something to play
-  // No segment out yet and the packager was asked for one recently: it is working.
+  // A packager that is still alive is still working. The first segments of a 4K
+  // file on a cold cloud drive take far longer to produce than any fixed timeout
+  // worth applying here, and giving up on them means showing a failure card for a
+  // stream that was about to start — the retry the viewer then presses works only
+  // because it waited longer.
+  if (s.packager_running) return true
+  // No segment out, nothing running and the packager was asked for one recently:
+  // it is working. Once it has been silent for a while, it is not.
   return !(Number(s.idle_seconds) > 10)
 }
 
@@ -810,9 +831,10 @@ function keepWaiting(code) {
   if (!candMeta && waited > CAND_PATIENCE_MS) return false
   // A decode error normally means the data arrived and the decoder refused it — a
   // verdict on the codec, not on the mode. Before the first frame, though, it is
-  // also what a fragment that arrived cut short looks like, so a stream that has
-  // not started yet gets one more attempt before the codec is blamed.
-  if (code === 3) return !candMeta && candTries < 1
+  // also what a fragment that arrived cut short looks like, so while the server is
+  // still producing, give it the benefit of the doubt; once it has stopped, the
+  // decoder's verdict stands.
+  if (code === 3) return !candMeta && (serverPreparing() || candTries < 1)
   // Network-flavoured errors are worth another attempt whatever the mode.
   if (code === 1 || code === 2) return candTries < RETRY_DELAYS.length
   // SRC_NOT_SUPPORTED is ambiguous: a native-HLS player (iOS) reports it for a
@@ -844,6 +866,9 @@ function retryCand(code) {
 
 function onHlsError(_, data) {
   if (!data.fatal) return
+  // Keep the server's own words before acting on the failure.
+  const said = data.response?.text
+  if (said) lastServerReason = String(said).slice(0, 200)
   if (data.type === HlsLib.ErrorTypes.MEDIA_ERROR && !mediaRecovered) {
     mediaRecovered = true
     hls.value?.recoverMediaError()
@@ -863,6 +888,58 @@ function onHlsError(_, data) {
   startCand(candIdx.value + 1)
 }
 
+/**
+ * The file's duration, from whichever source actually knows it.
+ *
+ * hls.js reports `Infinity` until it has parsed the level's duration, and
+ * `loadedmetadata` can fire before that. Reading it once and keeping it made every
+ * later calculation meaningless: the duration read 0:00, the buffered bar stayed
+ * empty, and a drag computed an infinite target that seeking then threw away — a
+ * progress bar that cannot be moved. The element's duration is not final at that
+ * moment either, so this also runs on durationchange; the decision's own duration
+ * (the whole file's, straight from the probe) is the honest fallback.
+ */
+function applyDuration() {
+  const v = videoEl.value
+  if (!v) return
+  const d = Number(v.duration)
+  const known = Number(play.value?.duration) || 0
+  if (isFinite(d) && d > 0) {
+    // While a session is packaging, the element's duration is only what has been
+    // packaged so far — it grows. Taking it as the file's length would show a
+    // shrinking total (32:03 becoming 1:36) and, worse, make the player treat the
+    // packaging edge as the end of the episode. The decision's duration is the
+    // file's; the element's is only ever better when it is larger.
+    duration.value = known > 0 ? Math.max(known, d + streamStart.value) : d + streamStart.value
+  } else if (known > 0) {
+    duration.value = known
+  }
+}
+
+/**
+ * How far into the file there is actually something to play, in file time.
+ *
+ * Deliberately not `seekable`: a packaged stream is served as an event playlist
+ * with no end yet, so the element reports its seekable range as [0, Infinity]. That
+ * number means "you may ask for this", not "this exists" — and asking is precisely
+ * how a player ends up with nothing: it jumps to a position the packager has not
+ * reached, waits for fragments that are minutes away, and shows no picture, no
+ * progress and no duration in the meantime.
+ *
+ * What exists is what has been buffered, plus what the server says it has finished
+ * producing (segment generation progress, which the session path reports too).
+ */
+function reachable() {
+  let reach = streamStart.value
+  const v = videoEl.value
+  if (v && v.buffered.length) {
+    reach = Math.max(reach, v.buffered.end(v.buffered.length - 1) + streamStart.value)
+  }
+  const gen = Number(streamStatus.value?.generated_seconds)
+  if (isFinite(gen) && gen > 0) reach = Math.max(reach, streamStart.value + gen)
+  return reach
+}
+
 function onLoadedMetadata() {
   // Metadata is not "ready": a stream still waiting for its first segments keeps
   // its loading state (and its bar) until there is enough to play, or until
@@ -874,21 +951,62 @@ function onLoadedMetadata() {
   // the viewer's saved position was, and players present that stream as starting
   // at zero (hls.js re-aligns it), so the element's own clock is offset from the
   // file by streamStart.
-  const elDuration = Number(v.duration) || 0
-  // The payload's duration is already the whole file's, so only the element's own
-  // (remaining) duration gets the offset added.
-  duration.value = elDuration > 0 ? elDuration + streamStart.value : (play.value?.duration || 0)
+  applyDuration()
   position.value = (Number(v.currentTime) || 0) + streamStart.value
   // Subtitles come on by themselves; the panel is there to change or turn them off.
   autoSelectSub()
   api.get(`/api/progress?file_id=${route.params.fileId}`).then((p) => {
-    const inStream = p ? p.position - streamStart.value : 0
-    if (p && p.position > 30 && duration.value > 0 && p.position < duration.value * 0.95) {
-      v.currentTime = Math.max(0, inStream)
+    if (!p || !(p.position > 30) || !(p.position < duration.value * 0.95)) return
+    // A position the stream has not packaged yet cannot be jumped to: the fragments
+    // do not exist, so the element stalls with nothing buffered and the playhead
+    // appears to wander. Wait for the packaging to reach it instead — it runs many
+    // times faster than playback — and go there the moment it does.
+    if (p.position <= reachable()) {
+      v.currentTime = Math.max(0, p.position - streamStart.value)
       position.value = p.position
       toast.info(`已从 ${fmtTime(p.position)} 继续播放`)
+    } else {
+      resumeAt.value = p.position
+      toast.info(`正在生成到 ${fmtTime(p.position)} 再继续播放…`)
     }
   }).catch(() => {})
+}
+
+/**
+ * The element reached the end of what it knows about, which is not the same as the
+ * end of the episode while a session is still packaging.
+ *
+ * A packaged stream arrives as an event playlist; when the packager finishes, the
+ * list gains its end marker and the player switches from "live" to "on demand" —
+ * and it takes the length it had buffered at that instant as the stream's length.
+ * Playback then ends in the middle of an episode that is sitting finished on disk.
+ * Reconnecting picks up a playlist that covers everything produced since, and the
+ * pending position (resumeAt) takes the playhead back to where it stopped.
+ */
+function onEnded() {
+  const v = videoEl.value
+  if (!v) return
+  const known = Number(play.value?.duration) || 0
+  const at = v.currentTime + streamStart.value
+  // A real ending, or nothing was played at all: either way this is not a packaged
+  // edge. The second case matters more than it looks — an element that has not
+  // started reports "ended" too, and treating that as a packaging edge makes the
+  // player reconnect in a loop and never play anything.
+  if (known <= 0 || at < 5 || at >= known - 5) return
+  // One attempt per position: if reconnecting lands on the same edge again, that
+  // is the truth about this stream, not a reason to try forever.
+  if (Math.abs(at - endedAt) < 30) return
+  endedAt = at
+  resumeAt.value = at
+  if (reachable() > at + 5) {
+    // More exists than this stream knows about: start again with the fuller
+    // timeline, then continue from where it stopped.
+    toast.info('继续播放…')
+    attachSource()
+  } else {
+    // Nothing beyond this point exists yet. Wait for the packaging to pass it.
+    toast.info('正在生成后面的部分…')
+  }
 }
 
 function onErr() {
@@ -915,7 +1033,8 @@ function onErr() {
     return
   }
   const tried = cands.value.map(candName).join(' → ')
-  error.value = `播放失败(解码或网络错误)。已尝试:${tried}`
+  error.value = `播放失败(解码或网络错误)。已尝试:${tried}` +
+    (lastServerReason ? `\n服务端说:${lastServerReason}` : '')
 }
 
 function onTimeUpdate() {
@@ -928,6 +1047,17 @@ function onTimeUpdate() {
   // deal in is file time, so the session offset is added on the way out.
   if (!scrubbing.value) position.value = v.currentTime + streamStart.value
   if (v.buffered.length) buffered.value = v.buffered.end(v.buffered.length - 1) + streamStart.value
+  // A saved position the stream had not reached yet (see onLoadedMetadata): go
+  // there as soon as there is something to play there.
+  if (resumeAt.value) {
+    if (resumeAt.value <= reachable()) {
+      const at = resumeAt.value
+      resumeAt.value = 0
+      v.currentTime = Math.max(0, at - streamStart.value)
+      position.value = at
+      toast.info(`已从 ${fmtTime(at)} 继续播放`)
+    }
+  }
   // A paused picture draws no frames of its own, so a seek while paused has to
   // be painted from here.
   if (v.paused) paintDanmaku()
@@ -1347,14 +1477,57 @@ function moveScrub(e) {
 }
 function endScrub() {
   const v = videoEl.value
+  // A drag overrides a pending resume: the viewer has said where they want to be.
+  resumeAt.value = 0
   if (scrubbing.value && v && isFinite(scrubTime.value)) {
     // scrubTime is file time; the element wants stream time.
-    v.currentTime = Math.max(0, scrubTime.value - streamStart.value)
-    position.value = scrubTime.value
+    let target = scrubTime.value
+    // How far this stream reaches: what its session has packaged. With on-demand
+    // packaging that is a window that grows behind the playhead, not the whole
+    // episode — and dragging past it is the one thing a player cannot do, because
+    // those fragments do not exist yet.
+    const reach = reachable()
+    const beyond = target > reach - 0.5
+    if (beyond && play.value?.can_start_at && target > 0) {
+      // The server can begin a stream there, so ask for one: the same thing it does
+      // for "continue watching", with the position stated instead of remembered.
+      seekTo(target)
+    } else {
+      // Where the playhead can actually go: the farthest fragment that exists.
+      let applied = target
+      if (beyond) {
+        if (reach > streamStart.value) {
+          applied = reach - 0.5
+          toast.info(`这一段还在生成中,先跳到 ${fmtTime(applied)}`)
+        } else {
+          // Nothing is packaged yet, so there is nowhere to go. Say so and leave
+          // the clock where it is — showing the requested position while the video
+          // plays somewhere else is worse than not seeking at all.
+          applied = null
+          toast.info('这一段还在生成中,稍等一下')
+        }
+      }
+      if (applied !== null) {
+        v.currentTime = Math.max(0, applied - streamStart.value)
+        position.value = applied
+      }
+    }
   }
   scrubbing.value = false
   window.removeEventListener('pointermove', moveScrub)
   window.removeEventListener('pointerup', endScrub)
+}
+
+/**
+ * Move playback to a position this stream has not packaged.
+ *
+ * A player cannot seek into fragments that do not exist, so this is a restart at
+ * the target: the same thing the server does for "continue watching", with the
+ * position stated explicitly rather than taken from saved progress.
+ */
+async function seekTo(at) {
+  toast.info(`正在从 ${fmtTime(at)} 开始…`)
+  await loadDecision(forceMode.value, at)
 }
 
 function onSeekHover(e) {
@@ -1544,6 +1717,7 @@ onBeforeUnmount(() => {
               webkit-playsinline
               preload="auto"
               @loadedmetadata="onLoadedMetadata"
+              @durationchange="applyDuration"
               @error="onErr"
               @timeupdate="onTimeUpdate"
               @progress="onTimeUpdate"
@@ -1554,6 +1728,7 @@ onBeforeUnmount(() => {
               @waiting="onWaiting"
               @playing="onPlaying"
               @canplay="onCanPlay"
+              @ended="onEnded"
               @click="onTap"
               @dblclick="onDoubleTap"
               @ratechange="rate = videoEl?.playbackRate || 1"

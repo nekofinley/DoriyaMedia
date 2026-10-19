@@ -105,6 +105,45 @@ type Session struct {
 	complete bool
 	// size is the directory's size in bytes, measured when it completes.
 	size int64
+	// startedAt is when this session's packager was launched. Progress is reported
+	// against it, so a viewer can see whether production is faster than realtime.
+	startedAt time.Time
+}
+
+// Output reports what this session's packager has written so far: how many media
+// segments the playlist lists, how much timeline they cover, when the output last
+// changed, and whether the packager is still alive.
+//
+// The playlist is the right thing to read. ffmpeg rewrites it every time a segment
+// is finished, so it carries both the count and the liveness signal, and it is the
+// same file the player is being served from.
+func (s *Session) Output() (segments int, seconds float64, lastAt time.Time, running bool) {
+	if raw, err := os.ReadFile(s.PlaylistPath()); err == nil {
+		for _, line := range strings.Split(string(raw), "\n") {
+			d, ok := strings.CutPrefix(strings.TrimSpace(line), "#EXTINF:")
+			if !ok {
+				continue
+			}
+			segments++
+			if v, err := strconv.ParseFloat(strings.TrimSuffix(d, ","), 64); err == nil {
+				seconds += v
+			}
+		}
+	}
+	if fi, err := os.Stat(s.PlaylistPath()); err == nil {
+		lastAt = fi.ModTime()
+	} else if fi, err := os.Stat(s.dir); err == nil {
+		lastAt = fi.ModTime()
+	}
+	if s.pack != nil {
+		select {
+		case <-s.pack.Done():
+			running = false // the packager has exited
+		default:
+			running = true
+		}
+	}
+	return segments, seconds, lastAt, running
 }
 
 // markComplete records that the packager finished and measures what it produced.
@@ -448,7 +487,7 @@ func (e *Engine) LoadCache() {
 			dropped++
 			continue
 		}
-		s := &Session{key: key, dir: dir, lastUsed: time.Now()}
+		s := &Session{key: key, dir: dir, lastUsed: time.Now(), startedAt: time.Now()}
 		s.markComplete()
 		e.sessMu.Lock()
 		e.sessions[key] = s
@@ -552,7 +591,7 @@ func (e *Engine) EnsureSession(ctx context.Context, key sessionKey, opts Package
 		return nil, err
 	}
 
-	s := &Session{key: key, dir: dir, pack: p, cancel: cancel, lastUsed: time.Now(), startSeconds: opts.StartSeconds}
+	s := &Session{key: key, dir: dir, pack: p, cancel: cancel, lastUsed: time.Now(), startedAt: time.Now(), startSeconds: opts.StartSeconds}
 
 	e.sessMu.Lock()
 	// Another request may have won the race; keep only one session per key.

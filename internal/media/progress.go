@@ -51,6 +51,15 @@ type StreamStatus struct {
 	// IdleSeconds since the last segment request: the player uses it to hide the
 	// progress UI once generation has stopped.
 	IdleSeconds float64 `json:"idle_seconds"`
+	// PackagerRunning says a packaging session for this file is alive right now.
+	//
+	// A session answers one long-lived ffmpeg rather than generating a segment per
+	// request, so none of the counters above ever move for it. Without this the
+	// player asking "is the server still working?" about a packaged playback was
+	// told nothing, and gave up on a stream that was still being produced — on a
+	// cold 4K file on a cloud drive, which is exactly when the first segments take
+	// longer than any fixed timeout a player applies.
+	PackagerRunning bool `json:"packager_running,omitempty"`
 }
 
 // noteSegmentStart records that a segment request is in flight.
@@ -116,6 +125,63 @@ func (e *Engine) StreamStatus(fileID int64) *StreamStatus {
 	}
 	if p.busySeconds > 0 {
 		st.RealtimeFactor = p.generatedSeconds / p.busySeconds
+	}
+	return st
+}
+
+// PackagerProgress reports what a file's packaging sessions have produced.
+//
+// The session path answers one long-lived ffmpeg instead of generating a segment
+// per request, so the counters above never move for it: a player asking whether the
+// server is still working on a packaged playback was told nothing, applied its own
+// timeout, and gave up on a stream that was merely slow to start. Reading the
+// sessions' own output answers that question with the truth.
+//
+// It returns nil when the file has no session at all, so callers can fall back to
+// the per-request counters.
+func (e *Engine) PackagerProgress(fileID int64) *StreamStatus {
+	e.sessMu.Lock()
+	var live []*Session
+	for k, s := range e.sessions {
+		if k.fileID == fileID {
+			live = append(live, s)
+		}
+	}
+	e.sessMu.Unlock()
+	if len(live) == 0 {
+		return nil
+	}
+
+	st := &StreamStatus{}
+	var newest, started time.Time
+	for _, s := range live {
+		segments, seconds, lastAt, running := s.Output()
+		if running {
+			st.PackagerRunning = true
+		}
+		if segments > st.SegmentsReady {
+			st.SegmentsReady = segments
+			st.GeneratedSeconds = seconds
+		}
+		if lastAt.After(newest) {
+			newest = lastAt
+		}
+		if started.IsZero() || s.startedAt.After(started) {
+			started = s.startedAt
+		}
+	}
+	if newest.IsZero() {
+		newest = started
+	}
+	if !newest.IsZero() {
+		st.IdleSeconds = time.Since(newest).Seconds()
+	}
+	// Measured against wall time, unlike the per-request factor: a packager runs
+	// continuously, so the time it has had is the time it was working.
+	if !started.IsZero() {
+		if elapsed := time.Since(started).Seconds(); elapsed > 0.5 && st.GeneratedSeconds > 0 {
+			st.RealtimeFactor = st.GeneratedSeconds / elapsed
+		}
 	}
 	return st
 }

@@ -157,6 +157,20 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		startQ = "&start=" + strconv.FormatFloat(resumeFrom, 'f', 3, 64)
 	}
 
+	// A seek is not a resume. The guards above belong to "carry on where you left
+	// off" — they refuse to resume from the opening seconds or into the final
+	// stretch, because those are not places a viewer stopped at. A player asking to
+	// start at a position means exactly that position, wherever it is, and it needs
+	// the session boundary the server actually snapped to: packaged segments are
+	// addressed by index, so a stream that begins at 601.5s when the player believes
+	// it begins at 600s reports every timestamp 1.5s wrong.
+	if v := r.URL.Query().Get("at"); v != "" {
+		if at, err := strconv.ParseFloat(v, 64); err == nil && at > 0 && (dec.Duration <= 0 || at < dec.Duration) {
+			resumeFrom = at
+			startQ = "&start=" + strconv.FormatFloat(at, 'f', 3, 64)
+		}
+	}
+
 	// subtitles: only convertible (text) tracks can be served as WebVTT, and the
 	// one worth turning on automatically is picked here so every client agrees.
 	// Resolved before the URL is built, because whether there are subtitles
@@ -242,7 +256,20 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 	// as starting at zero. So the client is told where the stream begins in file
 	// time, or it would save progress measured from the resume point and line
 	// subtitles up against the wrong clock.
+	// Whether a stream can be asked to begin at an arbitrary position.
+	//
+	// It cannot for a two-stream source: its parts seek independently, so every
+	// session starts at the beginning and the player can only reach what has been
+	// packaged so far. A player that does not know this will drag its bar into
+	// fragments that do not exist yet and appear to do nothing at all.
 	streamStart := s.streamStartFor(dec.Mode, resumeFrom, multiPart)
+	// Whether a stream can be asked to begin at an arbitrary position.
+	//
+	// It cannot for a two-stream source: its parts seek independently, so every
+	// session starts at the beginning and the player can only reach what has been
+	// packaged so far. A player that does not know this drags its bar into fragments
+	// that do not exist yet and appears to do nothing at all.
+	canStartAt := dec.Kind == "hls" && !multiPart
 
 	// Safari manages HLS subtitles itself and ignores <track> on a natively
 	// played stream, so it is handed a master playlist carrying the subtitles as
@@ -378,6 +405,10 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		// timestamps the segments carry — so the client needs this offset to seek,
 		// to save progress in file time, and to line up absolutely timed subtitles.
 		"stream_start": streamStart,
+		// Whether the player may ask for a stream beginning at some other position
+		// (see the seek handling in the web player): without it, the honest answer
+		// to a drag past the packaged window is to go as far as it can and say so.
+		"can_start_at": canStartAt,
 		// native_subtitles says the stream carries its subtitles as HLS
 		// renditions, so the player manages them (its own menu, its own default)
 		// and the page must not also attach <track> elements.
@@ -461,6 +492,20 @@ func (s *Server) playPreparingPayload(r *http.Request, file *models.MediaFile) m
 
 // handlePlayStatus reports the probe state for a file so the player can show
 // real progress instead of an indistinguishable spinner.
+// streamStatusFor reports what is being produced for a file, preferring the
+// packaging session's own output.
+//
+// A packaged playback answers one long-lived ffmpeg, so the per-request counters
+// say nothing about it — and a player told nothing applies its own timeout and
+// gives up on a stream that is merely slow to start, which is the normal case for
+// the first seconds of a cold 4K file on a cloud drive.
+func (s *Server) streamStatusFor(fileID int64) *media.StreamStatus {
+	if p := s.Engine.PackagerProgress(fileID); p != nil {
+		return p
+	}
+	return s.Engine.StreamStatus(fileID)
+}
+
 func (s *Server) handlePlayStatus(w http.ResponseWriter, r *http.Request, user *models.User) {
 	id, ok := pathID(r)
 	if !ok {
@@ -478,12 +523,11 @@ func (s *Server) handlePlayStatus(w http.ResponseWriter, r *http.Request, user *
 	}
 	// stream carries segment-generation progress once playback starts, so the
 	// player can show how much is ready and whether the server keeps up.
-	writeJSON(w, 200, map[string]any{
-		"file_id": id,
+	writeJSON(w, 200, map[string]any{		"file_id": id,
 		"state":   st.State, // idle | probing | ready | failed
 		"elapsed": st.Elapsed,
 		"error":   st.Error,
-		"stream":  s.Engine.StreamStatus(id),
+		"stream":  s.streamStatusFor(id),
 	})
 }
 
@@ -1062,20 +1106,25 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		}
 	}
 
-	opts := media.PackagerOptions{
-		FFmpeg:          s.Cfg.FFmpeg,
-		Inputs:          inputs,
-		VideoIndex:      videoIndex,
-		AudioOrdinal:    audioOrdinal,
-		VideoMode:       req.videoMode,
-		AudioMode:       audioMode,
-		VideoCodec:      videoCodec,
-		TranscodeHeight: s.Cfg.Playback.TranscodeHeight,
-		SegmentSeconds:  segLen,
-		StartSeconds:    sessionStart,
-		StartSegment:    startSeg,
-		Burn:            req.burn,
-		PrepareDir:      req.prepare,
+	// The packager's command line is rebuilt from whichever inputs it is handed, so
+	// recovering from a refused link is a matter of resolving again and asking for a
+	// session with those.
+	optsFor := func(in []media.Input) media.PackagerOptions {
+		return media.PackagerOptions{
+			FFmpeg:          s.Cfg.FFmpeg,
+			Inputs:          in,
+			VideoIndex:      videoIndex,
+			AudioOrdinal:    audioOrdinal,
+			VideoMode:       req.videoMode,
+			AudioMode:       audioMode,
+			VideoCodec:      videoCodec,
+			TranscodeHeight: s.Cfg.Playback.TranscodeHeight,
+			SegmentSeconds:  segLen,
+			StartSeconds:    sessionStart,
+			StartSegment:    startSeg,
+			Burn:            req.burn,
+			PrepareDir:      req.prepare,
+		}
 	}
 	sig := signedQuery(s.Cfg.Secret, file.ID, sigTTL) + "&m=" + mode
 	if a := q.Get("a"); a != "" {
@@ -1089,8 +1138,8 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 	// Packaging can only start where a session is; which session answers a
 	// request depends on where in the file the request asks for.
 	height := s.Cfg.Playback.TranscodeHeight
-	ensureAt := func(startSeg int) (*media.Session, error) {
-		o := opts
+	ensureAt := func(in []media.Input, startSeg int) (*media.Session, error) {
+		o := optsFor(in)
 		o.StartSegment = startSeg
 		o.StartSeconds = float64(startSeg) * segLen
 		if multi {
@@ -1108,11 +1157,11 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 	// position this playback began at), while a playlist request that starts a
 	// playback must honour its position — otherwise "continue watching" streams
 	// from whatever session was left over.
-	streamSession := func() (*media.Session, error) {
+	streamSession := func(in []media.Input) (*media.Session, error) {
 		sess := s.Engine.SessionForStream(file.ID, mode, audioOrdinal, videoIndex, height)
 		switch {
 		case sess == nil:
-			return ensureAt(startSeg)
+			return ensureAt(in, startSeg)
 		case sess.StartSegment() == startSeg:
 			sess.Touch()
 			return sess, nil
@@ -1124,47 +1173,57 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 			// Nothing has been consumed here for a while, so treat this as a new
 			// playback and begin where it asks.
 			s.Engine.CloseStreamSessions(file.ID, mode, audioOrdinal, videoIndex, height, nil)
-			return ensureAt(startSeg)
+			return ensureAt(in, startSeg)
 		}
 	}
 
 	switch {
 	case rest == "" || strings.HasPrefix(rest, "index") || strings.HasPrefix(rest, "playlist"):
-		sess, err := streamSession()
+		// Nothing has been written to the response while these waits fail, so a
+		// packager that died on a refused link can be retried with a fresh one.
+		err := media.RetryWithFreshLink(ctx, s.Engine, file, drv, inputs, func(in []media.Input) error {
+			sess, err := streamSession(in)
+			if err != nil {
+				return fmt.Errorf("打包会话启动失败: %w", err)
+			}
+			// The playlist is rewritten in place as the packager runs, so "it
+			// exists" is not "it is readable": a half-written manifest is fatal to
+			// a player.
+			if err := sess.WaitForPlaylist(ctx, 45*time.Second); err != nil {
+				return fmt.Errorf("打包播放列表未就绪: %w", err)
+			}
+			pl, err := os.ReadFile(sess.PlaylistPath())
+			if err != nil {
+				return fmt.Errorf("读取播放列表失败: %w", err)
+			}
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			w.Header().Set("Cache-Control", "no-store")
+			_, _ = w.Write([]byte(media.RewriteSessionPlaylist(string(pl), base, sig)))
+			return nil
+		})
 		if err != nil {
-			log.Printf("hls session for file %d failed to start: %v", file.ID, err)
-			fail(w, 502, "打包会话启动失败: "+err.Error())
-			return
+			log.Printf("hls playlist for file %d failed: %v", file.ID, err)
+			fail(w, 502, err.Error())
 		}
-		// The playlist is rewritten in place as the packager runs, so "it exists"
-		// is not "it is readable": a half-written manifest is fatal to a player.
-		if err := sess.WaitForPlaylist(ctx, 45*time.Second); err != nil {
-			fail(w, 502, "打包播放列表未就绪: "+err.Error())
-			return
-		}
-		pl, err := os.ReadFile(sess.PlaylistPath())
-		if err != nil {
-			fail(w, 502, "读取播放列表失败: "+err.Error())
-			return
-		}
-		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		w.Header().Set("Cache-Control", "no-store")
-		_, _ = w.Write([]byte(media.RewriteSessionPlaylist(string(pl), base, sig)))
 
 	case rest == "init.mp4":
-		sess, err := streamSession()
+		err := media.RetryWithFreshLink(ctx, s.Engine, file, drv, inputs, func(in []media.Input) error {
+			sess, err := streamSession(in)
+			if err != nil {
+				return fmt.Errorf("打包会话启动失败: %w", err)
+			}
+			// ffmpeg writes the init segment in place, so it has to be waited for
+			// until it is no longer growing — half of it makes the whole stream
+			// undecodable.
+			if err := sess.WaitForInit(ctx, 45*time.Second); err != nil {
+				return fmt.Errorf("初始化分片未就绪: %w", err)
+			}
+			s.serveSessionFile(w, r, ctx, sess, sess.InitPath(), false)
+			return nil
+		})
 		if err != nil {
-			fail(w, 502, "打包会话启动失败: "+err.Error())
-			return
+			fail(w, 502, err.Error())
 		}
-		// ffmpeg writes the init segment in place, so it has to be waited for
-		// until it is no longer growing — half of it makes the whole stream
-		// undecodable.
-		if err := sess.WaitForInit(ctx, 45*time.Second); err != nil {
-			fail(w, 502, "初始化分片未就绪: "+err.Error())
-			return
-		}
-		s.serveSessionFile(w, r, ctx, sess, sess.InitPath(), false)
 
 	default:
 		idx, ok := media.ParseSessionSegment(rest)
@@ -1184,7 +1243,7 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 			if !multi {
 				s.Engine.CloseStreamSessions(file.ID, mode, audioOrdinal, videoIndex, height, nil)
 			}
-			next, err := ensureAt(idx)
+			next, err := ensureAt(inputs, idx)
 			if err != nil {
 				log.Printf("hls session for file %d failed to start at segment %d: %v", file.ID, idx, err)
 				fail(w, 502, "打包会话启动失败: "+err.Error())

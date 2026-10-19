@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -121,5 +123,99 @@ func TestStreamStatusResetsAfterIdleGap(t *testing.T) {
 	}
 	if st.SegmentsRequested != 1 {
 		t.Fatalf("requested=%d after a new burst, want 1", st.SegmentsRequested)
+	}
+}
+
+// A packaged playback has to be able to answer "is the server still working on
+// it?". Its segments never pass through the per-request counters, so without this
+// a player is told nothing, applies its own timeout, and gives up on a stream that
+// is merely slow to start — the first seconds of a cold 4K file on a cloud drive.
+func TestPackagerProgressReportsWhatASessionProduced(t *testing.T) {
+	e := newTestEngine(t, nil)
+	e.Cfg.DataDir = t.TempDir()
+	dir := filepath.Join(e.Cfg.Abs(), "cache", "hls", "7-remux-a0-v0-h1080-s0")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFileT(t, filepath.Join(dir, packagerPlaylistName),
+		"#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n"+
+			"#EXTINF:4.000,\nseg00000.m4s\n#EXTINF:3.500,\nseg00001.m4s\n")
+
+	key := SessionKey(7, "remux", 0, 0, 1080, 0)
+	pack := &Packager{done: make(chan struct{})}
+	s := &Session{key: key, dir: dir, pack: pack, lastUsed: time.Now(), startedAt: time.Now().Add(-4 * time.Second)}
+	e.sessMu.Lock()
+	e.sessions[key] = s
+	e.sessMu.Unlock()
+
+	st := e.PackagerProgress(7)
+	if st == nil {
+		t.Fatal("a file with a live session must report progress")
+	}
+	if st.SegmentsReady != 2 {
+		t.Fatalf("segments_ready = %d, want 2 (the playlist's EXTINF entries)", st.SegmentsReady)
+	}
+	if st.GeneratedSeconds != 7.5 {
+		t.Fatalf("generated_seconds = %v, want 7.5", st.GeneratedSeconds)
+	}
+	if !st.PackagerRunning {
+		t.Fatal("packager_running must be true while the packager is alive")
+	}
+	if st.RealtimeFactor <= 0 {
+		t.Fatalf("realtime_factor = %v, want the production rate against the time it has had", st.RealtimeFactor)
+	}
+
+	// Once the packager exits, nothing is being produced any more: the client must
+	// stop waiting on it and play what is already there.
+	close(pack.done)
+	st = e.PackagerProgress(7)
+	if st == nil {
+		t.Fatal("a finished session still has output worth reporting")
+	}
+	if st.PackagerRunning {
+		t.Fatal("packager_running must be false once the packager has exited")
+	}
+	if st.SegmentsReady != 2 {
+		t.Fatalf("segments_ready = %d after exit, want the 2 it produced", st.SegmentsReady)
+	}
+}
+
+// No session at all means no opinion: the caller falls back to the per-request
+// counters rather than being told "nothing is happening".
+func TestPackagerProgressIsSilentWithoutASession(t *testing.T) {
+	e := newTestEngine(t, nil)
+	e.Cfg.DataDir = t.TempDir()
+	if st := e.PackagerProgress(4242); st != nil {
+		t.Fatalf("progress for a file with no session = %+v, want nil", st)
+	}
+}
+
+// A packager that has just started has produced nothing yet. That must read as
+// "working", not as "idle for a very long time" — which is what a zero timestamp
+// would say.
+func TestPackagerProgressOfAJustStartedSessionLooksBusy(t *testing.T) {
+	e := newTestEngine(t, nil)
+	e.Cfg.DataDir = t.TempDir()
+	dir := filepath.Join(e.Cfg.Abs(), "cache", "hls", "9-remux-a0-v0-h1080-s0")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	key := SessionKey(9, "remux", 0, 0, 1080, 0)
+	e.sessMu.Lock()
+	e.sessions[key] = &Session{key: key, dir: dir, pack: &Packager{done: make(chan struct{})}, startedAt: time.Now()}
+	e.sessMu.Unlock()
+
+	st := e.PackagerProgress(9)
+	if st == nil {
+		t.Fatal("want progress for a session that has just started")
+	}
+	if st.SegmentsReady != 0 {
+		t.Fatalf("segments_ready = %d, want 0", st.SegmentsReady)
+	}
+	if st.IdleSeconds > 5 {
+		t.Fatalf("idle_seconds = %.1f: a session that has just been started is not idle", st.IdleSeconds)
+	}
+	if !st.PackagerRunning {
+		t.Fatal("packager_running must be true for a working packager")
 	}
 }
