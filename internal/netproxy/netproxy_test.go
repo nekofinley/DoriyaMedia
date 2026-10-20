@@ -16,6 +16,37 @@ import (
 	"time"
 )
 
+// ---------- region classification ----------
+
+// A proxy in Hong Kong is not an error: it unlocks the 港澳台 catalogue while
+// the mainland-only titles answer -10403. The two flags drive the settings
+// page's colour and message, so they must not both be false, and a mainland
+// address must never be reported as HMT (or the other way round).
+func TestZoneClassification(t *testing.T) {
+	cases := []struct {
+		country, region string
+		mainland, hmt   bool
+	}{
+		{"中国", "广东深圳", true, false},
+		{"CN", "Zhejiang", true, false},
+		{"中国", "香港", false, true},
+		{"中国", "澳门", false, true},
+		{"中国", "台湾", false, true},
+		{"中国台湾", "", false, true},
+		{"Hong Kong", "", false, true},
+		{"日本", "东京", false, false},
+		{"美国", "加利福尼亚", false, false},
+	}
+	for _, c := range cases {
+		if got := isMainland(c.country, c.region); got != c.mainland {
+			t.Errorf("isMainland(%q, %q) = %v, want %v", c.country, c.region, got, c.mainland)
+		}
+		if got := isHMT(c.country, c.region); got != c.hmt {
+			t.Errorf("isHMT(%q, %q) = %v, want %v", c.country, c.region, got, c.hmt)
+		}
+	}
+}
+
 // ---------- parsing ----------
 
 func TestParseAcceptsTheFormsUsersPaste(t *testing.T) {

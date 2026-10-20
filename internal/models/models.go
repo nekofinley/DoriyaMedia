@@ -89,6 +89,14 @@ type SourceConfig struct {
 	// (Shadowsocks' password is the key itself), so it is masked for anyone who
 	// is not an administrator.
 	BiliProxy string `json:"bili_proxy,omitempty"`
+	// BiliPlayableOnly keeps this source's listing to what its current route
+	// can actually play. bilibili licenses 番剧 per region, and the licence is
+	// checked by the streaming endpoint, not by the season page: a proxy in
+	// Hong Kong plays the 港澳台 titles while a mainland-only one answers
+	// -10403. With this on, a season that answers -10403 is listed as empty, so
+	// a media-library scan neither adds it nor keeps rows an earlier scan made
+	// for it — instead of offering a card that cannot play.
+	BiliPlayableOnly bool `json:"bili_playable_only,omitempty"`
 }
 
 type Library struct {

@@ -1,6 +1,13 @@
 package source
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -236,6 +243,137 @@ func TestCheckPlayInfoRefusesPreviewEpisode(t *testing.T) {
 	short.Dash.Duration = 360 // the six-minute trial
 	if err := checkPlayInfo(short, 1421000); err == nil {
 		t.Fatal("a six-minute answer for a 23-minute episode must be refused")
+	}
+}
+
+// ---------- region filter ----------
+
+// resetBiliCache empties the driver's shared TTL cache. The tests below ask the
+// same season ids through changing routes, and a cached verdict from an earlier
+// case would answer for the wrong one.
+func resetBiliCache() {
+	biliCacheMu.Lock()
+	biliCache = map[string]biliCacheItem{}
+	biliCacheMu.Unlock()
+}
+
+// biliSeasonFixture is the shape /pgc/view/web/season answers with, reduced to
+// the fields the driver reads: the id, a title, and one regular episode.
+func biliSeasonFixture(seasonID, epID, cid, aid int64) []byte {
+	body, err := json.Marshal(map[string]any{
+		"code": 0, "message": "success",
+		"result": map[string]any{
+			"season_id": seasonID,
+			"title":     fmt.Sprintf("番剧 %d", seasonID),
+			"episodes": []map[string]any{{
+				"id": epID, "cid": cid, "aid": aid,
+				"title": "1", "long_title": "第一集", "duration": 1440000,
+			}},
+		},
+	})
+	if err != nil {
+		// The fixture is a fixed map of strings and numbers; this cannot fail.
+		panic(err)
+	}
+	return body
+}
+
+// The scan is what this behaviour exists for, so the test watches the listing
+// the walker actually reads: a season that playurl refuses must come back
+// empty (which is what keeps it out of a library and removes stale rows), a
+// playable one must come back whole, and a failure that is *not* a region
+// verdict must not hide anything.
+func TestPlayableOnlySkipsRegionLockedSeason(t *testing.T) {
+	resetBiliCache()
+	defer resetBiliCache()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/pgc/view/web/season":
+			id, _ := strconv.ParseInt(r.URL.Query().Get("season_id"), 10, 64)
+			ep, cid, aid := id*10+1, id*10+2, id*10+3
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(biliSeasonFixture(id, ep, cid, aid))
+		case "/pgc/player/web/playurl":
+			// The probe episode of the blocked season is the only one bilibili
+			// refuses; 900003's answer is a server failure, not a verdict.
+			switch r.URL.Query().Get("ep_id") {
+			case "9000011":
+				_, _ = w.Write([]byte(`{"code":-10403,"message":"抱歉您所在地区不可观看！"}`))
+			case "9000031":
+				w.WriteHeader(http.StatusInternalServerError)
+			default:
+				_, _ = w.Write([]byte(`{"code":0,"message":"success","result":{}}`))
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	oldAPI := biliAPI
+	biliAPI = srv.URL
+	defer func() { biliAPI = oldAPI }()
+
+	ctx := context.Background()
+	d := &BilibiliDriver{codec: "avc", client: srv.Client(), playableOnly: true}
+
+	eps, err := d.episodeEntries(ctx, "/挡住 [series 900001]/看不见 [season 900001]", 900001)
+	if err != nil {
+		t.Fatalf("a region-locked season must list as empty, not fail: %v", err)
+	}
+	if len(eps) != 0 {
+		t.Fatalf("a region-locked season listed %d episodes, want none", len(eps))
+	}
+
+	eps, err = d.episodeEntries(ctx, "/能看 [series 900002]/看得见 [season 900002]", 900002)
+	if err != nil || len(eps) != 1 {
+		t.Fatalf("a playable season listed %d episodes (err=%v), want 1", len(eps), err)
+	}
+
+	// A 500 from the playurl probe is unknown, not "unplayable". The season has
+	// to stay listed: hiding it would delete a library's rows for a transient
+	// failure.
+	eps, err = d.episodeEntries(ctx, "/风控 [series 900003]/未知 [season 900003]", 900003)
+	if err != nil || len(eps) != 1 {
+		t.Fatalf("an unknown probe failure listed %d episodes (err=%v), want the season kept", len(eps), err)
+	}
+
+	// With the option off the same blocked season is listed exactly as before.
+	d.playableOnly = false
+	eps, err = d.episodeEntries(ctx, "/挡住 [series 900001]/看不见 [season 900001]", 900001)
+	if err != nil || len(eps) != 1 {
+		t.Fatalf("with the filter off the blocked season listed %d episodes (err=%v), want 1", len(eps), err)
+	}
+}
+
+func TestProbeEpisodePrefersRegularThenSection(t *testing.T) {
+	if got := probeEpisode(&pgcSeason{Episodes: []pgcEpisode{
+		{ID: 0, Cid: 1}, {ID: 5, Cid: 6, Aid: 7},
+	}}); got == nil || got.ID != 5 {
+		t.Fatalf("probeEpisode picked %+v, want the first episode with an id and cid", got)
+	}
+	sectionOnly := &pgcSeason{Section: []pgcSection{{
+		Title:    "PV",
+		Episodes: []pgcEpisode{{ID: 9, Cid: 10}},
+	}}}
+	if got := probeEpisode(sectionOnly); got == nil || got.ID != 9 {
+		t.Fatalf("probeEpisode ignored a section-only season: %+v", got)
+	}
+	if probeEpisode(&pgcSeason{}) != nil {
+		t.Fatal("probeEpisode invented an episode for an empty season")
+	}
+}
+
+func TestBiliErrorMarksRegionLocked(t *testing.T) {
+	if err := biliError(-10403, ""); !errors.Is(err, errRegionLocked) {
+		t.Fatalf("-10403 did not classify as region-locked: %v", err)
+	}
+	if err := biliError(-404, ""); errors.Is(err, errRegionLocked) {
+		t.Fatalf("-404 classified as region-locked: %v", err)
+	}
+	if err := biliError(-352, ""); errors.Is(err, errRegionLocked) {
+		t.Fatalf("-352 classified as region-locked: %v", err)
 	}
 }
 

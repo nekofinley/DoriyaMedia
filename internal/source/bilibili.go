@@ -43,7 +43,6 @@ import (
 // 弹幕 are a plain extra: Comments() returns the bullet comments published
 // against an episode's cid.
 const (
-	biliAPI     = "https://api.bilibili.com"
 	biliReferer = "https://www.bilibili.com/"
 	biliUA      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -54,6 +53,10 @@ const (
 	// biliMaxCommentsPerFile bounds one episode's bullet comments.
 	biliMaxCommentsPerFile = 20000
 )
+
+// biliAPI is the API origin. It is a variable rather than a constant so tests
+// can point the driver at a local server; nothing in production writes it.
+var biliAPI = "https://api.bilibili.com"
 
 // BilibiliDriver lists 番剧 as a virtual tree and plays episodes through the
 // engine's multi-input remux.
@@ -70,6 +73,11 @@ type BilibiliDriver struct {
 	// shared one when there is no proxy, otherwise one dialing through it.
 	client *http.Client
 
+	// playableOnly keeps the listing to what this route can play: see
+	// SourceConfig.BiliPlayableOnly. The check is per season (one playurl probe,
+	// cached), because that is the granularity a library card has.
+	playableOnly bool
+
 	// buvid is the device id bilibili's risk control wants on API requests. A
 	// cookie captured from a browser can lack buvid3, and the search endpoint
 	// then answers with an HTML 412 after the first few requests. It is fetched
@@ -81,8 +89,9 @@ type BilibiliDriver struct {
 
 // NewBilibili builds the driver. proxy is the source's own proxy setting in any
 // of the forms netproxy accepts (socks5:// / http:// / ss:// / host:port); an
-// empty string means direct.
-func NewBilibili(cookie string, quality int, codec string, proxy string) (*BilibiliDriver, error) {
+// empty string means direct. playableOnly asks the driver to leave out seasons
+// the route it dials from cannot play (see SourceConfig.BiliPlayableOnly).
+func NewBilibili(cookie string, quality int, codec string, proxy string, playableOnly bool) (*BilibiliDriver, error) {
 	switch codec {
 	case "", "auto", "avc", "h264", "hevc", "h265", "av1", "av01":
 	default:
@@ -91,7 +100,10 @@ func NewBilibili(cookie string, quality int, codec string, proxy string) (*Bilib
 	if codec == "" {
 		codec = "avc"
 	}
-	d := &BilibiliDriver{cookie: strings.TrimSpace(cookie), quality: quality, codec: codec, client: httpClient}
+	d := &BilibiliDriver{
+		cookie: strings.TrimSpace(cookie), quality: quality, codec: codec,
+		client: httpClient, playableOnly: playableOnly,
+	}
 	spec, err := netproxy.Parse(proxy)
 	switch {
 	case errors.Is(err, netproxy.ErrNoProxy):
@@ -303,6 +315,12 @@ func (d *BilibiliDriver) do(ctx context.Context, req *http.Request) (*http.Respo
 	return client.Do(req.WithContext(ctx))
 }
 
+// errRegionLocked is bilibili's -10403: the licence for this title does not
+// cover the region the request came from. It is a decision the caller can act
+// on (this season is not watchable from here), unlike every other API failure,
+// so it is a sentinel rather than a message.
+var errRegionLocked = errors.New("bilibili: 该内容在当前地区不可观看(-10403)")
+
 // biliError turns the codes a viewer can actually meet into something worth
 // reading. Everything else keeps bilibili's own wording.
 func biliError(code int, msg string) error {
@@ -310,7 +328,11 @@ func biliError(code int, msg string) error {
 	case -101:
 		return fmt.Errorf("bilibili: 账号未登录(Cookie 失效或没填)——登录后才能看会员集和高清")
 	case -10403:
-		return fmt.Errorf("bilibili: 该内容在当前地区不可观看(-10403);服务器若在海外,请在这个源上配置一个落地在中国大陆的代理")
+		// Both directions exist: a mainland-only title from a Hong Kong egress
+		// and a 港澳台-only title from a mainland one answer the same code. The
+		// advice therefore names both regions instead of assuming the machine
+		// should land in mainland.
+		return fmt.Errorf("%w;港澳台与大陆的版权不同,换一个落地在它能看的地区的代理即可", errRegionLocked)
 	case -404:
 		return fmt.Errorf("bilibili: 内容不存在或已下架")
 	case 87007, 87008:
@@ -1093,6 +1115,19 @@ func (d *BilibiliDriver) episodeEntries(ctx context.Context, dir string, seasonI
 	if err != nil {
 		return nil, err
 	}
+	// A season this route cannot play is listed as *empty*, not as an error.
+	//
+	// The scan is what this is for: an empty season directory holds no files,
+	// so the title never becomes a show — and a rescan removes the rows an
+	// earlier scan stored for it, which is what makes switching the proxy (or
+	// turning this on) clean up a library instead of leaving dead cards behind.
+	// Returning an error instead would only add a warning per season and could
+	// fail a scan whose whole catalogue is unavailable from here; it would also
+	// leave the old rows in place, because an unreadable directory proves
+	// nothing to the scanner's cleanup.
+	if d.playableOnly && !d.seasonPlayable(ctx, s) {
+		return []Entry{}, nil
+	}
 	// The file names carry the series, not the season: they already sit inside
 	// the season's own directory, and the series is what a player shows as the
 	// title when an episode is opened from the file browser.
@@ -1238,13 +1273,14 @@ func (d *BilibiliDriver) myMid(ctx context.Context) (int64, error) {
 	return mid, nil
 }
 
-// playInfo asks for one episode's streams.
-func (d *BilibiliDriver) playInfo(ctx context.Context, ref biliEpisodeRef, epID int64) (*pgcPlayInfo, error) {
-	qn := d.quality
+// playURL asks for one episode's streams and returns the payload as it comes.
+// playInfo is the typed reader; the region probe needs only the error, and
+// going through the same request keeps the two from drifting apart.
+func (d *BilibiliDriver) playURL(ctx context.Context, ref biliEpisodeRef, epID int64, qn int) (json.RawMessage, error) {
 	if qn <= 0 {
 		qn = 127 // 8K; bilibili hands back the best the account is entitled to
 	}
-	raw, err := d.getJSON(ctx, "/pgc/player/web/playurl", url.Values{
+	return d.getJSON(ctx, "/pgc/player/web/playurl", url.Values{
 		"ep_id": {strconv.FormatInt(epID, 10)},
 		"cid":   {strconv.FormatInt(ref.Cid, 10)},
 		"avid":  {strconv.FormatInt(ref.Aid, 10)},
@@ -1253,6 +1289,11 @@ func (d *BilibiliDriver) playInfo(ctx context.Context, ref biliEpisodeRef, epID 
 		"fnver": {"0"}, "fourk": {"1"}, "otype": {"json"},
 		"session": {""}, "module": {"bangumi"},
 	})
+}
+
+// playInfo asks for one episode's streams.
+func (d *BilibiliDriver) playInfo(ctx context.Context, ref biliEpisodeRef, epID int64) (*pgcPlayInfo, error) {
+	raw, err := d.playURL(ctx, ref, epID, d.quality)
 	if err != nil {
 		return nil, err
 	}
@@ -1264,6 +1305,74 @@ func (d *BilibiliDriver) playInfo(ctx context.Context, ref biliEpisodeRef, epID 
 		return nil, err
 	}
 	return &info, nil
+}
+
+// probeEpisode picks the entry a region check asks playurl about: the first
+// regular episode, or the first section entry when a season carries none (only
+// PVs and previews, an unusual but real shape). A season with neither has
+// nothing playurl could answer for.
+func probeEpisode(s *pgcSeason) *pgcEpisode {
+	if s == nil {
+		return nil
+	}
+	for i := range s.Episodes {
+		if ep := &s.Episodes[i]; ep.ID != 0 && ep.Cid != 0 {
+			return ep
+		}
+	}
+	for i := range s.Section {
+		for j := range s.Section[i].Episodes {
+			if ep := &s.Section[i].Episodes[j]; ep.ID != 0 && ep.Cid != 0 {
+				return ep
+			}
+		}
+	}
+	return nil
+}
+
+// seasonPlayable asks the one endpoint whose answer depends on where the
+// request comes from. The season page is *not* region-checked: bilibili hands
+// the metadata — title, episode list, covers — to any region, and puts the
+// licence decision in playurl. A title licensed only outside the current
+// egress therefore looks perfectly normal in the tree and answers -10403 the
+// moment a viewer presses play. That is exactly the card this filter removes.
+//
+// Only a definitive -10403 hides a season. A timeout, a rate limit or an
+// account problem must not: an empty listing is what a scan reads as "this
+// season has no episodes", and a flaky probe would take the library rows with
+// it. Those answers keep the season listed and let playback report its own
+// reason.
+func (d *BilibiliDriver) seasonPlayable(ctx context.Context, s *pgcSeason) bool {
+	ep := probeEpisode(s)
+	if ep == nil {
+		return true
+	}
+	// The answer is a property of (season, egress), not of the account —
+	// bilibili's region check is by IP — so the probe is cached under the proxy
+	// it was made through. Six hours keeps a rescan (and every browse of the
+	// same season) from doubling the API calls; changing the proxy changes the
+	// key, so a new route is checked immediately.
+	key := fmt.Sprintf("playable:%s:%d", d.proxySpec.Raw, s.SeasonID)
+	v, err := biliCached(key, 6*time.Hour, func() (any, error) {
+		_, err := d.playURL(ctx, biliEpisodeRef{
+			SeasonID: s.SeasonID, Cid: ep.Cid, Aid: ep.Aid, Duration: ep.Duration,
+		}, ep.ID, 80)
+		switch {
+		case err == nil:
+			return true, nil
+		case errors.Is(err, errRegionLocked):
+			return false, nil
+		default:
+			return nil, err
+		}
+	})
+	if err != nil {
+		// Unknown is not "unplayable": never empty a season on a failure that
+		// is not bilibili's region verdict.
+		return true
+	}
+	ok, _ := v.(bool)
+	return ok
 }
 
 // checkPlayInfo rejects the shapes that carry no streams — or carry the wrong

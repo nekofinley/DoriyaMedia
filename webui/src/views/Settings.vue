@@ -42,7 +42,7 @@ let pollTimer = null
 
 // new source form
 const srcType = ref('openlist')
-const srcForm = ref({ name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '', bili_cookie: '', bili_quality: 0, bili_codec: 'avc', bili_proxy: '' })
+const srcForm = ref({ name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '', bili_cookie: '', bili_quality: 0, bili_codec: 'avc', bili_proxy: '', bili_playable_only: true })
 const testResult = ref(null)
 const testing = ref(false)
 const addingSource = ref(false)
@@ -61,7 +61,7 @@ const proxyTesting = ref(false)
 const proxyResult = ref(null)
 
 function blankSrcForm() {
-  return { name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '', bili_cookie: '', bili_quality: 0, bili_codec: 'avc', bili_proxy: '' }
+  return { name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '', bili_cookie: '', bili_quality: 0, bili_codec: 'avc', bili_proxy: '', bili_playable_only: true }
 }
 
 /** Load one source row into the form, so it can be changed in place. */
@@ -84,6 +84,9 @@ function startEditSource(s) {
     bili_quality: Number(c.bili_quality) || 0,
     bili_codec: c.bili_codec || 'avc',
     bili_proxy: c.bili_proxy && c.bili_proxy !== '******' ? c.bili_proxy : '',
+    // A source from before this option existed has no field: keep its old
+    // behaviour (everything listed) until an administrator ticks the box.
+    bili_playable_only: !!c.bili_playable_only,
   }
   addingSource.value = true
 }
@@ -140,7 +143,11 @@ function buildSourceConfig() {
   if (srcType.value === 'local') return { root: f.root }
   if (srcType.value === 'webdav') return { webdav_url: f.webdav_url, webdav_user: f.webdav_user, webdav_pass: f.webdav_pass }
   if (srcType.value === 'bilibili') {
-    return { bili_cookie: f.bili_cookie, bili_quality: Number(f.bili_quality) || 0, bili_codec: f.bili_codec || 'avc', bili_proxy: (f.bili_proxy || '').trim() }
+    return {
+      bili_cookie: f.bili_cookie, bili_quality: Number(f.bili_quality) || 0,
+      bili_codec: f.bili_codec || 'avc', bili_proxy: (f.bili_proxy || '').trim(),
+      bili_playable_only: !!f.bili_playable_only,
+    }
   }
   return { base_url: f.base_url, token: f.token }
 }
@@ -215,7 +222,9 @@ function stFor(id) { return (scanStates.value || []).find((s) => s.library_id ==
 function sourceLine(s) {
   if (s.type === 'bilibili') {
     const account = s.config.bili_cookie ? '已配置账号' : '未登录(仅免费集 / 480P)'
-    return s.config.bili_proxy ? `${account} · 经代理 ${maskProxy(s.config.bili_proxy)}` : `${account} · 直连(海外 IP 看番剧会被 -10403 拦)`
+    const proxy = s.config.bili_proxy ? `经代理 ${maskProxy(s.config.bili_proxy)}` : '直连(海外 IP 看番剧会被 -10403 拦)'
+    const only = s.config.bili_playable_only ? ' · 只上架当前线路能播的番剧' : ''
+    return `${account} · ${proxy}${only}`
   }
   return s.config.base_url || s.config.webdav_url || s.config.root || '-'
 }
@@ -763,7 +772,8 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                         placeholder="ss://aes-256-gcm:密码@host:8388  /  socks5://127.0.0.1:1080  /  http://127.0.0.1:7890"
                       />
                       <div class="tiny">
-                        B 站按 IP 判断地区,海外 IP 看番剧会报 <code>-10403</code>。填一个落地在中国大陆的代理即可;
+                        B 站按 IP 判断地区,海外 IP 看番剧会报 <code>-10403</code>。填一个落地在<b>中国大陆</b>的代理,
+                        大陆版权的番剧就都能看;落地在<b>香港 / 澳门 / 台湾</b>则能看港澳台版权的番剧(大陆独家的看不了)。
                         这里的流量(接口、CDN 流、服务端合流用的 ffmpeg)都会走它。
                         支持 <b>Shadowsocks</b>(<code>ss://</code>,aes-128/256-gcm、chacha20-ietf-poly1305)、
                         <b>SOCKS5</b>(<code>socks5://</code>,可带用户名密码)和 <b>HTTP</b> 代理(<code>http://</code>)。
@@ -775,9 +785,22 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                         </button>
                         <span class="tiny">会经这个代理访问 B 站接口,告诉你它看到的地区</span>
                       </div>
-                      <div v-if="proxyResult" class="flash" :class="proxyResult.ok && proxyResult.mainland ? 'ok' : 'err'" style="margin:10px 0 0">
-                        <AppIcon :name="proxyResult.ok && proxyResult.mainland ? 'check' : 'alert'" :size="16" />
+                      <div v-if="proxyResult" class="flash" :class="proxyResult.ok && (proxyResult.mainland || proxyResult.hmt) ? 'ok' : 'err'" style="margin:10px 0 0">
+                        <AppIcon :name="proxyResult.ok && (proxyResult.mainland || proxyResult.hmt) ? 'check' : 'alert'" :size="16" />
                         <span>{{ proxyResult.message || proxyResult.error }}</span>
+                      </div>
+                    </div>
+
+                    <div class="field wide">
+                      <label class="check-line">
+                        <input type="checkbox" v-model="srcForm.bili_playable_only" />
+                        只上架当前线路能播放的番剧
+                      </label>
+                      <div class="tiny">
+                        扫描媒体库时逐季请求一次 B 站播放接口:当前地区看不了的季度(<code>-10403</code>)按空目录处理,
+                        不会进媒体库;之前扫描留下的这类剧集,重扫时也会被移除。
+                        网络失败、风控或账号问题不会误删任何东西(只有明确的地区限制才跳过)。
+                        代理在港澳台时建议保持开启 —— 它正好留下港澳台限定、跳过大陆限定。
                       </div>
                     </div>
                   </template>
@@ -815,8 +838,8 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                 <!-- The region answer rides along with the connection test: it
                      is the fact that decides whether 番剧 will play at all. -->
                 <Transition name="fade">
-                  <div v-if="testResult && testResult.region" class="flash" :class="testResult.region.ok && testResult.region.mainland ? 'ok' : 'err'" style="margin:10px 0 0">
-                    <AppIcon :name="testResult.region.ok && testResult.region.mainland ? 'check' : 'alert'" :size="16" />
+                  <div v-if="testResult && testResult.region" class="flash" :class="testResult.region.ok && (testResult.region.mainland || testResult.region.hmt) ? 'ok' : 'err'" style="margin:10px 0 0">
+                    <AppIcon :name="testResult.region.ok && (testResult.region.mainland || testResult.region.hmt) ? 'check' : 'alert'" :size="16" />
                     <span>{{ testResult.region.message || testResult.region.error }}</span>
                   </div>
                 </Transition>

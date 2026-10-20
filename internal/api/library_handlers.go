@@ -180,7 +180,7 @@ func (s *Server) handleTestSource(w http.ResponseWriter, r *http.Request, user *
 			return
 		}
 	case "bilibili":
-		drv, err = source.NewBilibili(req.Config.BiliCookie, req.Config.BiliQuality, req.Config.BiliCodec, req.Config.BiliProxy)
+		drv, err = source.NewBilibili(req.Config.BiliCookie, req.Config.BiliQuality, req.Config.BiliCodec, req.Config.BiliProxy, req.Config.BiliPlayableOnly)
 		if err != nil {
 			fail(w, 400, err.Error())
 			return

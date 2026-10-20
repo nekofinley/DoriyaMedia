@@ -134,7 +134,6 @@ type CatalogHit struct {
 	Kind     string  `json:"kind,omitempty"`
 }
 
-
 // NewDriver builds a driver from a source row.
 func NewDriver(src *models.Source) (Driver, error) {
 	var cfg models.SourceConfig
@@ -151,7 +150,7 @@ func NewDriver(src *models.Source) (Driver, error) {
 	case "openlist":
 		return NewOpenList(cfg.BaseURL, cfg.Token)
 	case "bilibili":
-		return NewBilibili(cfg.BiliCookie, cfg.BiliQuality, cfg.BiliCodec, cfg.BiliProxy)
+		return NewBilibili(cfg.BiliCookie, cfg.BiliQuality, cfg.BiliCodec, cfg.BiliProxy, cfg.BiliPlayableOnly)
 	case "url":
 		return &URLDriver{}, nil
 	default:

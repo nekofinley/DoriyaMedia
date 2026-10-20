@@ -307,6 +307,13 @@ func (sc *Scanner) ImportSeries(ctx context.Context, lib *models.Library, source
 		if werr != nil {
 			return 0, fmt.Errorf("读取番剧失败: %w", werr)
 		}
+		if src.Type == "bilibili" {
+			// With the per-source "只上架当前线路能播的番剧" switch on, a
+			// season licensed to another region is listed as empty on purpose.
+			// Say so instead of the generic "nothing playable", or importing a
+			// 港澳台 title through a mainland proxy reads like a broken source.
+			return 0, fmt.Errorf("没有读到可播放的剧集:该番剧可能不在当前代理地区(换一个落地地区,或关闭该源的「只上架当前线路能播的番剧」再试)")
+		}
 		return 0, fmt.Errorf("没有读到可播放的剧集")
 	}
 	prog.Update(func(st *models.ScanState) {

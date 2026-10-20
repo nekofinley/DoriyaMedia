@@ -38,6 +38,10 @@ type Check struct {
 	// Mainland is true when that address is inside mainland China, which is
 	// where the licensed 番剧 play without restriction.
 	Mainland bool `json:"mainland"`
+	// HMT is true when that address is in Hong Kong, Macau or Taiwan. Those are
+	// licensed separately from the mainland: they unlock the 港澳台 titles and
+	// the mainland-only ones answer -10403, so neither answer is simply "wrong".
+	HMT bool `json:"hmt"`
 	// Latency is how long the round trip took.
 	LatencyMS int64 `json:"latency_ms"`
 	// Message is one line fit for a settings page.
@@ -102,11 +106,14 @@ func CheckProxy(spec Spec, timeout time.Duration) Check {
 	out.OK = true
 	out.Country, out.Region, out.IP = country, region, ip
 	out.Mainland = isMainland(country, region)
+	out.HMT = isHMT(country, region)
 	switch {
 	case out.Mainland:
 		out.Message = fmt.Sprintf("代理可用,bilibili 看到的地区是%s%s(%s)——可以看正版番剧", country, region, ip)
+	case out.HMT:
+		out.Message = fmt.Sprintf("代理可用,bilibili 看到的地区是%s%s(%s)——能看港澳台版权的番剧;大陆独家的仍会报地区限制(-10403),可在源上开启「只上架当前线路能播的番剧」", country, region, ip)
 	default:
-		out.Message = fmt.Sprintf("代理可用,但 bilibili 看到的地区是%s%s(%s)——番剧大概率会报地区限制(-10403),请换一个落地在中国大陆的节点", country, region, ip)
+		out.Message = fmt.Sprintf("代理可用,但 bilibili 看到的地区是%s%s(%s)——大部分正版番剧会报地区限制(-10403),请换一个落地在中国大陆或港澳台的节点", country, region, ip)
 	}
 	return out
 }
@@ -164,12 +171,24 @@ func isMainland(country, region string) bool {
 	if c != "中国" && !strings.EqualFold(c, "CN") && !strings.EqualFold(c, "China") {
 		return false
 	}
-	for _, excluded := range []string{"香港", "澳门", "澳門", "台湾", "臺灣", "Hong Kong", "Macau", "Macao", "Taiwan"} {
-		if strings.Contains(region, excluded) {
-			return false
+	return !isHMT(country, region)
+}
+
+// isHMT reports whether a zone answer is Hong Kong, Macau or Taiwan. The
+// endpoint may put the special region in the province field ("中国 香港") or in
+// the country field itself ("中国台湾"), depending on the route, so both are
+// checked.
+func isHMT(country, region string) bool {
+	area := strings.TrimSpace(country) + " " + strings.TrimSpace(region)
+	for _, name := range []string{
+		"香港", "澳门", "澳門", "台湾", "臺灣",
+		"Hong Kong", "Macau", "Macao", "Taiwan",
+	} {
+		if strings.Contains(area, name) {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 // tidyNetErr turns the url.Error wrapper's inner cause into something a
