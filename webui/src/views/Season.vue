@@ -3,6 +3,7 @@ import { ref, onMounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, imgUrl, artIf, fmtSize } from '../api.js'
 import AppIcon from '../components/AppIcon.vue'
+import BiliBadge from '../components/BiliBadge.vue'
 import SmartImage from '../components/SmartImage.vue'
 import EmptyState from '../components/EmptyState.vue'
 
@@ -144,6 +145,7 @@ onMounted(load)
               <AppIcon name="film" :size="20" :stroke="1.5" />
               <span>{{ epNo(ep) ? `第 ${epNo(ep)} 集` : '剧集' }}</span>
             </div>
+            <BiliBadge v-if="ep.source_type === 'bilibili'" />
             <span class="play-chip"><AppIcon name="play" :size="20" filled /></span>
           </button>
 

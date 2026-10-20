@@ -31,6 +31,18 @@ func TestPickBGM(t *testing.T) {
 			want:    0,
 		},
 		{
+			name:    "繁体中文名折叠后精确匹配",
+			query:   "鬼滅之刃",
+			results: []BgmSubject{subj("鬼灭之刃", "鬼滅の刃", 2019)},
+			want:    0,
+		},
+		{
+			name:    "港澳台译名与大陆译名只差一个字也能认出来",
+			query:   "間諜家家酒",
+			results: []BgmSubject{subj("间谍过家家", "SPY×FAMILY", 2022)},
+			want:    0,
+		},
+		{
 			name:    "日文原名匹配",
 			query:   "ぼっち・ざ・ろっく",
 			results: []BgmSubject{subj("孤独摇滚！", "ぼっち・ざ・ろっく！", 2022)},
@@ -189,6 +201,59 @@ func TestSearchBGMFallsBackToShortenedQuery(t *testing.T) {
 	defer mu.Unlock()
 	if len(seen) < 2 || seen[0] != "别再当欧尼酱了！" || seen[1] != "别当欧尼酱了" {
 		t.Fatalf("searches = %v, want the original then the shortened spelling", seen)
+	}
+}
+
+// A title from the 港澳台 catalogue is Traditional Chinese, and the search
+// engine can return nothing for it even though the subject exists. The
+// Simplified spelling has to be tried, and the hit is still scored against the
+// original name.
+func TestSearchBGMTriesSimplifiedSpelling(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/search/subjects":
+			var body struct {
+				Keyword string `json:"keyword"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			seen = append(seen, body.Keyword)
+			mu.Unlock()
+			hits := []map[string]any{}
+			if body.Keyword == "间谍家家酒" {
+				hits = append(hits, map[string]any{
+					"id": 400602, "name": "SPY×FAMILY", "name_cn": "间谍过家家",
+					"type": 2, "date": "2022-04-09", "eps": 12,
+				})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": hits, "total": len(hits)})
+		case "/v0/subjects/400602":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 400602, "name": "SPY×FAMILY", "name_cn": "间谍过家家",
+				"type": 2, "date": "2022-04-09", "eps": 12,
+				"images": map[string]any{"large": "https://lain.bgm.tv/pic/cover/l/x.jpg"},
+				"rating": map[string]any{"score": 8.1},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	m := NewManager(nil, &config.Config{BGM: config.BGMTV{APIBase: srv.URL}})
+	sub, err := m.searchBGM(context.Background(), "間諜家家酒", 2022)
+	if err != nil {
+		t.Fatalf("searchBGM: %v", err)
+	}
+	if sub == nil || sub.ID != 400602 {
+		t.Fatalf("searchBGM = %+v, want subject 400602", sub)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) < 2 || seen[0] != "間諜家家酒" || seen[1] != "间谍家家酒" {
+		t.Fatalf("searches = %v, want the original then its Simplified spelling", seen)
 	}
 }
 

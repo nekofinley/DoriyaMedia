@@ -142,6 +142,11 @@ type Item struct {
 	Episode       int       `json:"episode,omitempty"`
 	AirDate       string    `json:"air_date,omitempty"`
 	AddedAt       time.Time `json:"added_at"`
+	// SourceType is the kind of storage source every file of this item comes
+	// from ("bilibili", "local", "webdav", …). The scan writes it, and empty
+	// means either no files yet or files from more than one kind of source. The
+	// UI uses it to mark bilibili content with the source's badge.
+	SourceType string `json:"source_type,omitempty"`
 }
 
 type MediaFile struct {

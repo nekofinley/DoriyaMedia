@@ -3,6 +3,7 @@ import { ref, onMounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, imgUrl, artIf, fmtSize, fmtDate, parseGenres, streamBadges } from '../api.js'
 import AppIcon from '../components/AppIcon.vue'
+import BiliBadge from '../components/BiliBadge.vue'
 import SmartImage from '../components/SmartImage.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { toast } from '../toast.js'
@@ -187,6 +188,7 @@ function seasonBackdrop(s) {
               <div class="still">
                 <SmartImage v-if="seasonBackdrop(s)" :src="seasonBackdrop(s)" :alt="s.name" :seed="s.name" />
                 <div v-else class="ph"><span>{{ seasonLabel(s) }}</span></div>
+                <BiliBadge v-if="s.source_type === 'bilibili'" />
                 <span class="play-chip"><AppIcon name="play" :size="15" filled /></span>
               </div>
               <div class="meta">

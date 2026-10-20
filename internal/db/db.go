@@ -150,6 +150,7 @@ func (s *Store) migrate() error {
 			season INTEGER DEFAULT 0,
 			episode INTEGER DEFAULT 0,
 			air_date TEXT DEFAULT '',
+			source_type TEXT NOT NULL DEFAULT '',
 			added_at TIMESTAMP NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_items_library ON items(library_id, type)`,
@@ -165,6 +166,7 @@ func (s *Store) migrate() error {
 			added_at TIMESTAMP NOT NULL,
 			UNIQUE(source_id, path)
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_files_item ON files(item_id)`,
 		`CREATE TABLE IF NOT EXISTS subtitles (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -198,6 +200,9 @@ func (s *Store) migrate() error {
 	if err := s.migrateLibrarySources(); err != nil {
 		return err
 	}
+	if err := s.migrateItemSourceTypes(); err != nil {
+		return err
+	}
 	return s.migrateUsers()
 }
 
@@ -227,6 +232,89 @@ func (s *Store) migrateUsers() error {
 	}
 	for _, c := range cols {
 		if err := s.addColumn("users", c.name, c.ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateItemSourceTypes adds the column the UI badges read and fills it for
+// libraries that already have rows. A rescan would fill it too, but a badge
+// disappearing until the next scan is not a good first impression, and the
+// backfill is three UPDATEs per library.
+func (s *Store) migrateItemSourceTypes() error {
+	has, err := s.hasColumn("items", "source_type")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	if _, err := s.DB.Exec(`ALTER TABLE items ADD COLUMN source_type TEXT NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("items.source_type: %w", err)
+	}
+	rows, err := s.DB.Query(`SELECT id FROM libraries`)
+	if err != nil {
+		return err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := s.RefreshItemSourceTypes(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RefreshItemSourceTypes recomputes items.source_type for one library.
+//
+// The value is the source *type* every file of the item comes from — an
+// episode's own files, a season's episodes' files, a show's season episodes'
+// files. An item whose files span two kinds of source gets the empty string:
+// there is no single badge that is true for it, and the UI shows none.
+//
+// It runs after every organize pass, so a rescan after moving a show to the
+// bilibili source picks the badge up (and dropping the source drops it), and it
+// is also what the one-time migration calls for libraries that predate the
+// column.
+func (s *Store) RefreshItemSourceTypes(libraryID int64) error {
+	stmts := []string{
+		// Episodes and films hold the files themselves.
+		`UPDATE items SET source_type = COALESCE((
+			SELECT MIN(src.type) FROM files f JOIN sources src ON src.id = f.source_id
+			WHERE f.item_id = items.id
+			HAVING COUNT(DISTINCT src.type) = 1
+		), '') WHERE library_id = ? AND type IN ('movie','episode')`,
+		// A season's files are its episodes'.
+		`UPDATE items SET source_type = COALESCE((
+			SELECT MIN(src.type) FROM items e
+			JOIN files f ON f.item_id = e.id JOIN sources src ON src.id = f.source_id
+			WHERE e.parent_id = items.id
+			HAVING COUNT(DISTINCT src.type) = 1
+		), '') WHERE library_id = ? AND type = 'season'`,
+		// A show's files are its seasons' episodes'.
+		`UPDATE items SET source_type = COALESCE((
+			SELECT MIN(src.type) FROM items se
+			JOIN items e ON e.parent_id = se.id
+			JOIN files f ON f.item_id = e.id JOIN sources src ON src.id = f.source_id
+			WHERE se.parent_id = items.id
+			HAVING COUNT(DISTINCT src.type) = 1
+		), '') WHERE library_id = ? AND type = 'show'`,
+	}
+	for _, stmt := range stmts {
+		if _, err := s.DB.Exec(stmt, libraryID); err != nil {
 			return err
 		}
 	}
@@ -802,10 +890,10 @@ func (s *Store) Libraries() ([]models.Library, error) {
 
 func (s *Store) InsertItem(it *models.Item) error {
 	res, err := s.execRetryResult(`INSERT INTO items
-		(library_id, type, parent_id, name, original_title, year, tmdb_id, bgm_id, overview, poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		(library_id, type, parent_id, name, original_title, year, tmdb_id, bgm_id, overview, poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, source_type, added_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		it.LibraryID, it.Type, it.ParentID, it.Name, it.OriginalTitle, it.Year, it.TMDBID, it.BGMID, it.Overview,
-		it.PosterPath, it.BackdropPath, it.StillPath, it.Rating, it.Genres, it.Season, it.Episode, it.AirDate, time.Now())
+		it.PosterPath, it.BackdropPath, it.StillPath, it.Rating, it.Genres, it.Season, it.Episode, it.AirDate, it.SourceType, time.Now())
 	if err != nil {
 		return err
 	}
@@ -826,14 +914,18 @@ func (s *Store) DeleteItem(id int64) error {
 	return err
 }
 
+// itemCols is the column list every item query scans, in the order scanItems
+// reads it. Adding an item field means this line, scanItems and any per-row
+// reader (ItemByID) — not five nearly identical SELECTs.
+const itemCols = `id, library_id, type, parent_id, name, original_title, year, tmdb_id, bgm_id, overview,
+	poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, source_type, added_at`
+
 func (s *Store) ItemByID(id int64) (*models.Item, error) {
 	it := &models.Item{}
-	err := s.DB.QueryRow(`SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, bgm_id, overview,
-		poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at
-		FROM items WHERE id=?`, id).
+	err := s.DB.QueryRow(`SELECT `+itemCols+` FROM items WHERE id=?`, id).
 		Scan(&it.ID, &it.LibraryID, &it.Type, &it.ParentID, &it.Name, &it.OriginalTitle, &it.Year, &it.TMDBID, &it.BGMID,
 			&it.Overview, &it.PosterPath, &it.BackdropPath, &it.StillPath, &it.Rating, &it.Genres,
-			&it.Season, &it.Episode, &it.AirDate, &it.AddedAt)
+			&it.Season, &it.Episode, &it.AirDate, &it.SourceType, &it.AddedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -842,9 +934,7 @@ func (s *Store) ItemByID(id int64) (*models.Item, error) {
 
 // ItemChildren returns child items ordered by season/episode or name.
 func (s *Store) ItemChildren(parentID int64) ([]models.Item, error) {
-	rows, err := s.DB.Query(`SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, bgm_id, overview,
-		poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at
-		FROM items WHERE parent_id=? ORDER BY season, episode, name`, parentID)
+	rows, err := s.DB.Query(`SELECT `+itemCols+` FROM items WHERE parent_id=? ORDER BY season, episode, name`, parentID)
 	if err != nil {
 		return nil, err
 	}
@@ -885,9 +975,7 @@ func (s *Store) ItemsByLibrary(libraryID int64, typ string, search string, sort 
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM items WHERE `+w, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	q := `SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, bgm_id, overview,
-		poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at
-		FROM items WHERE ` + w + ` ORDER BY ` + orderBy + ` LIMIT ? OFFSET ?`
+	q := `SELECT ` + itemCols + ` FROM items WHERE ` + w + ` ORDER BY ` + orderBy + ` LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
 	items, err := s.queryItems(q, args...)
 	if err != nil {
@@ -898,8 +986,7 @@ func (s *Store) ItemsByLibrary(libraryID int64, typ string, search string, sort 
 
 func (s *Store) RecentItems(typ string, limit int) ([]models.Item, error) {
 	// exclude the hidden file-browser scratchpad libraries from home rows
-	rows, err := s.DB.Query(`SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, bgm_id, overview,
-		poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at
+	rows, err := s.DB.Query(`SELECT `+itemCols+`
 		FROM items WHERE type=? AND library_id NOT IN (SELECT id FROM libraries WHERE name LIKE '__browse__%')
 		ORDER BY added_at DESC LIMIT ?`, typ, limit)
 	if err != nil {
@@ -920,8 +1007,7 @@ func (s *Store) CountItems(typ string) (int64, error) {
 // ItemsNeedingIdent returns items of given types without tmdb id and without custom names,
 // used by the metadata enricher.
 func (s *Store) ItemsNeedingIdent(types []string) ([]models.Item, error) {
-	q := `SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, bgm_id, overview,
-		poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at
+	q := `SELECT ` + itemCols + `
 		FROM items WHERE tmdb_id = 0 AND bgm_id = 0 AND overview = '' AND type IN (` + placeholders(len(types)) + `)`
 	args := make([]any, 0, len(types))
 	for _, t := range types {
@@ -945,7 +1031,7 @@ func scanItems(rows *sql.Rows) ([]models.Item, error) {
 		var it models.Item
 		if err := rows.Scan(&it.ID, &it.LibraryID, &it.Type, &it.ParentID, &it.Name, &it.OriginalTitle, &it.Year,
 			&it.TMDBID, &it.BGMID, &it.Overview, &it.PosterPath, &it.BackdropPath, &it.StillPath, &it.Rating, &it.Genres,
-			&it.Season, &it.Episode, &it.AirDate, &it.AddedAt); err != nil {
+			&it.Season, &it.Episode, &it.AirDate, &it.SourceType, &it.AddedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, it)

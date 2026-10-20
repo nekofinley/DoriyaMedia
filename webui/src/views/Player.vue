@@ -3,6 +3,7 @@ import { ref, onMounted, onBeforeUnmount, computed, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, detectClient, fmtTime, fmtSize, imgUrl, parseGenres } from '../api.js'
 import AppIcon from '../components/AppIcon.vue'
+import BiliBadge from '../components/BiliBadge.vue'
 import SmartImage from '../components/SmartImage.vue'
 import ToastHost from '../components/ToastHost.vue'
 import { toast } from '../toast.js'
@@ -2403,6 +2404,7 @@ onBeforeUnmount(() => {
             <span class="ws-thumb">
               <SmartImage v-if="ep.still_path" :src="imgUrl(ep.id, 'still')" :alt="epName(ep, i)" :seed="epName(ep, i)" />
               <span v-else class="ws-ph num">{{ epNo(ep, i) }}</span>
+              <BiliBadge v-if="ep.source_type === 'bilibili'" mini />
             </span>
             <span class="ws-copy">
               <span class="ws-name truncate">{{ epName(ep, i) }}</span>

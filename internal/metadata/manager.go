@@ -766,17 +766,87 @@ func findImage(names map[string]source.Entry, candidates []string) string {
 
 // ---------- tmdb ----------
 
-func (m *Manager) tryMovieTMDB(ctx context.Context, it *models.Item, query string, year int) bool {
+// searchTMDB asks for a title in every spelling the providers index. A 港澳台
+// source names its shows in Traditional Chinese; TMDB's zh-CN titles are
+// Simplified, and a search for the Traditional spelling can return nothing at
+// all. The original spelling is tried first, then the Simplified one; a hit
+// that resembles the title wins, otherwise the first answer of the first
+// non-empty search is kept (the behaviour before this existed).
+func (m *Manager) searchTMDB(ctx context.Context, kind, query string, year int) int {
 	t := m.tmdb()
 	if !t.Enabled() || strings.TrimSpace(query) == "" {
+		return 0
+	}
+	fallback := 0
+	for _, spelling := range searchSpellings(query) {
+		throttle()
+		var results []TMDBSearchItem
+		var err error
+		if kind == "movie" {
+			results, err = t.SearchMovie(ctx, spelling, year)
+		} else {
+			results, err = t.SearchTV(ctx, spelling, year)
+		}
+		if err != nil || len(results) == 0 {
+			continue
+		}
+		best, score := pickTMDB(results, query, year)
+		if fallback == 0 {
+			fallback = results[0].ID
+		}
+		if score >= 60 {
+			return results[best].ID
+		}
+	}
+	return fallback
+}
+
+// pickTMDB returns the index and score of the result that best matches the
+// title. Only names and the year are used: taking results[0] blindly is what
+// turns a Traditional title with no exact hit into a random show.
+func pickTMDB(results []TMDBSearchItem, query string, year int) (int, int) {
+	nq := normTitle(query)
+	best, bestScore := 0, 0
+	for i, r := range results {
+		score := 10
+		for _, name := range []string{r.Title, r.Name, r.OriginalTitle, r.OriginalName} {
+			nn := normTitle(name)
+			if nn == "" {
+				continue
+			}
+			switch {
+			case nn == nq:
+				if score < 100 {
+					score = 100
+				}
+			case nearMatch(nn, nq), titleClose(nn, nq):
+				if score < 60 {
+					score = 60
+				}
+			}
+		}
+		if year > 0 {
+			date := r.ReleaseDate
+			if date == "" {
+				date = r.FirstAirDate
+			}
+			if len(date) >= 4 && atoi(date[:4]) == year {
+				score += 30
+			}
+		}
+		if score > bestScore {
+			best, bestScore = i, score
+		}
+	}
+	return best, bestScore
+}
+
+func (m *Manager) tryMovieTMDB(ctx context.Context, it *models.Item, query string, year int) bool {
+	id := m.searchTMDB(ctx, "movie", query, year)
+	if id == 0 {
 		return false
 	}
-	throttle()
-	results, err := t.SearchMovie(ctx, query, year)
-	if err != nil || len(results) == 0 {
-		return false
-	}
-	return m.tryMovieTMDBByID(ctx, it, results[0].ID) == nil
+	return m.tryMovieTMDBByID(ctx, it, id) == nil
 }
 
 func (m *Manager) tryMovieTMDBByID(ctx context.Context, it *models.Item, id int) error {
@@ -807,16 +877,11 @@ func (m *Manager) tryMovieTMDBByID(ctx context.Context, it *models.Item, id int)
 }
 
 func (m *Manager) tryShowTMDB(ctx context.Context, show *models.Item, query string, year int) bool {
-	t := m.tmdb()
-	if !t.Enabled() || strings.TrimSpace(query) == "" {
+	id := m.searchTMDB(ctx, "tv", query, year)
+	if id == 0 {
 		return false
 	}
-	throttle()
-	results, err := t.SearchTV(ctx, query, year)
-	if err != nil || len(results) == 0 {
-		return false
-	}
-	return m.tryShowTMDBByID(ctx, show, results[0].ID) == nil
+	return m.tryShowTMDBByID(ctx, show, id) == nil
 }
 
 func (m *Manager) tryShowTMDBByID(ctx context.Context, show *models.Item, id int) error {
@@ -882,30 +947,47 @@ func (m *Manager) searchBGM(ctx context.Context, query string, year int) (*BgmSu
 	if !b.Enabled() {
 		return nil, nil
 	}
-	throttle()
-	results, err := b.Search(ctx, q, BgmTypeAnime)
-	if err != nil {
-		return nil, err
-	}
-	if sub := m.bgmSubjectFor(ctx, b, q, year, results); sub != nil {
-		m.logApproxBGM(q, sub)
-		return sub, nil
+	// A 港澳台 source states its titles in Traditional Chinese, while the
+	// providers index the Simplified spelling. Both spellings are searched, the
+	// original first; every hit is still scored against the original name
+	// (normTitle folds the two forms together), so a variant search cannot
+	// select an unrelated subject.
+	var variantBases []string
+	for _, spelling := range searchSpellings(q) {
+		throttle()
+		results, err := b.Search(ctx, spelling, BgmTypeAnime)
+		if err != nil {
+			return nil, err
+		}
+		if sub := m.bgmSubjectFor(ctx, b, q, year, results); sub != nil {
+			m.logApproxBGM(q, sub)
+			return sub, nil
+		}
+		if len(results) > 0 {
+			variantBases = append(variantBases, spelling)
+		}
 	}
 	// A title the engine did not understand well enough to return anything is
 	// not going to be found by deleting a character either; the retries are for
 	// the common case where wrong hits came back instead of the right one.
-	if len(results) == 0 {
-		return nil, nil
-	}
-	for _, variant := range bgmQueryVariants(q) {
-		throttle()
-		hits, err := b.Search(ctx, variant, BgmTypeAnime)
-		if err != nil {
-			return nil, err
-		}
-		if sub := m.bgmSubjectFor(ctx, b, q, year, hits); sub != nil {
-			m.logApproxBGM(q, sub)
-			return sub, nil
+	// bgmQueryVariants normalizes first, so the Traditional and Simplified bases
+	// can produce the same variants; each spelling is asked for once.
+	tried := map[string]bool{}
+	for _, base := range variantBases {
+		for _, variant := range bgmQueryVariants(base) {
+			if tried[variant] {
+				continue
+			}
+			tried[variant] = true
+			throttle()
+			hits, err := b.Search(ctx, variant, BgmTypeAnime)
+			if err != nil {
+				return nil, err
+			}
+			if sub := m.bgmSubjectFor(ctx, b, q, year, hits); sub != nil {
+				m.logApproxBGM(q, sub)
+				return sub, nil
+			}
 		}
 	}
 	return nil, nil
@@ -1145,10 +1227,10 @@ func (m *Manager) saveBGMImage(ctx context.Context, itemID int64, kind, rawURL s
 	return m.writeImage(itemID, kind, 0, u, data)
 }
 
-// normTitle lowercases and strips punctuation/spaces so "孤独摇滚！" and
-// "孤独摇滚" compare equal.
+// normTitle lowercases, folds Traditional to Simplified and strips
+// punctuation/spaces so "孤独摇滚！", "孤獨搖滾！" and "孤独摇滚" compare equal.
 func normTitle(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ToLower(strings.TrimSpace(toSimplified(s)))
 	var b strings.Builder
 	for _, r := range s {
 		switch r {

@@ -2,6 +2,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { api, imgUrl, artUrl, fmtRemaining, episodeLabel } from '../api.js'
 import AppIcon from '../components/AppIcon.vue'
+import BiliBadge from '../components/BiliBadge.vue'
 import PosterCard from '../components/PosterCard.vue'
 import MediaRail from '../components/MediaRail.vue'
 import HeroBillboard from '../components/HeroBillboard.vue'
@@ -120,6 +121,7 @@ function libPath(lib) {
             >
               <div class="still">
                 <SmartImage :src="artUrl(c.item)" :alt="c.item.name" :seed="c.item.name" />
+                <BiliBadge v-if="c.item.source_type === 'bilibili'" mini />
               </div>
               <span class="quick"><AppIcon name="play" :size="19" filled /></span>
               <div class="body">

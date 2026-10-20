@@ -1,6 +1,7 @@
 <script setup>
 import { computed } from 'vue'
 import AppIcon from './AppIcon.vue'
+import BiliBadge from './BiliBadge.vue'
 import SmartImage from './SmartImage.vue'
 import { imgUrl, artIf } from '../api.js'
 
@@ -29,6 +30,7 @@ const pct = computed(() => Math.max(0, Math.min(100, props.progress || 0)))
   <div class="poster">
     <router-link :to="target" class="art" :aria-label="item.name">
       <SmartImage :src="poster" :alt="item.name" :seed="item.name" :eager="eager" />
+      <BiliBadge v-if="item.source_type === 'bilibili'" />
       <span v-if="rank" class="rank">{{ rank }}</span>
       <span v-if="badge" class="corner-badge">{{ badge }}</span>
       <div class="overlay">

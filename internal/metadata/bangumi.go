@@ -215,7 +215,11 @@ func (c *BangumiClient) Search(ctx context.Context, keyword string, typ int) ([]
 	if err != nil {
 		return nil, err
 	}
-	return nil, lerr
+	// v0 answered successfully (possibly with no hits). A failing legacy
+	// fallback is not the answer to this search: the engine did answer, it just
+	// had nothing for this spelling — and returning the fallback's 404 here is
+	// what stopped a caller from trying another spelling at all.
+	return nil, nil
 }
 
 func (c *BangumiClient) searchLegacy(ctx context.Context, keyword string, typ int) ([]BgmSubject, error) {

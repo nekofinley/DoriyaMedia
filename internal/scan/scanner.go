@@ -499,11 +499,24 @@ func (sc *Scanner) organize(lib *models.Library, files []fileRec, prog *models.S
 	switch lib.Type {
 	case "series":
 		err := sc.organizeSeries(lib, files, prog, current, walked, partial, listings)
-		return err
+		return sc.finishOrganize(lib, err)
 	default:
 		err := sc.organizeMovies(lib, files, prog, current, walked, partial, listings)
-		return err
+		return sc.finishOrganize(lib, err)
 	}
+}
+
+// finishOrganize closes an organize pass by recomputing the source type each
+// item is marked with. The scan knows the type of every file it stored, but a
+// show or season only learns that all of its episodes come from one kind of
+// source after they are all in — this is the one place that sees that.
+func (sc *Scanner) finishOrganize(lib *models.Library, err error) error {
+	if err == nil {
+		if terr := sc.Store.RefreshItemSourceTypes(lib.ID); terr != nil {
+			log.Printf("organize: refresh item source types for library %d failed: %v", lib.ID, terr)
+		}
+	}
+	return err
 }
 
 func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked, partial map[int64]bool, listings map[string][]source.Entry) error {
@@ -556,7 +569,11 @@ func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *mo
 		}
 		itemID, ok := byKey[key]
 		if !ok {
-			it := &models.Item{LibraryID: lib.ID, Type: "movie", Name: g.Title, Year: g.Year}
+			st := ""
+			if len(g.Files) > 0 {
+				st = g.Files[0].SrcType
+			}
+			it := &models.Item{LibraryID: lib.ID, Type: "movie", Name: g.Title, Year: g.Year, SourceType: st}
 			if err := sc.Store.InsertItem(it); err != nil {
 				return err
 			}
@@ -891,7 +908,7 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 			showID, ok = idx.shows[showKey]
 		}
 		if !ok {
-			it := &models.Item{LibraryID: lib.ID, Type: "show", Name: showTitle}
+			it := &models.Item{LibraryID: lib.ID, Type: "show", Name: showTitle, SourceType: fr.SrcType}
 			if err := sc.Store.InsertItem(it); err != nil {
 				log.Printf("organize: insert show %q failed: %v", showTitle, err)
 				return err
@@ -963,7 +980,7 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 				season = idx.nextSeason(showID)
 			}
 			pid := showID
-			it := &models.Item{LibraryID: lib.ID, Type: "season", ParentID: &pid, Name: seasonName, Season: season}
+			it := &models.Item{LibraryID: lib.ID, Type: "season", ParentID: &pid, Name: seasonName, Season: season, SourceType: fr.SrcType}
 			if err := sc.Store.InsertItem(it); err != nil {
 				return err
 			}
@@ -998,7 +1015,7 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 		if !ok {
 			pid := seasonID
 			it := &models.Item{LibraryID: lib.ID, Type: "episode", ParentID: &pid,
-				Name: orDefault(epName, fmt.Sprintf("第 %d 集", ep)), Season: season, Episode: ep}
+				Name: orDefault(epName, fmt.Sprintf("第 %d 集", ep)), Season: season, Episode: ep, SourceType: fr.SrcType}
 			if err := sc.Store.InsertItem(it); err != nil {
 				return err
 			}
