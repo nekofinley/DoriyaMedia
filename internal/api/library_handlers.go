@@ -47,6 +47,11 @@ func maskSourceConfig(cfg models.SourceConfig) models.SourceConfig {
 	if cfg.BiliCookie != "" {
 		cfg.BiliCookie = maskedSecret
 	}
+	// The refresh token mints cookies, so it is the same credential as the cookie
+	// and gets the same treatment.
+	if cfg.BiliRefreshToken != "" {
+		cfg.BiliRefreshToken = maskedSecret
+	}
 	// A proxy string carries a password, and for Shadowsocks the password *is*
 	// the key: masking it is the same rule as the cookie.
 	if cfg.BiliProxy != "" {
@@ -129,6 +134,13 @@ func (s *Server) handleUpdateSource(w http.ResponseWriter, r *http.Request, user
 	if cfg.BiliCookie == maskedSecret {
 		cfg.BiliCookie = old.BiliCookie
 	}
+	// A scan-to-login stores a refresh token; the edit form knows nothing about
+	// it, so it has to survive a save that only changes the codec — otherwise
+	// every settings edit would silently turn a renewable session back into a
+	// pasted cookie that expires.
+	if cfg.BiliRefreshToken == "" || cfg.BiliRefreshToken == maskedSecret {
+		cfg.BiliRefreshToken = old.BiliRefreshToken
+	}
 	if cfg.BiliProxy == maskedSecret {
 		cfg.BiliProxy = old.BiliProxy
 	}
@@ -180,7 +192,7 @@ func (s *Server) handleTestSource(w http.ResponseWriter, r *http.Request, user *
 			return
 		}
 	case "bilibili":
-		drv, err = source.NewBilibili(req.Config.BiliCookie, req.Config.BiliQuality, req.Config.BiliCodec, req.Config.BiliProxy, req.Config.BiliPlayableOnly)
+		drv, err = source.NewBilibili(req.Config.BiliCookie, req.Config.BiliCodec, req.Config.BiliProxy, req.Config.BiliPlayableOnly)
 		if err != nil {
 			fail(w, 400, err.Error())
 			return

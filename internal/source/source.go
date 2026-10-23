@@ -78,6 +78,66 @@ type MultiPart interface {
 	Parts(ctx context.Context, path string) ([]Part, error)
 }
 
+// Quality is one picture rung a source can serve during playback: an id the
+// source uses for it, a name, and the picture size it decodes to.
+//
+// bilibili is the reason this exists. A 番剧's playurl answer carries a ladder
+// (360P / 480P / 720P / 1080P / 1080P+ / 4K …), the account decides how much of
+// it is playable, and the viewer may want to change rung in the middle of an
+// episode — to save bandwidth, or to stop a slow line from stalling.
+type Quality struct {
+	ID     int    `json:"id"`
+	Label  string `json:"label"` // full name, e.g. "1080P 高码率"
+	Short  string `json:"short"` // compact name for the control bar, e.g. "1080P+"
+	Width  int    `json:"width,omitempty"`
+	Height int    `json:"height,omitempty"`
+}
+
+// QualityDriver is an optional Driver capability: the same file can be served
+// at several picture qualities, and the viewer can pick one while it plays.
+//
+// The preference is per driver instance, and the API builds one per request, so
+// a selection never leaks into another viewer's playback. Zero means automatic
+// (the best rung the account is entitled to). SelectedQuality is what the last
+// resolution actually chose, which is not always the preference: a rung can be
+// absent from an episode's ladder, and the source then falls back.
+type QualityDriver interface {
+	// SetQuality selects a rung for the calls that follow; 0 means automatic.
+	SetQuality(qn int)
+	// Quality reports the preference (0 = automatic).
+	Quality() int
+	// SelectedQuality reports the rung the last resolved stream used.
+	SelectedQuality() int
+	// Qualities lists the rungs this file can be played at, best first.
+	Qualities(ctx context.Context, path string) ([]Quality, error)
+}
+
+// SetQuality applies a quality preference to a driver that offers a choice.
+// Drivers without the capability ignore it, which is what every other source's
+// single-quality stream means.
+func SetQuality(drv Driver, qn int) {
+	if qd, ok := drv.(QualityDriver); ok {
+		qd.SetQuality(qn)
+	}
+}
+
+// QualityOf is the quality preference set on a driver, or 0 when it has none.
+func QualityOf(drv Driver) int {
+	if qd, ok := drv.(QualityDriver); ok {
+		return qd.Quality()
+	}
+	return 0
+}
+
+// SelectedQualityOf is the rung a driver last resolved, or 0 when it has no
+// quality ladder or nothing has been resolved yet.
+func SelectedQualityOf(drv Driver) int {
+	if qd, ok := drv.(QualityDriver); ok {
+		return qd.SelectedQuality()
+	}
+	return 0
+}
+
 // Comment is one bullet comment (弹幕) published against a file.
 type Comment struct {
 	Time  float64 `json:"t"`     // seconds into the file
@@ -150,7 +210,7 @@ func NewDriver(src *models.Source) (Driver, error) {
 	case "openlist":
 		return NewOpenList(cfg.BaseURL, cfg.Token)
 	case "bilibili":
-		return NewBilibili(cfg.BiliCookie, cfg.BiliQuality, cfg.BiliCodec, cfg.BiliProxy, cfg.BiliPlayableOnly)
+		return NewBilibili(cfg.BiliCookie, cfg.BiliCodec, cfg.BiliProxy, cfg.BiliPlayableOnly)
 	case "url":
 		return &URLDriver{}, nil
 	default:

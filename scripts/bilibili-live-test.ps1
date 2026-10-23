@@ -1,4 +1,4 @@
-﻿# Live end-to-end check for the bilibili (番剧 / PGC) source.
+# Live end-to-end check for the bilibili (番剧 / PGC) source.
 #
 #   pwsh scripts/bilibili-live-test.ps1                       # anonymous, free episodes
 #   pwsh scripts/bilibili-live-test.ps1 -Cookie "SESSDATA=…"  # with an account
@@ -136,7 +136,7 @@ try {
 
   $src = PostJson "$base/api/sources" @{
     name = "B站番剧"; type = "bilibili"
-    config = @{ bili_cookie = $Cookie; bili_quality = 0; bili_codec = "avc" }
+    config = @{ bili_cookie = $Cookie; bili_codec = "avc" }
   } $sess
   Check "添加 bilibili 源" ($src.id -gt 0) "id=$($src.id) type=$($src.type)"
   $sid = $src.id
@@ -178,6 +178,22 @@ try {
   Check "编解码已由源说明" ($play.video_codec -eq "h264" -and $play.audio_codec -eq "aac") `
     "$($play.video_codec)/$($play.audio_codec) $($play.resolution)"
   Check "给了弹幕地址" ([bool]$play.danmaku_url) $play.danmaku_url
+
+  # 清晰度不再是存储源上的一个固定设置:决策里带着这集的整副梯子,以及这次真正
+  # 选中的那一档。没有账号时梯子可能只有 360P 一档,那也算对。
+  $rungs = @($play.qualities)
+  Check "决策给了清晰度列表" ($rungs.Count -ge 1) `
+    (($rungs | ForEach-Object { "$($_.label)($($_.id))" }) -join ", ")
+  Check "当前清晰度在列表里" ([bool](@($rungs | Where-Object { $_.id -eq $play.quality }).Count)) `
+    "quality=$($play.quality)"
+  if ($rungs.Count -gt 1) {
+    # 挑最低一档,再问一次决策:服务器应当把它当成播放期间的一次换档,并且把 rung
+    # 钉进 HLS 地址,好让后续分片请求还是这一档。
+    $alt = $rungs[$rungs.Count - 1]
+    $sw = Invoke-RestMethod -Uri ($playUrl + "&q=$($alt.id)") -WebSession $sess
+    Check "可以在播放期间换清晰度" ($sw.quality -eq $alt.id) "quality=$($sw.quality) want=$($alt.id)"
+    Check "换档后的播放地址带 rung" ($sw.url -match "q=$($alt.id)") $sw.url
+  }
 
   # ---- HLS ----
   # Written to a file and read back: Windows PowerShell hands back a byte array

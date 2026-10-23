@@ -33,19 +33,27 @@ type partsEntry struct {
 // returns outlive it by a wide margin.
 const partsTTL = resolveTTL
 
+// partsForKey identifies one resolution of a file's streams. The quality is part
+// of it: a bilibili source resolves a different rung (and different URLs) for
+// each selection, and handing a cached 1080P parts set to a request that asked
+// for 360P would make the menu a no-op — the picture would never change.
+func partsForKey(file *models.MediaFile, drv source.Driver) string {
+	return fmt.Sprintf("%s|q%d", resolveKey(file), source.QualityOf(drv))
+}
+
 // PartsFor returns the upstream streams of a file, or nil when the file is an
 // ordinary single-target one.
 //
-// Resolution is cached per file and serialised, mirroring resolveTarget.
-// `rejected` is the link the caller just saw the source refuse: the cached set
-// is then dropped and a fresh one resolved, unless somebody already did that
-// while the caller waited for the lock.
+// Resolution is cached per file and quality, and serialised per file, mirroring
+// resolveTarget. `rejected` is the link the caller just saw the source refuse:
+// the cached set is then dropped and a fresh one resolved, unless somebody
+// already did that while the caller waited for the lock.
 func (e *Engine) PartsFor(ctx context.Context, file *models.MediaFile, drv source.Driver, rejected string) ([]source.Part, error) {
 	mp, ok := drv.(source.MultiPart)
 	if !ok {
 		return nil, nil
 	}
-	key := resolveKey(file)
+	key := partsForKey(file, drv)
 	mu := e.resolveLock(key)
 	mu.Lock()
 	defer mu.Unlock()

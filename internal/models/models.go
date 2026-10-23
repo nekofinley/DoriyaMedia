@@ -75,9 +75,19 @@ type SourceConfig struct {
 	Token   string `json:"token,omitempty"`
 	// bilibili (番剧 / PGC). The cookie is a full account credential — the API
 	// masks it for anyone who is not an administrator.
-	BiliCookie  string `json:"bili_cookie,omitempty"`
-	BiliQuality int    `json:"bili_quality,omitempty"` // preferred qn; 0 = best the account has
-	BiliCodec   string `json:"bili_codec,omitempty"`   // avc | hevc | av01 | auto
+	BiliCookie string `json:"bili_cookie,omitempty"`
+	// BiliRefreshToken is what keeps a scanned login alive. A QR login hands out
+	// a refresh_token beside the cookie; calling the refresh endpoint with it
+	// rotates both, and a session that keeps doing that never expires. A pasted
+	// browser cookie has no such token — which is exactly why it dies at the
+	// browser's next rotation, however far off the expiry it carries.
+	//
+	// It is a credential in its own right (it can mint cookies), so it is masked
+	// for anyone who is not an administrator, on the same rule as the cookie.
+	BiliRefreshToken string `json:"bili_refresh_token,omitempty"`
+	// There is deliberately no quality field: the picture's rung is chosen while
+	// the episode plays (the player's 清晰度 menu), not fixed for a whole library.
+	BiliCodec string `json:"bili_codec,omitempty"` // avc | hevc | av01 | auto
 	// BiliProxy routes this source's traffic — the API calls, the CDN streams
 	// and the ffmpeg that muxes them — through a proxy of its own. bilibili
 	// answers -10403 (该内容在当前地区不可观看) for a request from outside the

@@ -261,6 +261,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/sources/test", s.requireAdmin(s.handleTestSource))
 	mux.HandleFunc("POST /api/sources/test-proxy", s.requireAdmin(s.handleTestProxy))
 
+	// bilibili account: who the cookie belongs to, and how to get one without a
+	// browser. A pasted cookie dies when the browser rotates it, and the failure
+	// is silent (480P, "needs a membership") — these routes make it visible and
+	// fixable. See bili_account_handlers.go.
+	mux.HandleFunc("GET /api/sources/{id}/bili-account", s.requireAdmin(s.handleBiliAccount))
+	mux.HandleFunc("POST /api/sources/{id}/bili-qr", s.requireAdmin(s.handleBiliQR))
+	mux.HandleFunc("POST /api/sources/{id}/bili-qr/poll", s.requireAdmin(s.handleBiliQRPoll))
+	mux.HandleFunc("POST /api/sources/{id}/bili-refresh", s.requireAdmin(s.handleBiliRefresh))
+
 	// libraries
 	mux.HandleFunc("GET /api/libraries", s.requireAuth(s.handleListLibraries))
 	mux.HandleFunc("POST /api/libraries", s.requireAdmin(s.handleCreateLibrary))

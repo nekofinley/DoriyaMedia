@@ -178,7 +178,7 @@ func TestSessionLifecycle(t *testing.T) {
 	e2 := newTestEngine(t, nil)
 	e2.Cfg.DataDir = e.Cfg.DataDir
 	e2.LoadCache()
-	adopted := e2.SessionForStream(42, "remux", 0, 0, 1080)
+	adopted := e2.SessionForStream(42, "remux", 0, 0, 1080, "")
 	if adopted == nil {
 		t.Fatal("LoadCache did not adopt the completed session from disk")
 	}
@@ -309,7 +309,7 @@ func TestLoadCacheAdoptsCompleteAndDropsPartial(t *testing.T) {
 
 	e.LoadCache()
 
-	if s := e.SessionForSegment(7, "remux", 0, 0, 1080, 12, SessionSeekAhead); s == nil {
+	if s := e.SessionForSegment(7, "remux", 0, 0, 1080, "", 12, SessionSeekAhead); s == nil {
 		t.Error("a completed session on disk must be adopted")
 	} else if !s.Complete() || s.StartSegment() != 12 {
 		t.Errorf("adopted session has wrong state: complete=%v start=%d", s.Complete(), s.StartSegment())
@@ -478,33 +478,33 @@ func TestSessionSelectionForSegment(t *testing.T) {
 	_ = other
 
 	// Inside a session's window: the latest session that had already begun wins.
-	if got := e.SessionForSegment(7, "remux", 0, 0, 1080, 15, SessionSeekAhead); got != late {
+	if got := e.SessionForSegment(7, "remux", 0, 0, 1080, "", 15, SessionSeekAhead); got != late {
 		t.Errorf("segment 15 should be served by the session that started at 10")
 	}
-	if got := e.SessionForSegment(7, "remux", 0, 0, 1080, 5, SessionSeekAhead); got != early {
+	if got := e.SessionForSegment(7, "remux", 0, 0, 1080, "", 5, SessionSeekAhead); got != early {
 		t.Errorf("segment 5 predates the late session, so the early one must serve it")
 	}
 	// A seek far past what is packaged cannot be served by waiting.
-	if got := e.SessionForSegment(7, "remux", 0, 0, 1080, 500, SessionSeekAhead); got != nil {
+	if got := e.SessionForSegment(7, "remux", 0, 0, 1080, "", 500, SessionSeekAhead); got != nil {
 		t.Errorf("a request far ahead must not attach to a session that cannot reach it")
 	}
 	// Nor can a position before every session's start.
 	e2 := newTestEngine(t, nil)
 	e2.Cfg.DataDir = t.TempDir()
 	fakeSession(t, e2, 7, 10, 20)
-	if got := e2.SessionForSegment(7, "remux", 0, 0, 1080, 3, SessionSeekAhead); got != nil {
+	if got := e2.SessionForSegment(7, "remux", 0, 0, 1080, "", 3, SessionSeekAhead); got != nil {
 		t.Errorf("a request before a session's start must not attach to it")
 	}
 	// Buffering (just past production) must NOT look like a seek, or a slow
 	// transcode would restart the packager on every request.
-	if got := e.SessionForSegment(7, "remux", 0, 0, 1080, 25, SessionSeekAhead); got != late {
+	if got := e.SessionForSegment(7, "remux", 0, 0, 1080, "", 25, SessionSeekAhead); got != late {
 		t.Errorf("a request just past production must keep waiting on the live session")
 	}
 	// Sessions of another file or mode are never borrowed.
-	if got := e.SessionForSegment(7, "transcode", 0, 0, 1080, 15, SessionSeekAhead); got != nil {
+	if got := e.SessionForSegment(7, "transcode", 0, 0, 1080, "", 15, SessionSeekAhead); got != nil {
 		t.Errorf("another mode's session must not be reused")
 	}
-	if got := e.SessionForSegment(9, "remux", 0, 0, 1080, 15, SessionSeekAhead); got != nil {
+	if got := e.SessionForSegment(9, "remux", 0, 0, 1080, "", 15, SessionSeekAhead); got != nil {
 		t.Errorf("another file's session must not be reused")
 	}
 }
@@ -518,16 +518,16 @@ func TestSessionForStreamFollowsLatestUse(t *testing.T) {
 	first := fakeSession(t, e, 7, 0, 5)
 	second := fakeSession(t, e, 7, 40, 45)
 	first.lastUsed = time.Now().Add(-time.Minute)
-	if got := e.SessionForStream(7, "remux", 0, 0, 1080); got != second {
+	if got := e.SessionForStream(7, "remux", 0, 0, 1080, ""); got != second {
 		t.Fatal("the most recently used session must answer the playlist")
 	}
-	if got := e.SessionForStream(7, "transcode", 0, 0, 1080); got != nil {
+	if got := e.SessionForStream(7, "transcode", 0, 0, 1080, ""); got != nil {
 		t.Fatal("another mode has no session")
 	}
 
 	// Closing the abandoned ones leaves exactly the live session.
-	e.CloseStreamSessions(7, "remux", 0, 0, 1080, second)
-	if got := e.SessionForStream(7, "remux", 0, 0, 1080); got != second {
+	e.CloseStreamSessions(7, "remux", 0, 0, 1080, "", second)
+	if got := e.SessionForStream(7, "remux", 0, 0, 1080, ""); got != second {
 		t.Fatal("the kept session must survive")
 	}
 	e.sessMu.Lock()
@@ -535,6 +535,77 @@ func TestSessionForStreamFollowsLatestUse(t *testing.T) {
 	e.sessMu.Unlock()
 	if n != 1 {
 		t.Fatalf("expected only the kept session to remain, got %d", n)
+	}
+}
+
+// Two rungs of one bilibili episode are two pictures, not two encodings of the
+// same one. Their sessions must never answer for each other: a segment request
+// pinned to 360P that is served by the 1080P packaging job would show the wrong
+// picture and its timestamps would belong to a different stream.
+func TestSessionsAreKeptApartByQualityVariant(t *testing.T) {
+	e := newTestEngine(t, nil)
+	e.Cfg.DataDir = t.TempDir()
+
+	const (
+		v1080 = "h2641920x1080-q112"
+		v360  = "h264640x360-q16"
+	)
+	high := fakeSessionVariant(t, e, 7, v1080)
+	low := fakeSessionVariant(t, e, 7, v360)
+
+	if got := e.SessionForStream(7, "remux", 0, 0, 1080, v1080); got != high {
+		t.Fatal("the playlist for 1080P must get the 1080P session")
+	}
+	if got := e.SessionForStream(7, "remux", 0, 0, 1080, v360); got != low {
+		t.Fatal("the playlist for 360P must get the 360P session")
+	}
+	if got := e.SessionForSegment(7, "remux", 0, 0, 1080, v360, 0, SessionSeekAhead); got != low {
+		t.Fatal("a 360P segment must be served by the 360P packaging job")
+	}
+	if got := e.SessionForSegment(7, "remux", 0, 0, 1080, "h264852x480-q32", 0, SessionSeekAhead); got != nil {
+		t.Fatal("a rung with no session must not borrow another rung's")
+	}
+
+	// A seek inside one rung cleans up only that rung's abandoned sessions.
+	e.CloseStreamSessions(7, "remux", 0, 0, 1080, v360, nil)
+	if got := e.SessionForStream(7, "remux", 0, 0, 1080, v360); got != nil {
+		t.Fatal("the closed 360P session survived")
+	}
+	if got := e.SessionForStream(7, "remux", 0, 0, 1080, v1080); got != high {
+		t.Fatal("closing one rung must not touch the other one's playback")
+	}
+}
+
+// fakeSessionVariant registers a session for one stream variant, with the first
+// segment already produced so segment selection has something to see.
+func fakeSessionVariant(t *testing.T, e *Engine, fileID int64, variant string) *Session {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "seg00000.m4s"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed segment: %v", err)
+	}
+	s := &Session{key: SessionKeyVariant(fileID, "remux", 0, 0, 1080, 0, variant), dir: dir, lastUsed: time.Now()}
+	e.sessMu.Lock()
+	e.sessions[s.key] = s
+	e.sessMu.Unlock()
+	return s
+}
+
+// The name in the play decision and the name of the packaging session's
+// directory must be the same string: the player matches its status poll against
+// the former, and a stray dash (sanitized out of a directory name) would make
+// every poll look like another stream's.
+func TestStreamVariantMatchesSessionKey(t *testing.T) {
+	v := StreamVariant("h264", 1920, 1080, 112)
+	if v != "h2641920x1080q112" {
+		t.Fatalf("StreamVariant = %q", v)
+	}
+	k := SessionKeyVariant(7, "remux", 0, 0, 1080, 0, v)
+	if k.variant != v {
+		t.Fatalf("the session key stored %q for variant %q", k.variant, v)
+	}
+	if got := StreamVariant("", 0, 0, 0); got != "" {
+		t.Fatalf("a source without a picture named a variant %q", got)
 	}
 }
 

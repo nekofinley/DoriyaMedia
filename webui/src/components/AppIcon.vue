@@ -85,6 +85,8 @@ const P = {
   redo: 'M16 5l4.5 4.5L16 14M20.5 9.5H10a6 6 0 0 0 0 12h5',
   upload: 'M12 16V4M8 8l4-4 4 4M5 16v3a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3',
   grip: 'M9 6h.01M9 12h.01M9 18h.01M15 6h.01M15 12h.01M15 18h.01',
+  // 扫码登录: three finder squares and a few modules, the shape of a QR code.
+  qr: 'M4 4h6v6H4zM5.5 5.5h3v3h-3zM14 4h6v6h-6zM15.5 5.5h3v3h-3zM4 14h6v6H4zM5.5 15.5h3v3h-3zM14 14h3v3h-3zM19 14h1v1h-1zM14 19h1v1h-1zM18 18h2v2h-2z',
 }
 
 const props = defineProps({

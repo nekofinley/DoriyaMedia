@@ -94,6 +94,18 @@ func SessionKeyVariant(fileID int64, mode string, audio, vindex, height, start i
 		height: height, start: start, variant: sanitizeVariant(variant)}
 }
 
+// StreamVariant names one source stream for a packaging session: its codec, the
+// picture size and — for a source with a ladder — the rung. It is the same name
+// the session key and the status endpoint use, in the sanitized form a directory
+// name can hold, so a client can match the progress it is polling to the stream
+// it is playing.
+func StreamVariant(codec string, width, height, quality int) string {
+	if codec == "" || width <= 0 {
+		return ""
+	}
+	return sanitizeVariant(fmt.Sprintf("%s%dx%d-q%d", codec, width, height, quality))
+}
+
 // sanitizeVariant keeps a variant filesystem-safe: it becomes part of a
 // directory name, and "-" separates the key's fields.
 func sanitizeVariant(v string) string {
@@ -175,6 +187,17 @@ func (s *Session) Output() (segments int, seconds float64, lastAt time.Time, run
 		}
 	}
 	return segments, seconds, lastAt, running
+}
+
+// PlaylistComplete reports whether the session's playlist carries its end
+// marker. That marker is what turns a growing playlist into a VOD one, and it is
+// the signal a player needs: hls.js will not seek into a live playlist reliably,
+// while an ended one seeks like any file. It is deliberately read from the
+// playlist rather than from the packager's process: ffmpeg exits a moment after
+// writing the marker, and a session adopted from the cache has no process at all.
+func (s *Session) PlaylistComplete() bool {
+	raw, err := os.ReadFile(s.PlaylistPath())
+	return err == nil && strings.Contains(string(raw), "#EXT-X-ENDLIST")
 }
 
 // markComplete records that the packager finished and measures what it produced.
@@ -723,14 +746,17 @@ func (s *Session) lastUsedTime() time.Time {
 }
 
 // streamSessions lists the live sessions serving one stream, whatever position
-// each of them started at.
-func (e *Engine) streamSessions(fileID int64, mode string, audio, vindex, height int) []*Session {
+// each of them started at. variant is part of the stream's identity as well:
+// two qualities of one bilibili episode are two different pictures, and a
+// segment of one must never be served from the other's packaging job.
+func (e *Engine) streamSessions(fileID int64, mode string, audio, vindex, height int, variant string) []*Session {
+	variant = sanitizeVariant(variant)
 	e.sessMu.Lock()
 	defer e.sessMu.Unlock()
 	var out []*Session
 	for k, s := range e.sessions {
 		if k.fileID == fileID && k.mode == mode && k.audio == audio &&
-			k.vindex == vindex && k.height == height {
+			k.vindex == vindex && k.height == height && k.variant == variant {
 			out = append(out, s)
 		}
 	}
@@ -741,9 +767,9 @@ func (e *Engine) streamSessions(fileID int64, mode string, audio, vindex, height
 // The playlist uses this, so after a seek the refreshed playlist follows the
 // session that is actually packaging, rather than racing back to the position
 // the URL was originally built with.
-func (e *Engine) SessionForStream(fileID int64, mode string, audio, vindex, height int) *Session {
+func (e *Engine) SessionForStream(fileID int64, mode string, audio, vindex, height int, variant string) *Session {
 	var best *Session
-	for _, s := range e.streamSessions(fileID, mode, audio, vindex, height) {
+	for _, s := range e.streamSessions(fileID, mode, audio, vindex, height, variant) {
 		if best == nil || s.lastUsedTime().After(best.lastUsedTime()) {
 			best = s
 		}
@@ -755,9 +781,9 @@ func (e *Engine) SessionForStream(fileID int64, mode string, audio, vindex, heig
 // that started latest without starting after idx. A session that has fallen more
 // than seekAhead segments behind is rejected — waiting for it would take longer
 // than packaging from where the player actually is, which is what a seek means.
-func (e *Engine) SessionForSegment(fileID int64, mode string, audio, vindex, height, idx, seekAhead int) *Session {
+func (e *Engine) SessionForSegment(fileID int64, mode string, audio, vindex, height int, variant string, idx, seekAhead int) *Session {
 	var best *Session
-	for _, s := range e.streamSessions(fileID, mode, audio, vindex, height) {
+	for _, s := range e.streamSessions(fileID, mode, audio, vindex, height, variant) {
 		if s.StartSegment() > idx {
 			continue // began after this segment: it never packaged it
 		}
@@ -774,7 +800,8 @@ func (e *Engine) SessionForSegment(fileID int64, mode string, audio, vindex, hei
 // CloseStreamSessions closes every live session for these parameters except
 // keep. A player can only be in one place, so the sessions a seek leaves behind
 // would otherwise keep reading the same source and filling the disk.
-func (e *Engine) CloseStreamSessions(fileID int64, mode string, audio, vindex, height int, keep *Session) {
+func (e *Engine) CloseStreamSessions(fileID int64, mode string, audio, vindex, height int, variant string, keep *Session) {
+	variant = sanitizeVariant(variant)
 	e.sessMu.Lock()
 	var dead []*Session
 	for k, s := range e.sessions {
@@ -782,7 +809,7 @@ func (e *Engine) CloseStreamSessions(fileID int64, mode string, audio, vindex, h
 			continue
 		}
 		if k.fileID == fileID && k.mode == mode && k.audio == audio &&
-			k.vindex == vindex && k.height == height {
+			k.vindex == vindex && k.height == height && k.variant == variant {
 			dead = append(dead, s)
 			delete(e.sessions, k)
 		}

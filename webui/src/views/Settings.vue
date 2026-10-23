@@ -42,7 +42,7 @@ let pollTimer = null
 
 // new source form
 const srcType = ref('openlist')
-const srcForm = ref({ name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '', bili_cookie: '', bili_quality: 0, bili_codec: 'avc', bili_proxy: '', bili_playable_only: true })
+const srcForm = ref({ name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '', bili_cookie: '', bili_codec: 'avc', bili_proxy: '', bili_playable_only: true })
 const testResult = ref(null)
 const testing = ref(false)
 const addingSource = ref(false)
@@ -61,7 +61,7 @@ const proxyTesting = ref(false)
 const proxyResult = ref(null)
 
 function blankSrcForm() {
-  return { name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '', bili_cookie: '', bili_quality: 0, bili_codec: 'avc', bili_proxy: '', bili_playable_only: true }
+  return { name: '', root: '', webdav_url: '', webdav_user: '', webdav_pass: '', base_url: '', token: '', bili_cookie: '', bili_codec: 'avc', bili_proxy: '', bili_playable_only: true }
 }
 
 /** Load one source row into the form, so it can be changed in place. */
@@ -81,7 +81,6 @@ function startEditSource(s) {
     base_url: c.base_url || '',
     token: c.token === '******' ? '' : (c.token || ''),
     bili_cookie: c.bili_cookie === '******' ? '' : (c.bili_cookie || ''),
-    bili_quality: Number(c.bili_quality) || 0,
     bili_codec: c.bili_codec || 'avc',
     bili_proxy: c.bili_proxy && c.bili_proxy !== '******' ? c.bili_proxy : '',
     // A source from before this option existed has no field: keep its old
@@ -144,7 +143,7 @@ function buildSourceConfig() {
   if (srcType.value === 'webdav') return { webdav_url: f.webdav_url, webdav_user: f.webdav_user, webdav_pass: f.webdav_pass }
   if (srcType.value === 'bilibili') {
     return {
-      bili_cookie: f.bili_cookie, bili_quality: Number(f.bili_quality) || 0,
+      bili_cookie: f.bili_cookie,
       bili_codec: f.bili_codec || 'avc', bili_proxy: (f.bili_proxy || '').trim(),
       bili_playable_only: !!f.bili_playable_only,
     }
@@ -228,6 +227,101 @@ function sourceLine(s) {
   }
   return s.config.base_url || s.config.webdav_url || s.config.root || '-'
 }
+
+// ---------- B 站账号状态 ----------
+//
+// A pasted cookie is a copy of a browser session, and bilibili rotates those from
+// the browser: the copy dies at the first rotation and nothing says so. What the
+// viewer then sees is 480P and "this needs a 大会员" on an account that has one.
+// The health line below is the answer to "why is my picture bad", and the QR
+// dialog is the fix that does not expire.
+
+const biliHealth = ref({})      // source id → BiliHealth
+const biliHealthLoading = ref(0) // source id being checked, 0 = none
+
+async function loadBiliHealth(s) {
+  if (!s || s.type !== 'bilibili') return
+  biliHealthLoading.value = s.id
+  try {
+    biliHealth.value = { ...biliHealth.value, [s.id]: await api.get(`/api/sources/${s.id}/bili-account`) }
+  } catch (e) {
+    biliHealth.value = {
+      ...biliHealth.value,
+      [s.id]: { configured: !!s.config?.bili_cookie, logged_in: false, message: e.message },
+    }
+  } finally {
+    biliHealthLoading.value = 0
+  }
+}
+
+/** The tone of a health line: good, warning, or unknown (not checked yet). */
+function biliTone(h) {
+  if (!h) return 'dim'
+  if (h.error) return 'err'
+  if (!h.configured) return 'dim'
+  return h.logged_in ? 'ok' : 'err'
+}
+
+const qr = ref(null)        // { source, key, png, url, state, message }
+const qrStarting = ref(false)
+let qrTimer = null
+
+function stopQR() {
+  if (qrTimer) { clearInterval(qrTimer); qrTimer = null }
+}
+
+async function startQRLogin(s) {
+  stopQR()
+  qrStarting.value = true
+  qr.value = { source: s, state: 'loading', message: '正在申请二维码…' }
+  try {
+    const out = await api.post(`/api/sources/${s.id}/bili-qr`)
+    qr.value = { source: s, key: out.key, png: out.png, url: out.url, state: 'waiting', message: '请用 B 站手机客户端扫码' }
+    // Poll every two seconds: fast enough to feel immediate, slow enough that a
+    // forgotten dialog is not a request per second against bilibili.
+    qrTimer = setInterval(() => pollQR(s), 2000)
+  } catch (e) {
+    qr.value = { source: s, state: 'error', message: e.message }
+  } finally {
+    qrStarting.value = false
+  }
+}
+
+async function pollQR(s) {
+  const cur = qr.value
+  if (!cur || !cur.key) return
+  try {
+    const st = await api.post(`/api/sources/${s.id}/bili-qr/poll`, { key: cur.key })
+    qr.value = { ...cur, state: st.state, message: st.message, account: st.account }
+    if (st.state === 'confirmed') {
+      stopQR()
+      await loadAll()
+      await loadBiliHealth(s)
+      toast.ok(st.message || '登录成功')
+    } else if (st.state === 'expired') {
+      stopQR()
+    }
+  } catch (e) {
+    // A transient failure (a proxy hiccup) must not kill the dialog; the next
+    // tick tries again. Only a dead QR ends it.
+    qr.value = { ...cur, message: e.message }
+  }
+}
+
+function closeQR() {
+  stopQR()
+  qr.value = null
+}
+
+async function refreshBiliSession(s) {
+  try {
+    biliHealth.value = { ...biliHealth.value, [s.id]: await api.post(`/api/sources/${s.id}/bili-refresh`) }
+    await loadAll()
+    toast.ok('会话已续期')
+  } catch (e) { toast.err(e.message) }
+}
+
+onBeforeUnmount(stopQR)
 function fmtClock(ts) {
   if (!ts) return ''
   return new Date(ts * 1000).toLocaleTimeString('zh-CN', { hour12: false })
@@ -273,6 +367,12 @@ function providersOf(lib) {
 onMounted(async () => {
   await loadAll()
   await loadAudits()
+  // The account state is the first thing that explains a bad picture, so it is
+  // read for every bilibili source as soon as the page opens — not only when an
+  // administrator opens the edit form.
+  for (const s of sources.value) {
+    if (s.type === 'bilibili') await loadBiliHealth(s)
+  }
   pollTimer = setInterval(async () => {
     try { scanStates.value = (await api.get('/api/scan/status')) || [] } catch {}
     // 体检是长时间后台任务(要逐个探测网盘文件),轮询比扫描稍慢即可。
@@ -743,16 +843,6 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                       </div>
                     </div>
                     <div class="field">
-                      <label>清晰度上限</label>
-                      <select v-model.number="srcForm.bili_quality">
-                        <option :value="0">最高(账号能给多少就多少)</option>
-                        <option :value="112">1080P 高码率(需大会员)</option>
-                        <option :value="80">1080P(需登录)</option>
-                        <option :value="64">720P</option>
-                        <option :value="32">480P</option>
-                      </select>
-                    </div>
-                    <div class="field">
                       <label>编码偏好</label>
                       <select v-model="srcForm.bili_codec">
                         <option value="avc">AVC / H.264(兼容最好,推荐)</option>
@@ -761,6 +851,12 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                         <option value="auto">不限,由清晰度决定</option>
                       </select>
                       <div class="tiny">同一清晰度 B 站会同时给几种编码;AVC 是唯一所有客户端都能解、且不需要额外封装的。</div>
+                    </div>
+                    <div class="field wide">
+                      <div class="tiny">
+                        清晰度不在这里固定:播放时用播放器控制栏的「清晰度」按钮随时切换,
+                        默认是「自动」——取当前账号能给的最高一档(SDR 优先)。切换会从当前位置接着播。
+                      </div>
                     </div>
 
                     <!-- Region: the reason a server abroad needs this source to
@@ -853,6 +949,35 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
               <div class="r-main">
                 <div class="r-title">{{ s.name }} <span class="badge">{{ s.type }}</span></div>
                 <div class="tiny truncate">{{ sourceLine(s) }}</div>
+                <!-- The account verdict. A pasted cookie dies when the browser
+                     rotates it, and the only symptom is a bad picture — so the
+                     answer to "why is this blurry" belongs on the card, not
+                     behind an edit form. -->
+                <template v-if="s.type === 'bilibili'">
+                  <div v-if="biliHealthLoading === s.id" class="tiny dim" style="margin-top:4px">正在核对账号…</div>
+                  <div v-else-if="biliHealth[s.id]" class="bili-health" :class="biliTone(biliHealth[s.id])">
+                    <AppIcon :name="biliTone(biliHealth[s.id]) === 'ok' ? 'check' : biliTone(biliHealth[s.id]) === 'err' ? 'alert' : 'info'" :size="14" />
+                    <span>{{ biliHealth[s.id].message }}</span>
+                  </div>
+                  <div v-if="biliHealth[s.id] && biliHealth[s.id].hint" class="tiny dim" style="margin-top:2px">
+                    {{ biliHealth[s.id].hint }}
+                  </div>
+                  <div class="btn-row" style="margin-top:8px">
+                    <button class="btn sm" @click="startQRLogin(s)">
+                      <AppIcon name="qr" :size="14" /> {{ biliHealth[s.id] && biliHealth[s.id].logged_in ? '重新扫码登录' : '扫码登录' }}
+                    </button>
+                    <button
+                      v-if="biliHealth[s.id] && biliHealth[s.id].refreshable"
+                      class="btn sm" title="用 refresh_token 换一个新的 Cookie,不用重新扫码"
+                      @click="refreshBiliSession(s)"
+                    >
+                      <AppIcon name="refresh" :size="14" /> 续期
+                    </button>
+                    <button class="btn sm" :disabled="biliHealthLoading === s.id" @click="loadBiliHealth(s)">
+                      <AppIcon name="refresh" :size="14" /> 重新检查
+                    </button>
+                  </div>
+                </template>
               </div>
               <button class="btn sm" title="编辑这个源(不用删了重加)" @click="startEditSource(s)"><AppIcon name="wand" :size="14" /> 编辑</button>
               <button class="btn sm danger" @click="delSource(s.id)"><AppIcon name="trash" :size="14" /> 删除</button>
@@ -1731,6 +1856,55 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
       <div class="sk mt-5" style="height:260px;border-radius:var(--r-l)" />
     </div>
   </div>
+
+  <!-- 扫码登录: the fix for a cookie that a browser rotation killed. A scanned
+       session belongs to this server and carries a refresh_token, so it does not
+       die the next time somebody opens bilibili in a browser. -->
+  <Transition name="fade">
+    <div v-if="qr" class="qr-backdrop" @click.self="closeQR">
+      <div class="qr-dialog card">
+        <div class="card-head">
+          <div>
+            <div class="card-title"><AppIcon name="qr" :size="16" /> 扫码登录 B 站</div>
+            <div class="tiny">{{ qr.source?.name }} · 用 B 站手机客户端扫描下面的二维码</div>
+          </div>
+          <button class="btn sm" @click="closeQR"><AppIcon name="close" :size="14" /></button>
+        </div>
+
+        <div class="qr-body">
+          <div class="qr-frame" :class="{ dimmed: qr.state === 'expired' || qr.state === 'error' }">
+            <img v-if="qr.png" :src="qr.png" alt="B 站登录二维码" width="240" height="240" />
+            <div v-else class="sk" style="width:240px;height:240px;border-radius:var(--r-m)" />
+          </div>
+          <div class="qr-side">
+            <div class="qr-state" :class="qr.state === 'confirmed' ? 'ok' : qr.state === 'expired' || qr.state === 'error' ? 'err' : 'dim'">
+              <AppIcon :name="qr.state === 'confirmed' ? 'check' : qr.state === 'expired' || qr.state === 'error' ? 'alert' : 'qr'" :size="16" />
+              <span>{{ qr.message }}</span>
+            </div>
+            <div v-if="qr.account && qr.account.logged_in" class="tiny" style="margin-top:8px">
+              账号:{{ qr.account.uname }}
+              <template v-if="qr.account.vip_status === 1"> · 大会员</template>
+            </div>
+            <ol class="qr-steps tiny">
+              <li>手机打开 B 站 →「我的」→ 右上角扫一扫</li>
+              <li>扫描左侧二维码</li>
+              <li>在手机上点「确认登录」</li>
+            </ol>
+            <div class="tiny dim">
+              扫码得到的会话属于这台服务器,带 refresh_token,可以自动续期 ——
+              不像从浏览器复制的 Cookie 那样,浏览器一刷新登录态它就失效了。
+            </div>
+            <div class="btn-row" style="margin-top:10px">
+              <button class="btn sm" :disabled="qrStarting" @click="startQRLogin(qr.source)">
+                <AppIcon name="refresh" :size="14" /> 换一个二维码
+              </button>
+              <button v-if="qr.state === 'confirmed'" class="btn sm primary" @click="closeQR">完成</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </Transition>
 </template>
 
 <style scoped>
@@ -1936,6 +2110,73 @@ a.audit-show:hover { color: var(--brand); }
 .btn-row .input { min-height: 38px; }
 
 .set-skeleton { padding-top: calc(var(--header-h) + 40px); }
+
+/* ---------- B 站账号状态 ---------- */
+
+/* The verdict line on a source card. Tone carries the meaning: a dead cookie is
+   the one thing on this page that silently ruins playback, so it is drawn like a
+   warning rather than as another line of grey text. */
+.bili-health {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 5px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.bili-health.ok { color: var(--ok); }
+.bili-health.err { color: var(--danger); }
+.bili-health.dim { color: var(--text-3); }
+
+.qr-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-4);
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(3px);
+}
+.qr-dialog {
+  width: min(680px, 100%);
+  max-height: calc(100vh - 2 * var(--sp-4));
+  overflow-y: auto;
+}
+.qr-body {
+  display: flex;
+  gap: var(--sp-5);
+  align-items: flex-start;
+  padding: var(--sp-4) 0 0;
+}
+.qr-frame {
+  flex: none;
+  padding: 12px;
+  border-radius: var(--r-m);
+  /* White behind the code whatever the theme: a dark-on-dark QR does not scan. */
+  background: #fff;
+  transition: opacity 0.2s;
+}
+.qr-frame.dimmed { opacity: 0.35; }
+.qr-frame img { display: block; border-radius: 4px; }
+.qr-side { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.qr-state {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+}
+.qr-state.ok { color: var(--ok); }
+.qr-state.err { color: var(--danger); }
+.qr-state.dim { color: var(--text-3); }
+.qr-steps { margin: 4px 0 0; padding-left: 18px; line-height: 1.8; }
+
+@media (max-width: 720px) {
+  .qr-body { flex-direction: column; align-items: center; }
+  .qr-side { width: 100%; }
+}
 
 @media (max-width: 1080px) {
   .set-layout { grid-template-columns: 1fr; gap: var(--sp-5); }

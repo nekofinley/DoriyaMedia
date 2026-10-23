@@ -65,6 +65,14 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		fail(w, 500, "存储源错误: "+err.Error())
 		return
 	}
+	// 清晰度 is a playback-time choice, not a library setting: the player sends
+	// the rung it wants with each decision (and with every HLS request that
+	// follows), and a driver without a ladder simply ignores it. The choice has
+	// to reach the source before the probe, because the probe for a multi-stream
+	// source *is* its resolved ladder — resolving the wrong rung first would
+	// decide the picture's codec and size from another quality's streams.
+	qualityPref := qualityParam(r)
+	source.SetQuality(drv, qualityPref)
 
 	// The decision needs a probe. A source that publishes its media as several
 	// streams (bilibili DASH) states its own codecs, so that probe is built from
@@ -89,6 +97,19 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		return
 	}
 	_, multiPart := drv.(source.MultiPart)
+
+	// The ladder and the rung this stream actually uses. The latter is not the
+	// preference when the requested rung is missing from this episode (a stored
+	// 4K choice on a 720P title) or when the codec preference moves the picture
+	// down a rung, so it is reported separately and the player shows the truth.
+	qualities := make([]source.Quality, 0, 8)
+	quality := source.SelectedQualityOf(drv)
+	if qd, ok := drv.(source.QualityDriver); ok {
+		if qs, err := qd.Qualities(ctx, file.Path); err == nil {
+			qualities = qs
+		}
+		quality = qd.SelectedQuality()
+	}
 
 	client := s.clientKind(r)
 	force := r.URL.Query().Get("force")
@@ -291,6 +312,32 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		danmakuURL = fmt.Sprintf("/api/danmaku/%d/comments.json%s", file.ID, signedQuery(s.Cfg.Secret, file.ID, sigTTL))
 	}
 
+	// The HLS stream is pinned to the rung this decision actually chose, not to
+	// the preference: "auto" has to become a concrete stream for the session key,
+	// and a segment request that re-resolved "auto" could otherwise land on a
+	// different rung than the playlist it belongs to. When the ladder could not be
+	// read (the menu call failed), the preference is the next best identity: it
+	// still separates two explicit choices, and a missing rung falls back inside
+	// the source exactly as it did for this decision.
+	pinQuality := quality
+	if pinQuality <= 0 {
+		pinQuality = qualityPref
+	}
+	qualityQ := ""
+	if pinQuality > 0 {
+		qualityQ = "&q=" + strconv.Itoa(pinQuality)
+	}
+	// The packaging session this decision will use, named the same way
+	// serveSessionHLS names it. A player that switches quality can then tell the
+	// abandoned rung's progress from the new one's: both sessions can be alive at
+	// once, and the abandoned one may already be minutes ahead.
+	streamVariant := ""
+	if multiPart {
+		if v := probe.Video(); v != nil {
+			streamVariant = media.StreamVariant(v.CodecName, v.Width, v.Height, pinQuality)
+		}
+	}
+
 	switch dec.Mode {
 	case "direct":
 		dec.URL = fmt.Sprintf("/api/stream/%d%s", file.ID, signedQuery(s.Cfg.Secret, file.ID, sigTTL))
@@ -315,7 +362,7 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		if burnSub > 0 {
 			burnQ = "&burn=" + strconv.FormatInt(burnSub, 10)
 		}
-		dec.URL = fmt.Sprintf("/api/hls/%d/%s%s&m=%s%s%s", file.ID, playlist, sq, dec.Mode, startQ, burnQ)
+		dec.URL = fmt.Sprintf("/api/hls/%d/%s%s&m=%s%s%s%s", file.ID, playlist, sq, dec.Mode, startQ, burnQ, qualityQ)
 		dec.MimeType = "application/vnd.apple.mpegurl"
 	}
 
@@ -326,7 +373,7 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 	proxyURL := fmt.Sprintf("/api/stream/%d?proxy=1", file.ID) + strings.Replace(sq, "?", "&", 1)
 	directURL := fmt.Sprintf("/api/stream/%d%s", file.ID, sq)
 	hlsURL := func(m string) string {
-		return fmt.Sprintf("/api/hls/%d/%s%s&m=%s%s", file.ID, playlist, sq, m, startQ)
+		return fmt.Sprintf("/api/hls/%d/%s%s&m=%s%s%s", file.ID, playlist, sq, m, startQ, qualityQ)
 	}
 	alts := make([]media.DecisionAlt, 0, len(dec.Alternates))
 	for _, a := range dec.Alternates {
@@ -406,6 +453,17 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		// timestamps the segments carry — so the client needs this offset to seek,
 		// to save progress in file time, and to line up absolutely timed subtitles.
 		"stream_start": streamStart,
+		// 清晰度: the rungs this file can be played at, the rung this stream uses
+		// (0 when its source has no ladder), and the preference the caller asked
+		// for (0 = automatic). An empty qualities list means the player offers
+		// no menu at all — an ordinary file has one picture, not a choice.
+		"qualities":    qualities,
+		"quality":      quality,
+		"quality_pref": qualityPref,
+		// stream_variant names the packaging job this URL belongs to (empty for a
+		// source with one stream). The status endpoint names its job the same way,
+		// so a player that just changed quality can ignore the old job's progress.
+		"stream_variant": streamVariant,
 		// Whether the player may ask for a stream beginning at some other position
 		// (see the seek handling in the web player): without it, the honest answer
 		// to a drag past the packaged window is to go as far as it can and say so.
@@ -486,6 +544,13 @@ func (s *Server) playPreparingPayload(r *http.Request, file *models.MediaFile) m
 		"audio_tracks": []any{},
 		"subtitles":    []any{},
 		"versions":     s.versionsFor(file.ItemID, file.ID),
+		// No ladder yet: the probe has not read one, and a source without one
+		// never has any. Stated rather than omitted so the player's fields keep
+		// their shapes while it polls.
+		"qualities":      []any{},
+		"quality":        0,
+		"quality_pref":   qualityParam(r),
+		"stream_variant": "",
 	}
 }
 
@@ -500,9 +565,17 @@ func (s *Server) playPreparingPayload(r *http.Request, file *models.MediaFile) m
 // say nothing about it — and a player told nothing applies its own timeout and
 // gives up on a stream that is merely slow to start, which is the normal case for
 // the first seconds of a cold 4K file on a cloud drive.
-func (s *Server) streamStatusFor(fileID int64) *media.StreamStatus {
-	if p := s.Engine.PackagerProgress(fileID); p != nil {
+//
+// variant limits the answer to one source stream. A player that has just switched
+// rung must not be told about the old rung's progress (which can be minutes
+// ahead), and a caller that asks for a stream the server has not started yet gets
+// no stream at all rather than an unrelated counter.
+func (s *Server) streamStatusFor(fileID int64, variant string) *media.StreamStatus {
+	if p := s.Engine.PackagerProgressVariant(fileID, variant); p != nil {
 		return p
+	}
+	if variant != "" {
+		return nil
 	}
 	return s.Engine.StreamStatus(fileID)
 }
@@ -528,7 +601,7 @@ func (s *Server) handlePlayStatus(w http.ResponseWriter, r *http.Request, user *
 		"state":   st.State, // idle | probing | ready | failed
 		"elapsed": st.Elapsed,
 		"error":   st.Error,
-		"stream":  s.streamStatusFor(id),
+		"stream":  s.streamStatusFor(id, r.URL.Query().Get("variant")),
 	})
 }
 
@@ -543,6 +616,21 @@ func (s *Server) clientKind(r *http.Request) media.ClientKind {
 	default:
 		return media.DetectClient(r.UserAgent())
 	}
+}
+
+// qualityParam is the 清晰度 a playback request asks for, in the source's own
+// numbering (bilibili's qn). 0 or anything unreadable means automatic: the best
+// rung the source will give. A source without a ladder ignores it.
+func qualityParam(r *http.Request) int {
+	v := r.URL.Query().Get("q")
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 func deref(p *int64) int64 {
@@ -754,6 +842,10 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, "存储源错误: "+err.Error())
 		return
 	}
+	// The playlist, its init segment and every media segment carry the rung they
+	// belong to (see playFile): re-resolving the same file at "automatic" for a
+	// segment request could choose a different picture than the playlist's.
+	source.SetQuality(drv, qualityParam(r))
 	ctx, cancel := context.WithTimeout(r.Context(), 150*time.Second)
 	defer cancel()
 
@@ -1103,6 +1195,17 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 	// for every segment anyway.
 	multi := len(inputs) > 1
 
+	// The rung these inputs were resolved at, and the one every request that
+	// follows carries so the playlist and the segments behind it are the same
+	// picture.
+	//
+	// This is the request's pinned rung (q), which playFile always writes, not
+	// SelectedQuality: a warm parts cache answers without re-resolving and then
+	// nothing records a selection on this driver. A request with no q is an
+	// automatic stream and its packaging job is named q0, exactly as the play
+	// decision named it.
+	sessionQuality := source.QualityOf(drv)
+
 	// Sessions are addressed by segment, so snap the requested position down to a
 	// segment boundary: segment N then always means "N*segLen into the file", and
 	// the playlist's MEDIA-SEQUENCE agrees with the timestamps we serve.
@@ -1154,6 +1257,12 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 	if req.burn != nil {
 		sig += "&burn=" + strconv.FormatInt(req.burnID, 10)
 	}
+	if sessionQuality > 0 {
+		// Every playlist, init segment and media segment names the rung it was
+		// packaged from. Without it, "automatic" would be re-resolved per request
+		// and could choose another rung mid-stream.
+		sig += "&q=" + strconv.Itoa(sessionQuality)
+	}
 	base := fmt.Sprintf("/api/hls/%d", file.ID)
 
 	// Packaging output is identified by the stream it was made from as well as by
@@ -1164,8 +1273,8 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 	// apart; an ordinary file has one stream and no variant.
 	variant := ""
 	if multi {
-		if v := probe.Video(); v != nil && v.CodecName != "" && v.Width > 0 {
-			variant = fmt.Sprintf("%s%d", v.CodecName, v.Width)
+		if v := probe.Video(); v != nil {
+			variant = media.StreamVariant(v.CodecName, v.Width, v.Height, sessionQuality)
 		}
 	}
 
@@ -1192,7 +1301,7 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 	// playback must honour its position — otherwise "continue watching" streams
 	// from whatever session was left over.
 	streamSession := func(in []media.Input) (*media.Session, error) {
-		sess := s.Engine.SessionForStream(file.ID, mode, audioOrdinal, videoIndex, height)
+		sess := s.Engine.SessionForStream(file.ID, mode, audioOrdinal, videoIndex, height, variant)
 		switch {
 		case sess == nil:
 			return ensureAt(in, startSeg)
@@ -1206,7 +1315,7 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		default:
 			// Nothing has been consumed here for a while, so treat this as a new
 			// playback and begin where it asks.
-			s.Engine.CloseStreamSessions(file.ID, mode, audioOrdinal, videoIndex, height, nil)
+			s.Engine.CloseStreamSessions(file.ID, mode, audioOrdinal, videoIndex, height, variant, nil)
 			return ensureAt(in, startSeg)
 		}
 	}
@@ -1265,7 +1374,7 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 			fail(w, 404, "未知 HLS 资源")
 			return
 		}
-		sess := s.Engine.SessionForSegment(file.ID, mode, audioOrdinal, videoIndex, height, idx, media.SessionSeekAhead)
+		sess := s.Engine.SessionForSegment(file.ID, mode, audioOrdinal, videoIndex, height, variant, idx, media.SessionSeekAhead)
 		if sess == nil {
 			// Outside what is packaged (a seek, forwards or backwards): package
 			// from there instead of waiting for a session that will never reach
@@ -1275,7 +1384,7 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 			// nowhere else to start from, so the request waits for the segment to be
 			// packaged instead (packaging runs far faster than playback).
 			if !multi {
-				s.Engine.CloseStreamSessions(file.ID, mode, audioOrdinal, videoIndex, height, nil)
+				s.Engine.CloseStreamSessions(file.ID, mode, audioOrdinal, videoIndex, height, variant, nil)
 			}
 			next, err := ensureAt(inputs, idx)
 			if err != nil {
@@ -1321,6 +1430,12 @@ func (s *Server) serveHLSSubtitles(w http.ResponseWriter, r *http.Request, ctx c
 	if streamStart > 0 {
 		startParam = "&start=" + strconv.FormatFloat(streamStart, 'f', 3, 64)
 	}
+	// The master playlist is a second entry point into the media stream, so the
+	// variant it names has to carry the same rung the master was asked for.
+	qParam := ""
+	if qn := qualityParam(r); qn > 0 {
+		qParam = "&q=" + strconv.Itoa(qn)
+	}
 
 	if rest == "master.m3u8" {
 		if len(servable) == 0 {
@@ -1347,7 +1462,7 @@ func (s *Server) serveHLSSubtitles(w http.ResponseWriter, r *http.Request, ctx c
 			}
 		}
 		fmt.Fprintf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%d,SUBTITLES=\"subs\"\n", bw)
-		fmt.Fprintf(&b, "/api/hls/%d/index.m3u8%s&m=%s%s\n", file.ID, sig, mode, startParam)
+		fmt.Fprintf(&b, "/api/hls/%d/index.m3u8%s&m=%s%s%s\n", file.ID, sig, mode, startParam, qParam)
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write([]byte(b.String()))

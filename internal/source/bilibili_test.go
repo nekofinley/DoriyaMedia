@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCodecOf(t *testing.T) {
@@ -184,6 +185,172 @@ func TestPickVideoAvoidsHDR(t *testing.T) {
 	}
 }
 
+// A rung the player chose in the 清晰度 menu wins over the automatic choice,
+// but only within that rung: the codec preference still decides which codec of
+// it to copy. A rung the episode does not have falls back to the automatic
+// ladder instead of failing the playback.
+func TestPickVideoHonoursQualityPreference(t *testing.T) {
+	reps := []biliRep{
+		{ID: 112, Codecs: "avc1.640032", BaseURL: "u112avc", Bandwidth: 6000},
+		{ID: 80, Codecs: "avc1.640028", BaseURL: "u80avc", Bandwidth: 3000},
+		{ID: 80, Codecs: "hev1.1.6.L120.90", BaseURL: "u80hevc", Bandwidth: 2500},
+		{ID: 32, Codecs: "avc1.64001F", BaseURL: "u32avc", Bandwidth: 700},
+	}
+
+	d := &BilibiliDriver{codec: "avc", quality: 80}
+	got, ok := d.pickVideo(reps)
+	if !ok || got.BaseURL != "u80avc" {
+		t.Fatalf("a chosen 1080P rung picked %q", got.BaseURL)
+	}
+	if d.SelectedQuality() != 80 {
+		t.Fatalf("selected quality = %d, want the 1080P rung", d.SelectedQuality())
+	}
+
+	// Within the chosen rung the codec preference still applies: HEVC when asked.
+	dh := &BilibiliDriver{codec: "hevc", quality: 80}
+	got, _ = dh.pickVideo(reps)
+	if got.BaseURL != "u80hevc" {
+		t.Fatalf("HEVC preference within 1080P picked %q", got.BaseURL)
+	}
+
+	// An impossible rung is not an error: the best the ladder has is played.
+	missing := &BilibiliDriver{codec: "avc", quality: 120}
+	got, ok = missing.pickVideo(reps)
+	if !ok || got.BaseURL != "u112avc" || missing.SelectedQuality() != 112 {
+		t.Fatalf("a missing rung picked %q (selected %d), want the ladder's best",
+			got.BaseURL, missing.SelectedQuality())
+	}
+}
+
+// The quality menu must describe what can actually be played. bilibili's API
+// names rungs the account is not entitled to (accept_quality and support_formats
+// go all the way to HDR/4K on an anonymous cookie whose DASH ladder holds only
+// 360P/480P), and an HDR rung is never offered because a plain copy of it is the
+// wrong picture. The request itself always asks for the full ladder, so a rung
+// can be switched without another API round trip.
+func TestQualitiesListsPlayableLadder(t *testing.T) {
+	resetBiliCache()
+	defer resetBiliCache()
+
+	var askedQN string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/pgc/player/web/playurl" {
+			http.NotFound(w, r)
+			return
+		}
+		askedQN = r.URL.Query().Get("qn")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(biliPlayurlFixture()))
+	}))
+	defer srv.Close()
+
+	oldAPI := biliAPI
+	biliAPI = srv.URL
+	defer func() { biliAPI = oldAPI }()
+
+	const epID = 700001
+	biliCacheMu.Lock()
+	biliCache[fmt.Sprintf("epid:%d", epID)] = biliCacheItem{
+		val: biliEpisodeRef{SeasonID: 700, Cid: 701, Aid: 702, Duration: 1440000},
+		at:  time.Now(),
+	}
+	biliCacheMu.Unlock()
+
+	d := &BilibiliDriver{codec: "avc", client: srv.Client()}
+	path := fmt.Sprintf("/某番 [series 700]/第一季 [season 700]/第1话 [ep%d].mp4", epID)
+
+	qs, err := d.Qualities(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Qualities: %v", err)
+	}
+	if askedQN != "127" {
+		t.Fatalf("the ladder was asked for at qn=%s, want 127 (the full ladder)", askedQN)
+	}
+	if len(qs) != 3 {
+		t.Fatalf("Qualities listed %d rungs, want 3: %+v", len(qs), qs)
+	}
+	wantIDs := []int{120, 32, 16}
+	for i, want := range wantIDs {
+		if qs[i].ID != want {
+			t.Fatalf("rung %d is %d, want %d (best first)", i, qs[i].ID, want)
+		}
+	}
+	if qs[0].Label != "4K 超清" || qs[0].Short != "4K" {
+		t.Fatalf("4K row = %q/%q, want bilibili's own label", qs[0].Label, qs[0].Short)
+	}
+	if qs[0].Width != 1920 || qs[0].Height != 1080 {
+		t.Fatalf("4K row size = %dx%d", qs[0].Width, qs[0].Height)
+	}
+	if qs[1].Label != "480P 清晰" || qs[1].Short != "480P" {
+		t.Fatalf("480P row = %q/%q", qs[1].Label, qs[1].Short)
+	}
+	for _, q := range qs {
+		if q.ID == 125 {
+			t.Fatal("an HDR-only rung was offered as a playable choice")
+		}
+	}
+	if d.SelectedQuality() != 120 {
+		t.Fatalf("automatic selection = %d, want the best SDR rung (120)", d.SelectedQuality())
+	}
+
+	// Picking a rung changes the selection; the ladder itself stays the same.
+	d.SetQuality(32)
+	qs, err = d.Qualities(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Qualities after 480P: %v", err)
+	}
+	if d.SelectedQuality() != 32 {
+		t.Fatalf("after picking 480P the selection = %d", d.SelectedQuality())
+	}
+	if len(qs) != 3 {
+		t.Fatalf("the ladder changed with the selection: %+v", qs)
+	}
+
+	// A stored rung this episode does not have is not fatal: playback falls back
+	// to the automatic ladder, and the API reports the rung that is really used.
+	d.SetQuality(112)
+	if _, err := d.Qualities(context.Background(), path); err != nil {
+		t.Fatalf("Qualities with a missing rung: %v", err)
+	}
+	if d.SelectedQuality() != 120 {
+		t.Fatalf("a missing rung selected %d, want the automatic 120", d.SelectedQuality())
+	}
+	if d.Quality() != 112 {
+		t.Fatalf("Quality() = %d, want the requested 112", d.Quality())
+	}
+}
+
+// biliPlayurlFixture is one playurl answer: an HDR-only 4K rung, an SDR 4K rung
+// with two codecs, 480P and 360P. support_formats names rungs that are not in
+// the ladder (HDR, and the 1080P entries an account without a membership is told
+// about but does not get).
+func biliPlayurlFixture() string {
+	return `{"code":0,"message":"success","result":{
+	  "quality":120,"is_preview":0,"timelength":1440000,
+	  "accept_quality":[125,120,112,80,64,32,16],
+	  "accept_description":["HDR 真彩","4K 超清","1080P 高码率","1080P 高清","720P 高清","480P 清晰","360P 流畅"],
+	  "support_formats":[
+	    {"quality":125,"new_description":"HDR 真彩","display_desc":"HDR","need_vip":true},
+	    {"quality":120,"new_description":"4K 超清","display_desc":"4K","need_vip":true},
+	    {"quality":112,"new_description":"1080P 高码率","display_desc":"1080P","need_vip":true},
+	    {"quality":80,"new_description":"1080P 高清","display_desc":"1080P","need_login":true},
+	    {"quality":64,"new_description":"720P 高清","display_desc":"720P","need_login":true},
+	    {"quality":32,"new_description":"480P 清晰","display_desc":"480P"},
+	    {"quality":16,"new_description":"360P 流畅","display_desc":"360P"}
+	  ],
+	  "dash":{"duration":1440,"video":[
+	    {"id":125,"baseUrl":"v125hdr","codecs":"hvc1.2.4.H150.90","width":3840,"height":2160,"bandwidth":9000000},
+	    {"id":120,"baseUrl":"v120avc","codecs":"avc1.640033","width":1920,"height":1080,"bandwidth":5400000},
+	    {"id":120,"baseUrl":"v120hevc","codecs":"hev1.1.6.L153.90","width":1920,"height":1080,"bandwidth":4000000},
+	    {"id":32,"baseUrl":"v32avc","codecs":"avc1.64001F","width":852,"height":480,"bandwidth":700000},
+	    {"id":32,"baseUrl":"v32hevc","codecs":"hev1.1.6.L120.90","width":852,"height":480,"bandwidth":600000},
+	    {"id":16,"baseUrl":"v16avc","codecs":"avc1.64001E","width":640,"height":360,"bandwidth":400000}
+	  ],"audio":[
+	    {"id":30280,"baseUrl":"a320","codecs":"mp4a.40.2","bandwidth":192000}
+	  ]}
+	}}`
+}
+
 func TestPickAudio(t *testing.T) {
 	got, ok := pickAudio([]biliRep{
 		{ID: 30216, Codecs: "mp4a.40.2", BaseURL: "a64", Bandwidth: 66000},
@@ -251,10 +418,12 @@ func TestCheckPlayInfoRefusesPreviewEpisode(t *testing.T) {
 // resetBiliCache empties the driver's shared TTL cache. The tests below ask the
 // same season ids through changing routes, and a cached verdict from an earlier
 // case would answer for the wrong one.
+//
+// It drops the account cache as well: that one is keyed by cookie, and several
+// tests deliberately reuse the same fake cookie against different servers, so a
+// leftover answer would be served as if the new server had said it.
 func resetBiliCache() {
-	biliCacheMu.Lock()
-	biliCache = map[string]biliCacheItem{}
-	biliCacheMu.Unlock()
+	biliCacheClear()
 }
 
 // biliSeasonFixture is the shape /pgc/view/web/season answers with, reduced to

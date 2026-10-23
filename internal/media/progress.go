@@ -60,6 +60,15 @@ type StreamStatus struct {
 	// cold 4K file on a cloud drive, which is exactly when the first segments take
 	// longer than any fixed timeout a player applies.
 	PackagerRunning bool `json:"packager_running,omitempty"`
+	// Variant names the source stream this session packages (the rung of a
+	// bilibili ladder). Empty for an ordinary file. A player switching quality
+	// can tell the old session's progress from the new one's with it.
+	Variant string `json:"variant,omitempty"`
+	// Complete says the playlist has its end marker: the job finished and the
+	// playlist is VOD, so a seek into it is reliable. This is what a quality
+	// switch waits for — not the process exiting a moment later, and not a
+	// half-written playlist that hls.js treats as live.
+	Complete bool `json:"complete,omitempty"`
 }
 
 // noteSegmentStart records that a segment request is in flight.
@@ -129,7 +138,8 @@ func (e *Engine) StreamStatus(fileID int64) *StreamStatus {
 	return st
 }
 
-// PackagerProgress reports what a file's packaging sessions have produced.
+// PackagerProgress reports what the packaging session a viewer is consuming has
+// produced.
 //
 // The session path answers one long-lived ffmpeg instead of generating a segment
 // per request, so the counters above never move for it: a player asking whether the
@@ -137,51 +147,66 @@ func (e *Engine) StreamStatus(fileID int64) *StreamStatus {
 // timeout, and gave up on a stream that was merely slow to start. Reading the
 // sessions' own output answers that question with the truth.
 //
+// The answer describes the session used most recently, not the fleet of them. A
+// file can have several at once: a seek leaves the old position behind, and a
+// bilibili quality change starts a fresh packaging job from the beginning while
+// the previous rung is still finishing. Taking the furthest-produced instead (as
+// this used to) let the abandoned 1080P job answer "ready" for a 360P stream that
+// had barely started, and the player jumped to a position the new session had
+// not packaged yet.
+//
 // It returns nil when the file has no session at all, so callers can fall back to
 // the per-request counters.
 func (e *Engine) PackagerProgress(fileID int64) *StreamStatus {
+	return e.PackagerProgressVariant(fileID, "")
+}
+
+// PackagerProgressVariant is PackagerProgress limited to one source stream.
+//
+// A file can be packaged several times over — a seek leaves the old position
+// behind, and a bilibili quality change starts a fresh job for the new rung while
+// the previous one is still finishing. A player that has just switched rung is
+// asking about the *new* stream, so the answer has to be filtered by variant;
+// otherwise the abandoned 1080P job answers "ready" for a 360P stream that has
+// barely started, and the player jumps to a position it has not packaged.
+//
+// An empty variant means "any stream", which is what a source without a ladder
+// wants: its file has exactly one stream.
+func (e *Engine) PackagerProgressVariant(fileID int64, variant string) *StreamStatus {
+	want := sanitizeVariant(variant)
 	e.sessMu.Lock()
-	var live []*Session
+	var current *Session
 	for k, s := range e.sessions {
-		if k.fileID == fileID {
-			live = append(live, s)
+		if k.fileID != fileID {
+			continue
+		}
+		if want != "" && k.variant != want {
+			continue
+		}
+		if current == nil || s.lastUsedTime().After(current.lastUsedTime()) {
+			current = s
 		}
 	}
 	e.sessMu.Unlock()
-	if len(live) == 0 {
+	if current == nil {
 		return nil
 	}
 
-	st := &StreamStatus{}
-	var newest, started time.Time
-	for _, s := range live {
-		segments, seconds, lastAt, running := s.Output()
-		if running {
-			st.PackagerRunning = true
-		}
-		if segments > st.SegmentsReady {
-			st.SegmentsReady = segments
-			st.GeneratedSeconds = seconds
-		}
-		if lastAt.After(newest) {
-			newest = lastAt
-		}
-		if started.IsZero() || s.startedAt.After(started) {
-			started = s.startedAt
-		}
+	segments, seconds, lastAt, running := current.Output()
+	st := &StreamStatus{
+		SegmentsReady:    segments,
+		GeneratedSeconds: seconds,
+		PackagerRunning:  running,
+		Variant:          current.key.variant,
+		Complete:         current.PlaylistComplete(),
 	}
-	if newest.IsZero() {
-		newest = started
-	}
-	if !newest.IsZero() {
-		st.IdleSeconds = time.Since(newest).Seconds()
+	if !lastAt.IsZero() {
+		st.IdleSeconds = time.Since(lastAt).Seconds()
 	}
 	// Measured against wall time, unlike the per-request factor: a packager runs
 	// continuously, so the time it has had is the time it was working.
-	if !started.IsZero() {
-		if elapsed := time.Since(started).Seconds(); elapsed > 0.5 && st.GeneratedSeconds > 0 {
-			st.RealtimeFactor = st.GeneratedSeconds / elapsed
-		}
+	if elapsed := time.Since(current.startedAt).Seconds(); elapsed > 0.5 && seconds > 0 {
+		st.RealtimeFactor = seconds / elapsed
 	}
 	return st
 }

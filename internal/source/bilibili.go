@@ -61,9 +61,18 @@ var biliAPI = "https://api.bilibili.com"
 // BilibiliDriver lists 番剧 as a virtual tree and plays episodes through the
 // engine's multi-input remux.
 type BilibiliDriver struct {
-	cookie  string
-	quality int    // preferred qn; 0 = highest the account may have
-	codec   string // avc | hevc | av01 | auto
+	cookie string
+	// quality is the rung the viewer picked for this request; 0 means automatic
+	// (the best SDR rung the account is entitled to). It is set per request from
+	// the player's 清晰度 menu — the driver instance is built for one HTTP
+	// request, so one viewer's choice never reaches another's stream.
+	quality int
+	// selected is the rung the last resolved ladder actually used. It differs
+	// from quality when the requested rung is absent (an episode without 4K, a
+	// stored preference from a title that had it) or when the codec preference
+	// forces a lower rung; the API reports it so the player can show the truth.
+	selected int
+	codec    string // avc | hevc | av01 | auto
 
 	// proxySpec is this source's own way out, for a machine bilibili's region
 	// check refuses (see SourceConfig.BiliProxy). The zero value means direct:
@@ -91,7 +100,11 @@ type BilibiliDriver struct {
 // of the forms netproxy accepts (socks5:// / http:// / ss:// / host:port); an
 // empty string means direct. playableOnly asks the driver to leave out seasons
 // the route it dials from cannot play (see SourceConfig.BiliPlayableOnly).
-func NewBilibili(cookie string, quality int, codec string, proxy string, playableOnly bool) (*BilibiliDriver, error) {
+//
+// There is deliberately no quality parameter: the rung is chosen while the
+// episode plays (SetQuality, from the player's 清晰度 menu), not fixed in the
+// library's source settings.
+func NewBilibili(cookie string, codec string, proxy string, playableOnly bool) (*BilibiliDriver, error) {
 	switch codec {
 	case "", "auto", "avc", "h264", "hevc", "h265", "av1", "av01":
 	default:
@@ -101,7 +114,7 @@ func NewBilibili(cookie string, quality int, codec string, proxy string, playabl
 		codec = "avc"
 	}
 	d := &BilibiliDriver{
-		cookie: strings.TrimSpace(cookie), quality: quality, codec: codec,
+		cookie: strings.TrimSpace(cookie), codec: codec,
 		client: httpClient, playableOnly: playableOnly,
 	}
 	spec, err := netproxy.Parse(proxy)
@@ -315,6 +328,12 @@ func (d *BilibiliDriver) do(ctx context.Context, req *http.Request) (*http.Respo
 	return client.Do(req.WithContext(ctx))
 }
 
+// errNotLoggedIn is bilibili's -101. It is a sentinel because one caller has to
+// read it as an answer rather than a failure: the account check asks "who does
+// this cookie belong to", and "nobody" is a perfectly good reply — reporting it
+// as a network error would send the user to fix their proxy.
+var errNotLoggedIn = errors.New("bilibili: 账号未登录")
+
 // errRegionLocked is bilibili's -10403: the licence for this title does not
 // cover the region the request came from. It is a decision the caller can act
 // on (this season is not watchable from here), unlike every other API failure,
@@ -326,7 +345,7 @@ var errRegionLocked = errors.New("bilibili: 该内容在当前地区不可观看
 func biliError(code int, msg string) error {
 	switch code {
 	case -101:
-		return fmt.Errorf("bilibili: 账号未登录(Cookie 失效或没填)——登录后才能看会员集和高清")
+		return fmt.Errorf("%w(Cookie 失效或没填)——登录后才能看会员集和高清", errNotLoggedIn)
 	case -10403:
 		// Both directions exist: a mainland-only title from a Hong Kong egress
 		// and a 港澳台-only title from a mainland one answer the same code. The
@@ -471,11 +490,30 @@ type pgcDash struct {
 	Audio    []biliRep `json:"audio"`
 }
 
+// biliFormat is one row of the playurl answer's support_formats: bilibili's own
+// name for a rung in the quality menu it would draw. The menu here reads it so
+// the labels match what the viewer knows from bilibili itself (1080P 高码率,
+// 4K 超清 …) rather than an invented table.
+type biliFormat struct {
+	Quality        int    `json:"quality"`
+	NewDescription string `json:"new_description"`
+	Description    string `json:"description"`
+	DisplayDesc    string `json:"display_desc"`
+	NeedVIP        bool   `json:"need_vip"`
+}
+
 type pgcPlayInfo struct {
 	Quality   int      `json:"quality"`
 	IsPreview int      `json:"is_preview"`
 	TimeLen   int64    `json:"timelength"` // ms
 	Dash      *pgcDash `json:"dash"`
+	// AcceptQuality is every rung the API is willing to talk about, and
+	// SupportFormats is the same list with bilibili's labels. Neither is the
+	// ladder that can actually be played: an account without a membership is
+	// told 4K and HDR exist while Dash carries only 480P and 360P. The menu is
+	// built from the representations, and these two only name them.
+	AcceptQuality  []int        `json:"accept_quality"`
+	SupportFormats []biliFormat `json:"support_formats"`
 }
 
 // ---------- virtual tree ----------
@@ -1291,20 +1329,54 @@ func (d *BilibiliDriver) playURL(ctx context.Context, ref biliEpisodeRef, epID i
 	})
 }
 
-// playInfo asks for one episode's streams.
+// playInfo asks for one episode's full ladder.
+//
+// The request always asks for the highest rung (qn=127): the answer then lists
+// every representation the account may have, and the rung to play is chosen
+// from that ladder by pickVideo. Asking for the viewer's rung instead would
+// make the answer for one episode depend on it, which is what made the old
+// library-wide setting impossible to change while watching.
 func (d *BilibiliDriver) playInfo(ctx context.Context, ref biliEpisodeRef, epID int64) (*pgcPlayInfo, error) {
-	raw, err := d.playURL(ctx, ref, epID, d.quality)
+	raw, err := d.playURL(ctx, ref, epID, 0)
 	if err != nil {
-		return nil, err
+		return nil, d.explainRefusal(ctx, err)
 	}
 	var info pgcPlayInfo
 	if err := json.Unmarshal(raw, &info); err != nil {
 		return nil, err
 	}
 	if err := checkPlayInfo(&info, ref.Duration); err != nil {
-		return nil, err
+		return nil, d.explainRefusal(ctx, err)
 	}
 	return &info, nil
+}
+
+// errCookieDead is a refusal that is really "nobody is logged in". It is a
+// sentinel because the two look identical from the playurl answer alone — a
+// 会员 episode without a membership and a 会员 episode without a *session* both
+// come back as is_preview 1 — and only one of them is fixed by paying bilibili.
+var errCookieDead = errors.New("bilibili: Cookie 已失效(账号未登录)")
+
+// explainRefusal re-labels a refusal with the reason it actually has.
+//
+// The playurl answer cannot tell the two apart: an account without a membership
+// and a request without a session both get code 0, is_preview 1 and no DASH. The
+// difference is one nav call, and it is worth making — "这一集需要大会员" sends a
+// paying member to buy a membership they already have, while the real fix is
+// re-logging in. It is asked only when something was already refused, so a
+// playable episode never pays for it.
+func (d *BilibiliDriver) explainRefusal(ctx context.Context, err error) error {
+	if err == nil || errors.Is(err, errRegionLocked) || errors.Is(err, errCookieDead) {
+		return err
+	}
+	acc, aerr := d.Account(ctx)
+	if aerr != nil || acc == nil || acc.LoggedIn {
+		return err
+	}
+	// The old wording is kept as the tail so nothing is lost, but the reason
+	// leads: the viewer's next action is to log in again, not to buy anything.
+	return fmt.Errorf("%w: %s —— 登录后这一集就能正常播放,不需要重新开通大会员",
+		errCookieDead, strings.TrimPrefix(err.Error(), "bilibili: "))
 }
 
 // probeEpisode picks the entry a region check asks playurl about: the first
@@ -1532,6 +1604,138 @@ func (r biliRep) isHDR() bool {
 		strings.HasPrefix(c, "dva1") || strings.HasPrefix(c, "dvav")
 }
 
+// ---------- quality ladder ----------
+
+// SetQuality selects a rung for the calls that follow. 0 is automatic: the
+// highest SDR rung the account has.
+func (d *BilibiliDriver) SetQuality(qn int) {
+	if qn < 0 {
+		qn = 0
+	}
+	d.quality = qn
+}
+
+// Quality reports the preference (0 = automatic).
+func (d *BilibiliDriver) Quality() int { return d.quality }
+
+// SelectedQuality reports the rung the last resolved stream used. It is 0
+// until an episode's ladder has been read.
+func (d *BilibiliDriver) SelectedQuality() int { return d.selected }
+
+// biliQualityLabels are bilibili's own names for the ladder's rungs, used when
+// the answer carries no support_formats (a proxy or an older API shape may drop
+// them) and to give the menu a compact name the control bar can hold.
+var biliQualityLabels = map[int]string{
+	127: "8K 超高清", 126: "杜比视界", 125: "HDR 真彩", 120: "4K 超清",
+	116: "1080P60 高帧率", 112: "1080P 高码率", 80: "1080P 高清",
+	74: "720P60 高帧率", 64: "720P 高清", 32: "480P 清晰",
+	16: "360P 流畅", 6: "240P 极速",
+}
+
+var biliQualityShorts = map[int]string{
+	127: "8K", 126: "杜比", 125: "HDR", 120: "4K",
+	116: "1080P60", 112: "1080P+", 80: "1080P",
+	74: "720P60", 64: "720P", 32: "480P", 16: "360P", 6: "240P",
+}
+
+func biliQualityName(qn int) string {
+	if n, ok := biliQualityLabels[qn]; ok {
+		return n
+	}
+	return fmt.Sprintf("Q%d", qn)
+}
+
+func biliQualityShort(qn int) string {
+	if n, ok := biliQualityShorts[qn]; ok {
+		return n
+	}
+	return fmt.Sprintf("Q%d", qn)
+}
+
+// Qualities lists the rungs one episode can actually be played at, best first.
+//
+// The list is built from the DASH representations, not from accept_quality: the
+// API names rungs the account is not entitled to (an anonymous cookie is told
+// HDR and 4K exist while its ladder holds only 360P and 480P), and a menu entry
+// that cannot be played is worse than no entry. HDR / Dolby Vision rungs are
+// left out as well: a plain stream copy of them is the wrong picture (see
+// isHDR), so they are never a choice a viewer should be offered.
+func (d *BilibiliDriver) Qualities(ctx context.Context, path string) ([]Quality, error) {
+	epID, ok := episodeIDFromPath(path)
+	if !ok {
+		return nil, fmt.Errorf("bilibili: 不是可播放的剧集路径: %s", path)
+	}
+	ref, err := d.episode(ctx, epID)
+	if err != nil {
+		return nil, err
+	}
+	info, err := d.playInfo(ctx, ref, epID)
+	if err != nil {
+		return nil, err
+	}
+	if info.Dash == nil {
+		return nil, nil
+	}
+	// The rung the stream will really use, decided by the same chooser Parts()
+	// goes through, so the menu and the picture cannot disagree.
+	if _, ok := d.pickVideo(info.Dash.Video); !ok {
+		d.selected = 0
+	}
+
+	formats := make(map[int]biliFormat, len(info.SupportFormats))
+	for _, f := range info.SupportFormats {
+		formats[f.Quality] = f
+	}
+
+	// One entry per rung, with the largest picture any codec offers there.
+	type rung struct {
+		width, height int
+		sdr           bool
+	}
+	seen := make(map[int]*rung, len(info.Dash.Video))
+	var ids []int
+	for _, r := range info.Dash.Video {
+		if repURL(r) == "" {
+			continue
+		}
+		g := seen[r.ID]
+		if g == nil {
+			g = &rung{}
+			seen[r.ID] = g
+			ids = append(ids, r.ID)
+		}
+		if r.Width > g.width {
+			g.width = r.Width
+		}
+		if r.Height > g.height {
+			g.height = r.Height
+		}
+		if !r.isHDR() {
+			g.sdr = true
+		}
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(ids)))
+
+	out := make([]Quality, 0, len(ids))
+	for _, id := range ids {
+		g := seen[id]
+		if !g.sdr {
+			continue
+		}
+		label := biliQualityName(id)
+		if f, ok := formats[id]; ok {
+			if n := strings.TrimSpace(f.NewDescription); n != "" {
+				label = n
+			}
+		}
+		out = append(out, Quality{
+			ID: id, Label: label, Short: biliQualityShort(id),
+			Width: g.width, Height: g.height,
+		})
+	}
+	return out, nil
+}
+
 // pickVideo chooses one representation: the configured codec when the account
 // has it, an SDR one rather than an HDR/Dolby Vision one, and within that the
 // highest quality and the heaviest variant.
@@ -1543,6 +1747,10 @@ func (r biliRep) isHDR() bool {
 // with the wrong luminance and colours. A configured codec is a statement about
 // what the viewer's machine can decode, so it now wins over a higher rung; if
 // the account has no stream in that codec the ladder is used as before.
+//
+// A rung the player picked comes before all of that: the viewer asked for it by
+// name, so the codec preference is applied within that rung (and only within it)
+// instead of being allowed to move the picture to another one.
 func (d *BilibiliDriver) pickVideo(reps []biliRep) (biliRep, bool) {
 	cands := make([]biliRep, 0, len(reps))
 	for _, r := range reps {
@@ -1551,7 +1759,21 @@ func (d *BilibiliDriver) pickVideo(reps []biliRep) (biliRep, bool) {
 		}
 	}
 	if len(cands) == 0 {
+		d.selected = 0
 		return biliRep{}, false
+	}
+
+	// 0. The rung the viewer chose, when the ladder offers it.
+	if d.quality > 0 {
+		var atRung []biliRep
+		for _, r := range cands {
+			if r.ID == d.quality {
+				atRung = append(atRung, r)
+			}
+		}
+		if len(atRung) > 0 {
+			cands = atRung
+		}
 	}
 
 	// 1. The configured codec, when the ladder actually offers it.
@@ -1585,6 +1807,7 @@ func (d *BilibiliDriver) pickVideo(reps []biliRep) (biliRep, bool) {
 			best = r
 		}
 	}
+	d.selected = best.ID
 	return best, true
 }
 

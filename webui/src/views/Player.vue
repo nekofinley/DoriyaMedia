@@ -177,6 +177,71 @@ const probeElapsed = ref(0)    // seconds the background probe has been running
 const stallSeconds = ref(0)    // seconds spent waiting on data mid-playback
 const streamStatus = ref(null) // segment-generation progress from the server
 
+/* --------------------------------------------------------------- 清晰度
+ *
+ * A bilibili episode carries several picture rungs. The source no longer fixes
+ * one in the library settings: the player asks for the rung it wants with each
+ * decision (and with every HLS request after it), and a source without a ladder
+ * has nothing to choose from. The preference is kept in this browser, like the
+ * volume and the subtitle language, because a viewing habit sticks.
+ */
+function qualityStored() {
+  const n = Number(localStorage.getItem('dm:quality'))
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+const qualityPref = ref(qualityStored())
+const qMenuOpen = ref(false)
+const qualityBusy = ref(false)
+// switchAt: while a quality change catches up, the file position the viewer
+// should continue from. A bilibili episode can only be packaged from the start
+// (its picture and sound seek independently), so the new stream begins at 0 and
+// the player waits for the server to reach this point instead of replaying the
+// opening at the audience.
+const switchAt = ref(0)
+const switchLabel = ref('')
+// True when switchAt is a saved position being restored (not a quality change).
+// The two share the hold/seek machinery, but the wording must not call a resume
+// a switch.
+const switchIsResume = ref(false)
+// Whether playback should resume by itself once a switch has caught up. A
+// viewer who switched while paused expects the new rung at the same frame, not
+// a picture that starts moving on its own.
+let switchAutoPlay = true
+// Whether the saved position has been looked at for this playback. A quality
+// switch restores the position itself, and hls.js re-attaches the media (firing
+// another loadedmetadata) after a seek; fetching progress on every attach can
+// apply an old position in the middle of playback — which then also becomes the
+// target a switch starts from. Once per decision is enough.
+let progressChecked = false
+// Whether a completed session has been asked to reload its playlist. hls.js
+// keeps the level details it parsed while the playlist was live; a paused player
+// does not refresh them by itself, so the element never learns the VOD duration
+// and a seek is clamped. startLoad() fetches the details again (now ended).
+let resumeReloaded = false
+// The packaging job this playback belongs to, as the decision named it. The
+// status endpoint reports one job per file; while a switch is catching up the
+// abandoned rung may still be alive and further ahead, so its progress must not
+// answer for the new stream.
+const expectedVariant = ref('')
+
+const qualities = computed(() => play.value?.qualities || [])
+const effectiveQuality = computed(() => Number(play.value?.quality) || 0)
+const qualityLabel = computed(() => {
+  const q = qualities.value.find((x) => x.id === effectiveQuality.value)
+  return q?.short || q?.label || ''
+})
+const qualityFullLabel = computed(() => {
+  const q = qualities.value.find((x) => x.id === effectiveQuality.value)
+  return q?.label || q?.short || ''
+})
+/** The bar shows the rung in use, and during a switch the one being fetched. */
+const qualityButtonLabel = computed(() => {
+  if (switchAt.value && switchLabel.value) return switchLabel.value
+  return qualityLabel.value || '清晰度'
+})
+
+watch(qualityPref, (v) => localStorage.setItem('dm:quality', String(v || 0)))
+
 const isIOS = computed(() => {
   const ua = navigator.userAgent
   return /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && 'ontouchend' in document)
@@ -208,6 +273,7 @@ function onViewport() {
   menuOpen.value = false
   dmMenuOpen.value = false
   epMenuOpen.value = false
+  qMenuOpen.value = false
 }
 
 const touchOnly = (() => {
@@ -243,7 +309,8 @@ const theaterChrome = computed(() => !isStacked.value || fsActive.value)
  * text below instead. */
 const stageBar = computed(() => theaterChrome.value || layout.value === 'phone')
 const chromeHidden = computed(() => theaterChrome.value && !controlsVisible.value &&
-  isPlaying.value && !menuOpen.value && !dmMenuOpen.value && !epMenuOpen.value && !panelOpen.value)
+  isPlaying.value && !menuOpen.value && !dmMenuOpen.value && !epMenuOpen.value &&
+  !qMenuOpen.value && !panelOpen.value)
 
 const modeClass = computed(() => `mode-${play.value?.mode || 'direct'}`)
 const MODE_LABELS = { direct: '302 直连', proxy: '代理播放', remux: 'HLS 转封装', unsupported: '无法播放' }
@@ -267,7 +334,10 @@ const streamNeeded = 12
 const streamPct = computed(() => {
   const s = streamStatus.value
   if (!s || !s.generated_seconds) return 0
-  return Math.min(100, (s.generated_seconds / streamNeeded) * 100)
+  // A quality switch has a definite target — where the viewer was — so the bar
+  // measures against that rather than against the few seconds a start needs.
+  const need = switchAt.value > 0 ? Math.max(switchAt.value, 1) : streamNeeded
+  return Math.min(100, (s.generated_seconds / need) * 100)
 })
 
 /** Timeline seconds per wall second: below 1 the server cannot keep up. */
@@ -285,6 +355,22 @@ const encoderTooSlow = computed(() => {
 const loadingText = computed(() => {
   if (play.value?.state === 'probing') {
     return `正在探测媒体信息(容器 / 编码 / 音轨)… ${probeElapsed.value.toFixed(0)}s`
+  }
+  if (switchAt.value > 0) {
+    const got = Math.max(0, Number(streamStatus.value?.generated_seconds) || 0)
+    const label = switchIsResume.value
+      ? `回到 ${fmtTime(switchAt.value)}`
+      : (switchLabel.value ? `切换到 ${switchLabel.value}` : '切换清晰度')
+    // Past the viewer's position the number stops meaning progress towards
+    // anything: the client is waiting for the end marker that makes the new
+    // playlist seekable (see warmSession).
+    if (got >= switchAt.value) return `正在${label} · 正在重新封装…`
+    return `正在${label} · 已生成 ${fmtTime(got)} / ${fmtTime(switchAt.value)}`
+  }
+  if (resumeAt.value > 0 && play.value?.stream_variant) {
+    const got = Math.max(0, Number(streamStatus.value?.generated_seconds) || 0)
+    if (streamStatus.value?.complete) return `正在回到 ${fmtTime(resumeAt.value)}…`
+    return `正在生成到 ${fmtTime(resumeAt.value)} · 已就绪 ${fmtTime(got)}`
   }
   const s = streamStatus.value
   if (s && s.generated_seconds > 0) {
@@ -412,12 +498,13 @@ const overview = computed(() => {
  * the subtitles in fullscreen produced the whole settings sheet — which is the
  * thing this separates. On a watch page the two are still one tab, in order. */
 function openPanel(mode) {
-  if (panelInline.value) { tab.value = 'settings'; menuOpen.value = false; dmMenuOpen.value = false; epMenuOpen.value = false; return }
+  if (panelInline.value) { tab.value = 'settings'; menuOpen.value = false; dmMenuOpen.value = false; epMenuOpen.value = false; qMenuOpen.value = false; return }
   if (panelOpen.value && panelMode.value === mode) { panelOpen.value = false; return }
   panelMode.value = mode
   menuOpen.value = false
   dmMenuOpen.value = false
   epMenuOpen.value = false
+  qMenuOpen.value = false
   panelOpen.value = true
 }
 /** 'all' where the panel is a watch-page tab, otherwise the face that was asked for. */
@@ -434,6 +521,7 @@ function togglePanel() { openPanel('settings') }
 function toggleMenu() {
   dmMenuOpen.value = false
   epMenuOpen.value = false
+  qMenuOpen.value = false
   if (panelInline.value) { tab.value = 'settings'; return }
   if (touchOnly) { openPanel('settings'); return }
   menuOpen.value = !menuOpen.value
@@ -467,6 +555,11 @@ async function loadDecision(force, at) {
   error.value = ''
   fatal.value = ''
   isLoading.value = true
+  // A fresh decision starts a fresh stream, so the saved position is looked at
+  // again — except for a quality switch, which carries the viewer's position in
+  // switchAt and must not have it overwritten by the progress saved a moment ago.
+  if (switchAt.value === 0) progressChecked = false
+  resumeReloaded = false
   forceMode.value = force || ''
   stopProbePoll()
   try {
@@ -480,6 +573,18 @@ async function loadDecision(force, at) {
   // resume position). Everything the UI and the API show is file time, so this is
   // the offset between the element's clock and the file's.
   streamStart.value = Number(play.value?.stream_start) || 0
+  expectedVariant.value = String(play.value?.stream_variant || '')
+  // A switch clears what the previous rung's packager had produced: until a
+  // status for the new variant arrives, the wait must not be measured against
+  // the abandoned job.
+  if (switchAt.value > 0) streamStatus.value = null
+  // A stored rung that this episode does not have is not an error: the server
+  // falls back to automatic and says which rung it used. Drop the preference so
+  // the menu agrees with the picture instead of marking a choice that cannot play.
+  const rungs = play.value?.qualities || []
+  if (qualityPref.value > 0 && rungs.length && !rungs.some((q) => q.id === qualityPref.value)) {
+    qualityPref.value = 0
+  }
   // The episode list does not depend on the decision, so ask for it in parallel
   // with the (slow) probe rather than after it.
   loadQueue()
@@ -488,8 +593,66 @@ async function loadDecision(force, at) {
     startProbePoll()
     return
   }
+  // A quality switch is a new packaging job that starts at 0. Attaching the
+  // player now would show the opening, and a seek past the few segments hls.js
+  // has read is clamped to them. Start the job with a plain playlist request and
+  // wait for it to pass the viewer's position first; the playlist hls.js then
+  // reads already contains the target.
+  if (switchAt.value > 0 && play.value?.stream_variant) {
+    await warmSession(play.value.url, switchAt.value)
+  }
   await nextTick()
   attachSource()
+}
+
+/**
+ * Start a switched stream's packaging without attaching the element, and wait
+ * until the episode has been fully packaged.
+ *
+ * Why the whole episode and not just the viewer's position: while ffmpeg is still
+ * writing, the session's playlist is an EVENT (live) playlist, and hls.js starts
+ * a live playlist at its first fragment and undoes a seek into the not-yet-VOD
+ * part — the picture restarts at 0 however far it had been warmed. The ENDLIST
+ * marker makes it a VOD playlist, which hls.js seeks honestly. Remuxing a bilibili
+ * episode copies the streams, so this is seconds, not minutes, and the loading
+ * text shows the generated timeline meanwhile.
+ *
+ * Progress is read for this stream only (`variant`), because the abandoned rung's
+ * packager is still alive and is usually further ahead.
+ *
+ * Best effort: a timeout attaches anyway and lets the normal waiting logic take
+ * over.
+ */
+async function warmSession(url, target) {
+  if (!url || !target || !expectedVariant.value) return
+  let started = false
+  try {
+    const res = await fetch(url, { credentials: 'same-origin' })
+    started = res.ok
+  } catch { /* the poll will report nothing; attach and let normal handling run */ }
+  if (!started || disposed) return
+  const query = `?variant=${encodeURIComponent(expectedVariant.value)}`
+  const deadline = Date.now() + 90000
+  let sawSession = false
+  while (!disposed && Date.now() < deadline) {
+    let st = null
+    try { st = await api.get(`/api/play/${route.params.fileId}/status${query}`) } catch { /* transient */ }
+    if (disposed) return
+    if (st && st.stream) {
+      sawSession = true
+      streamStatus.value = st.stream
+      const generated = Number(st.stream.generated_seconds) || 0
+      // The end marker is the VOD signal (see Complete in the server): the
+      // process exiting a moment later is not what hls.js needs.
+      if (st.stream.complete && generated >= target) return
+    } else if (sawSession) {
+      // The job finished and its cache was torn down (caching disabled): there is
+      // no session left to warm, so attaching will start a new one. Waiting for
+      // one that will never appear only delays the picture.
+      return
+    }
+    await new Promise((r) => setTimeout(r, 600))
+  }
 }
 
 /**
@@ -551,6 +714,9 @@ function fetchPlay(at) {
   if (burnSub.value) params.set('burn', String(burnSub.value))
   if (currentAudio.value) params.set('a', String(currentAudio.value))
   if (clientCaps) params.set('caps', clientCaps)
+  // The rung the viewer picked (0 = automatic, which is what leaving it out
+  // means). Only a source with a ladder notices it.
+  if (qualityPref.value > 0) params.set('q', String(qualityPref.value))
   // An explicit seek position, in file seconds. The server answers with the session
   // boundary it snapped to (stream_start), so the element's clock stays aligned.
   if (at > 0) params.set('at', String(Math.floor(at)))
@@ -629,10 +795,24 @@ function startStreamPoll() {
     // The probe poller already owns the endpoint while a probe is running.
     if (play.value?.state !== 'probing') {
       let st = null
-      try { st = await api.get(`/api/play/${route.params.fileId}/status`) } catch { /* transient */ }
+      const q = expectedVariant.value ? `?variant=${encodeURIComponent(expectedVariant.value)}` : ''
+      try { st = await api.get(`/api/play/${route.params.fileId}/status${q}`) } catch { /* transient */ }
       if (disposed) return
-      if (st && st.stream) streamStatus.value = st.stream
-      else if (st && !st.stream && !isLoading.value) streamStatus.value = null
+      if (st && st.stream) {
+        // While a quality change is catching up the previous rung's packager is
+        // still alive, and it is probably further ahead. Its progress describes
+        // a stream this player is no longer on.
+        const want = expectedVariant.value
+        if (!want || !st.stream.variant || st.stream.variant === want) {
+          streamStatus.value = st.stream
+        }
+      } else if (st && !st.stream && !isLoading.value) {
+        streamStatus.value = null
+      }
+      // A quality change (or a saved position) can be waiting for the packaging
+      // to reach a point. The poll is the only clock that keeps running while
+      // the picture is paused for that wait, so the jump happens from here.
+      maybeResume()
     }
     streamTimer = setTimeout(tick, isLoading.value ? 1200 : 5000)
   }
@@ -670,6 +850,12 @@ function onWaiting() {
 }
 
 function onPlaying() {
+  // A quality switch, or a resume into a still-packaging session, pauses the
+  // picture while the new stream catches up: whatever the element reports, the
+  // viewer is not watching yet. The pending v.play() from startCand can fire
+  // after the metadata handler paused it, so the hold is enforced here too. A
+  // resume on an ordinary file keeps playing from the start while it waits.
+  if (holdForSession()) { videoEl.value?.pause(); return }
   isLoading.value = false
   clearStall()
 }
@@ -681,8 +867,20 @@ function onPlaying() {
 function onCanPlay() {
   const v = videoEl.value
   if (!v || v.readyState < 3) return
+  if (holdForSession()) { v.pause(); return }
   isLoading.value = false
   clearStall()
+}
+
+/**
+ * The picture is being held for a position the stream cannot reach yet: a quality
+ * switch, or a saved position inside a bilibili session that is still packaging.
+ * Those playlists are live until their end marker, and hls.js starts a live one at
+ * its first fragment; the hold keeps the opening from being played at the viewer
+ * while the wait runs.
+ */
+function holdForSession() {
+  return switchAt.value > 0 || (resumeAt.value > 0 && !!play.value?.stream_variant)
 }
 
 /** Has the playhead advanced in the last moment? The events lie; the clock does not. */
@@ -698,6 +896,7 @@ function markPlaying() {
   const advanced = Math.abs(t - tickAt) > 0.002
   tickAt = t
   if (v.paused || !advanced || !(t > 0)) return
+  if (holdForSession()) return
   tickMovedAt = Date.now()
   isLoading.value = false
   clearStall()
@@ -807,7 +1006,12 @@ async function startCand(i) {
       if (!HlsLib) HlsLib = (await import('hls.js')).default
       const Hls = HlsLib
       if (Hls.isSupported()) {
-        hls.value = new Hls({
+        // A quality switch starts a fresh packaging job at 0, and the session is
+        // warmed only up to the viewer's position. Tell hls.js where to begin: a
+        // bare seek on a still-growing EVENT playlist is treated as live and
+        // reset to the start; startPosition loads the target fragment directly.
+        const startPos = switchAt.value > 0 ? Math.max(0, switchAt.value - streamStart.value) : -1
+        const hlsConfig = {
           maxBufferLength: 30,
           manifestLoadingTimeOut: 30000,
           manifestLoadingMaxRetry: 4,
@@ -816,7 +1020,20 @@ async function startCand(i) {
           fragLoadingMaxRetry: 8,
           fragLoadingRetryDelay: 1000,
           nudgeMaxRetry: 10,
-        })
+        }
+        if (startPos > 0) {
+          // Do not let hls.js start loading at 0: by the time the manifest is
+          // parsed the session exists, and startLoad(position) makes it load the
+          // target fragment as its very first one. The growing EVENT playlist
+          // otherwise resets a bare seek to the beginning.
+          hlsConfig.autoStartLoad = false
+        }
+        hls.value = new Hls(hlsConfig)
+        if (startPos > 0) {
+          hls.value.on(Hls.Events.MANIFEST_PARSED, () => {
+            try { hls.value?.startLoad(startPos) } catch { /* the normal error path reports it */ }
+          })
+        }
         hls.value.loadSource(src)
         hls.value.attachMedia(v)
         hls.value.on(Hls.Events.ERROR, onHlsError)
@@ -974,11 +1191,72 @@ function reachable() {
   return reach
 }
 
+/**
+ * Move to a position the stream has now packaged: a saved resume, or the point
+ * a 清晰度 switch was waiting for.
+ *
+ * A bilibili episode can only be packaged from the start (its picture and sound
+ * seek independently), so a quality change starts the new rung at zero and the
+ * player has to wait for production to pass the viewer's position. While that
+ * happens the element is paused; this is called from the stream poll, which is
+ * the only clock still running.
+ */
+function maybeResume() {
+  const v = videoEl.value
+  const target = switchAt.value || resumeAt.value
+  if (!v || !target || !candMeta) return
+  if (v.readyState < 2) return
+  const switching = switchAt.value > 0
+  // A resume into a bilibili session that is still packaging has the same live
+  // playlist problem as a switch: hls.js will not seek into it until the end
+  // marker turns it into VOD. Wait for the packager to finish (the poll keeps
+  // this running), then the seek is exact.
+  if (!switching && play.value?.stream_variant) {
+    const st = streamStatus.value
+    if (!st || !st.complete) return
+  }
+  if (play.value?.stream_variant && target > v.currentTime + streamStart.value + 0.5) {
+    // The playlist is VOD now, but the element learns the whole duration only
+    // after hls.js parses it. Seeking before that clamps the target to the few
+    // seconds it has buffered, and the picture starts there instead.
+    const dur = Number(v.duration)
+    if (!isFinite(dur) || dur + streamStart.value < target) {
+      // The details hls.js holds were parsed while the playlist was live, and a
+      // paused element never refreshes them. Re-attach once: the ended playlist
+      // is then read from scratch as VOD (with the target as its start position),
+      // which is exactly the quality-switch path.
+      if (!resumeReloaded) {
+        resumeReloaded = true
+        if (!switching) {
+          switchAt.value = target
+          switchIsResume.value = true
+          switchLabel.value = ''
+          resumeAt.value = 0
+          switchAutoPlay = true
+          isLoading.value = true
+          attachSource()
+        }
+      }
+      return
+    }
+  }
+  if (target > reachable()) return
+  const wasResumeSwitch = switchIsResume.value
+  const label = switchLabel.value
+  switchAt.value = 0
+  switchLabel.value = ''
+  switchIsResume.value = false
+  resumeAt.value = 0
+  v.currentTime = Math.max(0, target - streamStart.value)
+  position.value = target
+  isLoading.value = false
+  if (!switching || switchAutoPlay) v.play().catch(() => {})
+  toast.info(switching && label && !wasResumeSwitch
+    ? `已切换到 ${label},从 ${fmtTime(target)} 继续`
+    : `已从 ${fmtTime(target)} 继续播放`)
+}
+
 function onLoadedMetadata() {
-  // Metadata is not "ready": a stream still waiting for its first segments keeps
-  // its loading state (and its bar) until there is enough to play, or until
-  // frames actually move.
-  if (videoEl.value && videoEl.value.readyState >= 3) isLoading.value = false
   candMeta = true
   const v = videoEl.value
   // Everything here is reported in *file* time. A packaged session begins where
@@ -986,22 +1264,62 @@ function onLoadedMetadata() {
   // at zero (hls.js re-aligns it), so the element's own clock is offset from the
   // file by streamStart.
   applyDuration()
-  position.value = (Number(v.currentTime) || 0) + streamStart.value
+  const switchTo = switchAt.value
+  position.value = switchTo > 0 ? switchTo : (Number(v.currentTime) || 0) + streamStart.value
   // Subtitles come on by themselves; the panel is there to change or turn them off.
   autoSelectSub()
+
+  // A quality switch is a new packaging job that begins at the start of the file,
+  // however far the viewer was. Hold the picture at 0 and show the wait rather
+  // than replaying the opening; the stream poll moves the playhead once the
+  // packager has reached the viewer's position.
+  if (switchTo > 0) {
+    resumeAt.value = switchTo
+    isLoading.value = true
+    v.pause()
+    // The poll kicks the jump once the element really has the position; seeking
+    // here, before hls.js has processed the playlist, is silently undone.
+    return
+  }
+
+  // Metadata is not "ready": a stream still waiting for its first segments keeps
+  // its loading state (and its bar) until there is enough to play, or until
+  // frames actually move.
+  if (v.readyState >= 3) isLoading.value = false
+
+  // The saved position belongs to the first attach of this playback; a later
+  // metadata (a re-attach after a seek, or the second level hls.js builds) must
+  // not apply it again over a picture that is already playing.
+  if (progressChecked) return
+  progressChecked = true
   api.get(`/api/progress?file_id=${route.params.fileId}`).then((p) => {
     if (!p || !(p.position > 30) || !(p.position < duration.value * 0.95)) return
+    // A quality switch has already restored the viewer to this position (it is
+    // saved before the switch). Applying the same saved progress again would only
+    // queue a second "continue from…" over the picture, and while the new rung is
+    // still settling it could pull the playhead back.
+    if (Math.abs(position.value - p.position) < 3) return
     // A position the stream has not packaged yet cannot be jumped to: the fragments
     // do not exist, so the element stalls with nothing buffered and the playhead
     // appears to wander. Wait for the packaging to reach it instead — it runs many
-    // times faster than playback — and go there the moment it does.
+    // times faster than playback — and go there the moment it does. The wait is
+    // paused, so the opening is not played at a viewer who is resuming.
     if (p.position <= reachable()) {
       v.currentTime = Math.max(0, p.position - streamStart.value)
       position.value = p.position
       toast.info(`已从 ${fmtTime(p.position)} 继续播放`)
     } else {
       resumeAt.value = p.position
+      position.value = p.position
+      // A bilibili session is packaged from the start and its playlist is live
+      // until the end marker; seeking into it now is undone by hls.js. Hold the
+      // picture at 0 until the poll reports the packaging finished, then jump.
+      if (play.value?.stream_variant) {
+        isLoading.value = true
+        v.pause()
+      }
       toast.info(`正在生成到 ${fmtTime(p.position)} 再继续播放…`)
+      maybeResume()
     }
   }).catch(() => {})
 }
@@ -1078,20 +1396,16 @@ function onTimeUpdate() {
   // loading state goes away and stays away until it really stalls.
   markPlaying()
   // The element's clock is relative to the stream; everything the UI and the API
-  // deal in is file time, so the session offset is added on the way out.
-  if (!scrubbing.value) position.value = v.currentTime + streamStart.value
-  if (v.buffered.length) buffered.value = v.buffered.end(v.buffered.length - 1) + streamStart.value
-  // A saved position the stream had not reached yet (see onLoadedMetadata): go
-  // there as soon as there is something to play there.
-  if (resumeAt.value) {
-    if (resumeAt.value <= reachable()) {
-      const at = resumeAt.value
-      resumeAt.value = 0
-      v.currentTime = Math.max(0, at - streamStart.value)
-      position.value = at
-      toast.info(`已从 ${fmtTime(at)} 继续播放`)
-    }
+  // deal in is file time, so the session offset is added on the way out. While a
+  // quality switch holds the picture at 0, the bar shows the position being waited
+  // for; a saved-position resume keeps playing, so its bar follows the playhead.
+  if (!scrubbing.value && !switchAt.value && (!resumeAt.value || !v.paused)) {
+    position.value = v.currentTime + streamStart.value
   }
+  if (v.buffered.length) buffered.value = v.buffered.end(v.buffered.length - 1) + streamStart.value
+  // A saved position or a quality switch the stream had not reached yet (see
+  // onLoadedMetadata and maybeResume): go there as soon as it is packaged.
+  if (resumeAt.value || switchAt.value) maybeResume()
   // A paused picture draws no frames of its own, so a seek while paused has to
   // be painted from here.
   if (v.paused) paintDanmaku()
@@ -1218,10 +1532,10 @@ function toggleDanmaku() {
  *  other popup, because both hang off the same corner of the control bar. */
 function toggleDmMenu() {
   dmMenuOpen.value = !dmMenuOpen.value
-  if (dmMenuOpen.value) { menuOpen.value = false; epMenuOpen.value = false }
+  if (dmMenuOpen.value) { menuOpen.value = false; epMenuOpen.value = false; qMenuOpen.value = false }
 }
 
-/** The 选集 button. The three bar popups are one corner, so only one is open at a
+/** The 选集 button. The bar popups share one corner, so only one is open at a
  *  time; the list scrolls the current episode into view, since a season can be
  *  longer than the popup is tall. */
 function toggleEpMenu() {
@@ -1229,6 +1543,7 @@ function toggleEpMenu() {
   if (!epMenuOpen.value) return
   menuOpen.value = false
   dmMenuOpen.value = false
+  qMenuOpen.value = false
   nextTick(() => {
     epListEl.value?.querySelector('.on')?.scrollIntoView({ block: 'nearest' })
   })
@@ -1285,14 +1600,23 @@ watch(danmakuTypes, () => {
   localStorage.setItem('dm:dmTypes', JSON.stringify(danmakuTypes.value))
 }, { deep: true })
 
-function saveProgress() {  const v = videoEl.value
-  if (!v || !v.duration || !isFinite(v.duration)) return
+function saveProgress() {
+  const v = videoEl.value
+  if (!v) return
+  // While a switch or a resume holds the picture at 0 and waits for packaging,
+  // the element's clock is not where the viewer is — the waiting target is.
+  const waiting = switchAt.value || resumeAt.value
+  const pos = waiting || v.currentTime + streamStart.value
+  const dur = (v.duration && isFinite(v.duration))
+    ? v.duration + streamStart.value
+    : (duration.value || 0)
+  if (!dur || !isFinite(dur)) return
   api.post('/api/progress', {
     file_id: Number(route.params.fileId),
     // File time, not stream time: otherwise resuming a session-packaged playback
     // would save a position measured from where the session happened to begin.
-    position: v.currentTime + streamStart.value,
-    duration: v.duration + streamStart.value,
+    position: pos,
+    duration: dur,
   }).catch(() => {})
 }
 
@@ -1304,13 +1628,110 @@ function selectVersion(v) {
 }
 
 watch(() => route.params.fileId, (nv, ov) => {
-  if (nv && ov && nv !== ov) loadDecision()
+  if (nv && ov && nv !== ov) {
+    // A switch that was catching up belonged to the file being left.
+    switchAt.value = 0
+    switchLabel.value = ''
+    switchIsResume.value = false
+    resumeAt.value = 0
+    switchAutoPlay = true
+    qMenuOpen.value = false
+    loadDecision()
+  }
 })
 
 function selectAudio(i) {
   currentAudio.value = i
   panelOpen.value = false
   loadDecision()
+}
+
+/* --------------------------------------------------------------- 清晰度 switch
+ *
+ * Picking a rung is a reload of the stream, not a toggle: the source hands out
+ * whole ladders and the server packages one of them. The position is the thing
+ * that has to survive, so it is saved first and then restored by the waiting
+ * logic (see switchAt/maybeResume). The old rung keeps playing in the background
+ * until it is replaced, so a failed switch can fall back to it.
+ */
+async function selectQuality(opt) {
+  const want = Number(opt?.id) || 0
+  qMenuOpen.value = false
+  if (qualityBusy.value || want === qualityPref.value) return
+  qualityBusy.value = true
+  // Where the viewer wants to continue: a pending switch or resume wins (the
+  // picture is parked for it), otherwise the element's clock, which is the truth —
+  // `position` is a rendered copy that a throttled timeupdate can leave behind.
+  // A resumeAt while the picture is moving is stale and must not pull the new
+  // stream backwards.
+  const vNow = videoEl.value
+  const at = switchAt.value ||
+    (vNow && vNow.paused ? resumeAt.value : 0) ||
+    (vNow ? vNow.currentTime + streamStart.value : position.value)
+  // The new stream carries its own position (switchAt). The progress saved a
+  // moment ago is the same point, and looking it up again would only compete with
+  // the switch.
+  progressChecked = true
+  const prev = qualityPref.value
+  const canStart = !!play.value?.can_start_at
+  const wasPlaying = !!vNow && !vNow.paused && !vNow.ended
+  switchAutoPlay = wasPlaying
+  switchIsResume.value = false
+  qualityPref.value = want
+  // The old stream is still attached while the new decision is being fetched, and
+  // its buffer would satisfy a resume check: disarm it, or the poll could "restore"
+  // the position on the stream that is about to be replaced (and the real switch
+  // would then have no target left).
+  candMeta = false
+  // The old rung keeps its picture and sound until the new one is ready, but the
+  // overlay is about to cover it — stop it now so the wait is not scored over a
+  // programme that is still playing.
+  videoEl.value?.pause()
+  // A resumeAt while the picture was moving is stale: saving it would store the
+  // wrong position for this switch (and for a reload after it).
+  if (wasPlaying) resumeAt.value = 0
+  saveProgress()
+  switchAt.value = at > 1 ? at : 0
+  switchLabel.value = want ? (opt?.short || opt?.label || '') : '自动'
+  resumeAt.value = switchAt.value
+  // The old stream's progress must not be mistaken for the new one's: a bilibili
+  // episode starts packaging from 0, and the previous rung may already be
+  // minutes ahead.
+  streamStatus.value = null
+  panelOpen.value = false
+  menuOpen.value = false
+  dmMenuOpen.value = false
+  epMenuOpen.value = false
+  toast.info(want
+    ? `正在切换到 ${opt.label || opt.short || '所选清晰度'}…`
+    : '正在切换到自动清晰度…', 2000)
+  try {
+    await loadDecision(forceMode.value, canStart ? at : 0)
+  } finally {
+    qualityBusy.value = false
+    if (fatal.value) {
+      // The new rung could not be started. Put the preference back so the menu
+      // does not claim a quality that is not on screen, and let the old stream's
+      // own bookkeeping (resume checks) run again.
+      qualityPref.value = prev
+      switchAt.value = 0
+      switchLabel.value = ''
+      resumeAt.value = 0
+      progressChecked = false
+      candMeta = true
+    }
+  }
+}
+
+/** The 清晰度 popup: its own button, like 弹幕 and 选集, because changing rung
+ *  mid-episode is a thing a viewer does while watching. */
+function toggleQMenu() {
+  qMenuOpen.value = !qMenuOpen.value
+  if (!qMenuOpen.value) return
+  menuOpen.value = false
+  dmMenuOpen.value = false
+  epMenuOpen.value = false
+  panelOpen.value = false
 }
 
 // Subtitle preference: 'auto' (follow the server's ranking), 'off', or a
@@ -1509,6 +1930,7 @@ function toggleLock() {
     menuOpen.value = false
     dmMenuOpen.value = false
     epMenuOpen.value = false
+    qMenuOpen.value = false
     panelOpen.value = false
     toast.info('已锁定按键,点左侧锁图标解锁', 2600)
   } else {
@@ -1517,12 +1939,21 @@ function toggleLock() {
 }
 
 function togglePlay() {
+  if (switchAt.value) {
+    // The new rung is still being packaged up to the viewer's position.
+    toast.info('正在切换清晰度,请稍等…', 1600)
+    return
+  }
   const v = videoEl.value
   if (!v) return
   if (v.paused) v.play().catch(() => {}); else v.pause()
 }
 
 function seekBy(delta) {
+  if (switchAt.value) {
+    toast.info('正在切换清晰度,请稍等…', 1600)
+    return
+  }
   const v = videoEl.value
   if (!v || !isFinite(v.duration)) return
   v.currentTime = Math.max(0, Math.min(v.duration, v.currentTime + delta))
@@ -1538,6 +1969,11 @@ function pctFromEvent(e) {
 
 function beginScrub(e) {
   if (!duration.value) return
+  if (switchAt.value) {
+    // There is no stream at the target yet, and a drag would fight the wait.
+    toast.info('正在切换清晰度,请稍等…', 1600)
+    return
+  }
   scrubbing.value = true
   scrubTime.value = pctFromEvent(e) * duration.value
   window.addEventListener('pointermove', moveScrub)
@@ -1676,7 +2112,8 @@ function showControls() {
   controlsVisible.value = true
   clearTimeout(hideTimer)
   if (!theaterChrome.value) return   // a page keeps its buttons; only the theater fades
-  if (isPlaying.value && !menuOpen.value && !dmMenuOpen.value && !epMenuOpen.value && !panelOpen.value) {
+  if (isPlaying.value && !menuOpen.value && !dmMenuOpen.value && !epMenuOpen.value &&
+    !qMenuOpen.value && !panelOpen.value) {
     hideTimer = setTimeout(() => { controlsVisible.value = false }, 3200)
   }
 }
@@ -1703,6 +2140,7 @@ function onKey(e) {
     else if (menuOpen.value) menuOpen.value = false
     else if (dmMenuOpen.value) dmMenuOpen.value = false
     else if (epMenuOpen.value) epMenuOpen.value = false
+    else if (qMenuOpen.value) qMenuOpen.value = false
   }
   else if (/^[0-9]$/.test(k) && videoEl.value?.duration) {
     videoEl.value.currentTime = (Number(k) / 10) * videoEl.value.duration
@@ -1721,7 +2159,7 @@ function onKey(e) {
 function consumeFullscreenDrag(e) {
   if (!fsActive.value) return
   const t = e.target
-  if (t instanceof Element && t.closest('.panel, .ctl-menu, .dm-menu, .ep-menu')) return
+  if (t instanceof Element && t.closest('.panel, .ctl-menu, .dm-menu, .ep-menu, .q-menu')) return
   if (e.cancelable) e.preventDefault()
 }
 
@@ -2023,6 +2461,48 @@ onBeforeUnmount(() => {
                 <AppIcon name="subtitles" :size="19" />
               </button>
 
+              <!-- 清晰度: the rung's own name is the button, the way bilibili's
+                   player names it, and the popup is one tap from the picture —
+                   changing quality is a thing a viewer does mid-episode. A file
+                   with one picture (every local source) gets no button. -->
+              <div v-if="qualities.length" class="menu-wrap">
+                <button
+                  class="icon-btn q-btn" :class="{ on: qualityPref > 0 || qMenuOpen }"
+                  :aria-label="`清晰度:${qualityButtonLabel}`"
+                  :title="qualityPref === 0
+                    ? `清晰度:自动${qualityFullLabel ? ' · 当前 ' + qualityFullLabel : ''}`
+                    : `清晰度:${qualityButtonLabel}`"
+                  :aria-expanded="qMenuOpen" @click="toggleQMenu"
+                >
+                  <span>{{ qualityButtonLabel }}</span>
+                </button>
+                <Transition name="fade">
+                  <div v-if="qMenuOpen" class="ctl-menu q-menu" @pointerdown.stop>
+                    <div class="cm-title">清晰度</div>
+                    <button
+                      class="cm-item" :class="{ on: qualityPref === 0 }"
+                      :disabled="qualityBusy" @click="selectQuality({ id: 0, label: '自动' })"
+                    >
+                      <span class="cm-label">自动</span>
+                      <span class="tiny">
+                        {{ qualityLabel ? `当前 ${qualityFullLabel || qualityLabel}` : '最高可用' }}
+                      </span>
+                    </button>
+                    <button
+                      v-for="q in qualities" :key="q.id" class="cm-item"
+                      :class="{ on: qualityPref === q.id }" :disabled="qualityBusy"
+                      @click="selectQuality(q)"
+                    >
+                      <span class="cm-label">{{ q.label || q.short }}</span>
+                      <span class="tiny">
+                        {{ q.width }}×{{ q.height }}<template v-if="q.id === effectiveQuality"> · 当前</template>
+                      </span>
+                    </button>
+                    <div v-if="qualityBusy" class="tiny" style="margin-top:8px">正在切换…</div>
+                  </div>
+                </Transition>
+              </div>
+
               <!-- 弹幕: the switch, and the settings button that opens the panel —
                    two controls, not one. Turning the layer on and off is what a
                    viewer does mid-episode; tuning it is what they do once. They
@@ -2322,6 +2802,23 @@ onBeforeUnmount(() => {
                   >
                     {{ a.codec.toUpperCase() }}{{ a.lang ? ' · ' + a.lang : '' }}{{ a.title ? ' · ' + a.title : '' }}
                   </button>
+                </div>
+              </div>
+
+              <!-- 清晰度: the same ladder the bar's own popup offers, in the full
+                   settings list — a watch page may have the panel open already. -->
+              <div v-if="drawerMode !== 'subs' && qualities.length" class="pn-group">
+                <div class="label">清晰度</div>
+                <div class="pn-chips">
+                  <button
+                    class="chip" :class="{ on: qualityPref === 0 }"
+                    :disabled="qualityBusy" @click="selectQuality({ id: 0, label: '自动' })"
+                  >自动</button>
+                  <button
+                    v-for="q in qualities" :key="q.id" class="chip"
+                    :class="{ on: qualityPref === q.id }"
+                    :disabled="qualityBusy" @click="selectQuality(q)"
+                  >{{ q.label || q.short }}<span v-if="q.id === effectiveQuality" class="tiny"> · 当前</span></button>
                 </div>
               </div>
 
@@ -2774,6 +3271,26 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
   max-height: none;
 }
 
+/* ============================ 清晰度 popup ================================ */
+/* The rung's name is the button, the way bilibili's player names it, so this is
+   a text button rather than one of the bar's square icons. The popup reuses the
+   control bar's menu shape and drops downward on a watch page, like 弹幕. */
+.ctl-row .q-btn {
+  width: auto;
+  min-width: 46px;
+  padding: 0 10px;
+  font-size: var(--fs-12);
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+.q-menu { width: min(260px, calc(100vw - 24px)); }
+.lay-phone:not(.fs) .q-menu, .lay-tablet:not(.fs) .q-menu {
+  top: calc(100% + 8px);
+  bottom: auto;
+  max-height: none;
+}
+
 /* ============================ 选集 popup ================================== */
 /* The season as a list, hung off the 选集 button beside the subtitle one: number,
    name, and the air date or version count when the episode has one. The current
@@ -3103,6 +3620,7 @@ kbd {
 }
 @media (max-width: 620px) {
   .ctl-row .icon-btn { width: 38px; height: 38px; }
+  .ctl-row .q-btn { width: auto; min-width: 40px; padding: 0 7px; font-size: 11px; }
   .time { font-size: var(--fs-12); margin-left: 4px; }
   .big-play { width: 66px; height: 66px; }
 }
