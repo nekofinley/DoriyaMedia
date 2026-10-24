@@ -54,7 +54,11 @@ func TestKeyframeCacheIsKeyedByFileAndPosition(t *testing.T) {
 	e := &Engine{keyCache: map[string]keyframeEntry{}}
 	// A hit short-circuits before any resolution happens: a nil driver and file are
 	// enough to prove the cache answered rather than the probe.
-	e.keyCache["7|120.000"] = keyframeEntry{at1: 110, ok: true, at: time.Now()}
+	e.keyCache["7|120.000"] = keyframeEntry{
+		window: PackWindow{StartSeconds: 110, InputSeekSeconds: 105},
+		ok:     true,
+		at:     time.Now(),
+	}
 
 	key, ok := e.AlignedStart(context.Background(), nil, nil, 120)
 	if ok {

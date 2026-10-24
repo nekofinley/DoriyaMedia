@@ -20,6 +20,10 @@ const stageEl = ref(null)
 const playerEl = ref(null)
 let cueObs = null
 let dmObs = null
+let subSeekGeneration = 0
+let subSeekRaf = 0
+let subSeekTimer = 0
+let subSeekHidden = null // { track, el, subId } while one native track is repainting
 const watchEl = ref(null)
 const hls = ref(null)
 const currentAudio = ref(0)
@@ -974,6 +978,7 @@ function onPlaying() {
   if (holdForSession()) { videoEl.value?.pause(); return }
   isLoading.value = false
   clearStall()
+  kickDanmaku()
 }
 
 // Enough data has arrived to keep playing on its own. This settles the loading
@@ -1126,6 +1131,7 @@ async function startCand(i) {
   // the element began at 0 while the playlist said fragment 2).
   v.removeAttribute('src')
   v.load()
+  cancelSubtitleRestore(false)
   activeSub.value = null
 
   if (c.kind === 'hls') {
@@ -1790,9 +1796,15 @@ function saveProgress() {
   const parked = v.paused || v.readyState < 2
   const waiting = parked ? (switchAt.value || resumeAt.value) : 0
   const pos = waiting || v.currentTime + streamStart.value
-  const dur = (v.duration && isFinite(v.duration))
-    ? v.duration + streamStart.value
-    : (duration.value || 0)
+  // `v.duration` belongs to the growing EVENT playlist, not to the whole file.
+  // Saving it once packaging was 105s ahead wrote 155s for a 1421s episode and
+  // made later resume checks believe 95% had already been watched. The playback
+  // decision's probe duration is canonical; fall back to the measured UI duration
+  // only for a source whose real duration is genuinely unknown.
+  const knownDur = Number(play.value?.duration) || 0
+  const dur = knownDur > 0
+    ? knownDur
+    : Math.max(duration.value || 0, (v.duration && isFinite(v.duration)) ? v.duration + streamStart.value : 0)
   if (!dur || !isFinite(dur)) return
   api.post('/api/progress', {
     file_id: Number(route.params.fileId),
@@ -1931,20 +1943,16 @@ function findSubTrack(sub) {
 }
 
 // Subtitle files carry times in *file* time, while the element's clock is
-// relative to a packaged session (see streamStart). Move the cues onto the
-// element's clock, once per track, whenever they arrive.
-function shiftCues(el) {
-  if (!el || el.dataset.cuesShifted === '1' || !streamStart.value) return
-  const t = el.track
-  if (!t || !t.cues || !t.cues.length) return
-  const off = streamStart.value
-  for (const c of t.cues) {
-    try {
-      c.startTime = Math.max(0, c.startTime - off)
-      c.endTime = Math.max(0, c.endTime - off)
-    } catch { /* frozen cue: leave it alone */ }
-  }
-  el.dataset.cuesShifted = '1'
+// relative to a packaged session (see streamStart). Ask the subtitle endpoint
+// to move the cues before the browser parses them. Mutating parsed cues while
+// the track is already showing leaves Chromium's cue renderer in an unreliable
+// state, which showed up as subtitles stuck on an old line after a cached seek.
+function subTrackSrc(sub) {
+  if (!sub?.url) return ''
+  if (!streamStart.value) return sub.url
+  const url = new URL(sub.url, window.location.origin)
+  url.searchParams.set('start', String(streamStart.value))
+  return `${url.pathname}${url.search}${url.hash}`
 }
 
 // Cue placement is a percentage of the *element*, but the picture inside it may be
@@ -1969,7 +1977,8 @@ function fitCuesToPicture() {
       if (typeof c.line !== 'number') continue
       if (c.dmLine === undefined) c.dmLine = c.line
       try {
-        c.line = ((top + (c.dmLine / 100) * picH) / box.height) * 100
+        const line = ((top + (c.dmLine / 100) * picH) / box.height) * 100
+        if (Math.abs(c.line - line) > 0.001) c.line = line
       } catch { /* frozen cue: leave it alone */ }
     }
   }
@@ -1981,20 +1990,93 @@ function fitCuesToPicture() {
 function showSub(sub) {
   const v = videoEl.value
   if (!v) return false
-  for (const t of v.textTracks) t.mode = 'disabled'
   if (!sub) {
+    cancelSubtitleRestore(false)
+    for (const t of v.textTracks) t.mode = 'disabled'
     activeSub.value = null
     return true
   }
   const el = findSubTrack(sub)
   if (!el || !el.track) return false
-  el.track.mode = 'showing'
+  cancelSubtitleRestore(false)
+  for (const t of v.textTracks) t.mode = 'disabled'
   // The cues may already be loaded, or may arrive with the track's load event.
-  shiftCues(el)
   fitCuesToPicture()
-  el.addEventListener('load', () => { shiftCues(el); fitCuesToPicture() }, { once: true })
+  el.addEventListener('load', fitCuesToPicture, { once: true })
+  el.track.mode = 'showing'
   activeSub.value = sub
   return true
+}
+
+// A repaint is intentionally short, but it must never leave captions off. A
+// second seek can cancel the pending frames before its own `seeked` arrives, so
+// restore the old track first and let that seek perform a fresh repaint.
+function cancelSubtitleRestore(restoreCurrent) {
+  subSeekGeneration++
+  if (subSeekRaf) cancelAnimationFrame(subSeekRaf)
+  if (subSeekTimer) clearTimeout(subSeekTimer)
+  subSeekRaf = 0
+  subSeekTimer = 0
+  const hidden = subSeekHidden
+  subSeekHidden = null
+  if (!restoreCurrent || !hidden) return
+  if (activeSub.value?.id !== hidden.subId || !hidden.el.isConnected ||
+    hidden.el.track !== hidden.track || hidden.track.mode !== 'hidden') return
+  fitCuesToPicture()
+  hidden.track.mode = 'showing'
+}
+
+// Chromium can keep the last native cue painted after a seek even though the
+// track's activeCues have already changed. Briefly taking the track out of
+// `showing` after `seeked`, then putting it back two frames later, rebuilds
+// that renderer state without touching cue timings or formatting.
+function onSubtitleSeeking() {
+  stopDanmaku()
+  cancelSubtitleRestore(true)
+}
+
+function onSubtitleSeeked() {
+  paintDanmaku()
+  kickDanmaku()
+  const sub = activeSub.value
+  const v = videoEl.value
+  const el = sub && !nativeSubs.value ? findSubTrack(sub) : null
+  const track = el?.track
+  if (!track || v?.seeking) return
+  if (track.mode === 'showing') {
+    track.mode = 'hidden'
+    subSeekHidden = { track, el, subId: sub.id }
+  } else if (subSeekHidden?.track !== track || subSeekHidden?.el !== el ||
+    subSeekHidden?.subId !== sub.id) {
+    return
+  }
+  const generation = ++subSeekGeneration
+  const show = () => {
+    if (disposed || generation !== subSeekGeneration || activeSub.value?.id !== sub.id ||
+      !el.isConnected || el.track !== track || track.mode !== 'hidden') return
+    // A late seek event can leave `seeking` true briefly. Retry instead of
+    // abandoning the track in `hidden` when no later seeked event follows.
+    if (videoEl.value?.seeking) {
+      subSeekTimer = setTimeout(show, 100)
+      return
+    }
+    if (subSeekTimer) clearTimeout(subSeekTimer)
+    if (subSeekRaf) cancelAnimationFrame(subSeekRaf)
+    subSeekTimer = 0
+    subSeekRaf = 0
+    fitCuesToPicture()
+    track.mode = 'showing'
+    subSeekHidden = null
+  }
+  // rAF keeps the repaint frame-aligned, while the timer is the fallback for a
+  // backgrounded tab where animation frames can be suspended indefinitely.
+  subSeekTimer = setTimeout(show, 150)
+  subSeekRaf = requestAnimationFrame(() => {
+    subSeekRaf = requestAnimationFrame(() => {
+      subSeekRaf = 0
+      show()
+    })
+  })
 }
 
 // Burning a text subtitle overlays it on the picture, which is the faithful
@@ -2422,6 +2504,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('touchmove', consumeFullscreenDrag)
   cueObs?.disconnect()
   cueObs = null
+  cancelSubtitleRestore(false)
   dmObs?.disconnect()
   dmObs = null
   window.removeEventListener('pointermove', moveScrub)
@@ -2449,8 +2532,8 @@ onBeforeUnmount(() => {
               @progress="onTimeUpdate"
               @pause="saveProgress(); isPlaying = false; showControls(); stopDanmaku()"
               @play="isPlaying = true; showControls(); kickDanmaku()"
-              @seeking="stopDanmaku()"
-              @seeked="paintDanmaku()"
+              @seeking="onSubtitleSeeking"
+              @seeked="onSubtitleSeeked"
               @waiting="onWaiting"
               @playing="onPlaying"
               @canplay="onCanPlay"
@@ -2461,8 +2544,8 @@ onBeforeUnmount(() => {
             >
               <template v-if="!nativeSubs">
                 <track
-                  v-for="sub in (play?.subtitles || []).filter(s => s.url)" :key="sub.id" kind="subtitles"
-                  :src="sub.url" :label="sub.label || sub.lang || '字幕'"
+                  v-for="sub in (play?.subtitles || []).filter(s => s.url)" :key="`${sub.id}:${streamStart}`" kind="subtitles"
+                  :src="subTrackSrc(sub)" :label="sub.label || sub.lang || '字幕'"
                   :default="!!sub.default"
                 />
               </template>

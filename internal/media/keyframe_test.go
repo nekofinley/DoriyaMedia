@@ -2,6 +2,8 @@ package media
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,10 +12,10 @@ import (
 	"testing"
 )
 
-// A session that starts mid-file copies the video, so ffmpeg rewinds to the last
-// keyframe — while the audio input starts exactly where it was told. Starting on a
-// keyframe is what keeps the two together; starting between them leaves the sound a
-// GOP ahead, permanently. This is the measurement that motivated AlignedStart.
+// A copied video stream can start at the keyframe before the requested PTS even
+// when the request names a keyframe exactly. The independent audio input does not
+// rewind, so a one-stage seek splits the two tracks. A coarse seek to the preceding
+// keyframe plus an output-stage seek for the DTS distance lands both on the target.
 func TestKeyframeAlignmentKeepsAudioWithVideo(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not available")
@@ -33,24 +35,35 @@ func TestKeyframeAlignmentKeepsAudioWithVideo(t *testing.T) {
 		t.Skipf("cannot build the audio fixture: %v", err)
 	}
 
-	// The alignment the packager relies on: the keyframe at or before 21s.
+	// The alignment the packager relies on: target DTS 19.92, with the preceding
+	// keyframe at DTS 17.92 providing the coarse input seek.
 	prober := NewProber("ffprobe")
-	key, err := prober.KeyframeAtOrBefore(context.Background(), video, nil, "", 21, 30)
+	found, err := prober.keyframeWindowAtOrBefore(context.Background(), video, nil, "", 21, 30)
 	if err != nil {
-		t.Fatalf("KeyframeAtOrBefore: %v", err)
+		t.Fatalf("keyframeWindowAtOrBefore: %v", err)
 	}
-	if key != 20 {
-		t.Fatalf("keyframe at or before 21s = %v, want 20", key)
+	if math.Abs(found.pts-20) > 1e-6 {
+		t.Fatalf("target keyframe PTS = %v, want 20", found.pts)
+	}
+	if math.Abs(found.start.StartSeconds-19.92) > 1e-6 ||
+		math.Abs(found.start.InputSeekSeconds-17.92) > 1e-6 {
+		t.Fatalf("seek window = %+v, want coarse 17.92 -> start 19.92", found.start)
 	}
 
-	// Starting there keeps the streams together.
-	aligned := packTwoInputsAt(t, dir, "aligned", video, audio, key)
+	// The first copied packet must be the requested keyframe, not merely close in
+	// timestamp. Timestamp-only assertions miss the video-at-previous-GOP bug.
+	targetHash := keyframePacketHashAtOrBefore(t, video, 21)
+	aligned := packTwoInputsWindow(t, dir, "aligned", video, audio, found.start)
 	if gap := aligned.videoStart - aligned.audioStart; gap > 0.2 || gap < -0.2 {
 		t.Fatalf("starting on the keyframe left a %.3fs gap between picture and sound (v=%v a=%v)",
 			gap, aligned.videoStart, aligned.audioStart)
 	}
+	if aligned.videoHash != targetHash {
+		t.Fatalf("first output video packet = %s, want target keyframe %s", aligned.videoHash, targetHash)
+	}
 
-	// Starting between keyframes does not, which is why the alignment exists.
+	// A one-stage seek at 21s still starts the picture on the previous keyframe
+	// while the sound starts at 21s. This is the regression being prevented.
 	between := packTwoInputsAt(t, dir, "between", video, audio, 21)
 	if gap := between.videoStart - between.audioStart; gap > -0.5 {
 		t.Fatalf("starting at 21s was expected to leave the sound about a GOP late, got a %.3fs gap (v=%v a=%v)",
@@ -60,31 +73,51 @@ func TestKeyframeAlignmentKeepsAudioWithVideo(t *testing.T) {
 
 type streamStarts struct {
 	videoStart, audioStart float64
+	videoHash              string
 }
 
 // packTwoInputsAt runs the packager's command shape for one segment and reports
 // where each stream begins in the output.
 func packTwoInputsAt(t *testing.T, dir, name, video, audio string, at float64) streamStarts {
 	t.Helper()
+	return packTwoInputs(t, dir, name, video, audio, at, 0)
+}
+
+// packTwoInputsWindow runs the two-stage seek the packager now uses.
+func packTwoInputsWindow(t *testing.T, dir, name, video, audio string, window PackWindow) streamStarts {
+	t.Helper()
+	return packTwoInputs(t, dir, name, video, audio, window.InputSeekSeconds,
+		window.StartSeconds-window.InputSeekSeconds)
+}
+
+func packTwoInputs(t *testing.T, dir, name, video, audio string, inputSeek, outputSeek float64) streamStarts {
+	t.Helper()
 	out := filepath.Join(dir, name)
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	ss := "-ss"
-	atArg := ""
-	if at > 0 {
-		atArg = strconv.FormatFloat(at, 'f', 3, 64)
+	inputArg := ""
+	if inputSeek > 0 {
+		inputArg = strconv.FormatFloat(inputSeek, 'f', 3, 64)
+	}
+	outputArg := ""
+	if outputSeek > 0 {
+		outputArg = strconv.FormatFloat(outputSeek, 'f', 3, 64)
 	}
 	args := []string{"-hide_banner", "-loglevel", "error"}
-	if atArg != "" {
-		args = append(args, ss, atArg)
+	if inputArg != "" {
+		args = append(args, ss, inputArg)
 	}
 	args = append(args, "-i", video)
-	if atArg != "" {
-		args = append(args, ss, atArg)
+	if inputArg != "" {
+		args = append(args, ss, inputArg)
 	}
-	args = append(args, "-i", audio,
-		"-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "copy",
+	args = append(args, "-i", audio, "-map", "0:v:0", "-map", "1:a:0")
+	if outputArg != "" {
+		args = append(args, ss, outputArg)
+	}
+	args = append(args, "-c:v", "copy", "-c:a", "copy",
 		"-f", "hls", "-hls_segment_type", "fmp4", "-hls_time", "4",
 		"-hls_playlist_type", "event", "-hls_list_size", "0",
 		"-hls_fmp4_init_filename", "init.mp4",
@@ -116,7 +149,50 @@ func packTwoInputsAt(t *testing.T, dir, name, video, audio string, at float64) s
 	return streamStarts{
 		videoStart: streamStartOf(t, cat, "v:0"),
 		audioStart: streamStartOf(t, cat, "a:0"),
+		videoHash:  firstVideoPacketHash(t, cat),
 	}
+}
+
+func keyframePacketHashAtOrBefore(t *testing.T, path string, pos float64) string {
+	t.Helper()
+	from := math.Max(0, pos-10)
+	out, err := exec.Command("ffprobe", "-v", "error", "-show_data_hash", "md5",
+		"-select_streams", "v:0", "-show_entries", "packet=pts_time,dts_time,flags,data_hash",
+		"-read_intervals", fmt.Sprintf("%.3f%%+20", from), "-of", "csv=p=0", path).Output()
+	if err != nil {
+		t.Fatalf("ffprobe source keyframes: %v", err)
+	}
+	var best string
+	var bestPTS = -1.0
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Split(strings.TrimSpace(line), ",")
+		if len(fields) < 4 || !strings.Contains(fields[2], "K") {
+			continue
+		}
+		pts, err := strconv.ParseFloat(fields[0], 64)
+		if err == nil && pts <= pos && pts > bestPTS {
+			bestPTS, best = pts, fields[3]
+		}
+	}
+	if best == "" {
+		t.Fatalf("no source keyframe at or before %.3fs", pos)
+	}
+	return best
+}
+
+func firstVideoPacketHash(t *testing.T, path string) string {
+	t.Helper()
+	out, err := exec.Command("ffprobe", "-v", "error", "-show_data_hash", "md5",
+		"-select_streams", "v:0", "-show_entries", "packet=pts_time,dts_time,flags,data_hash",
+		"-read_intervals", "%+#1", "-of", "csv=p=0", path).Output()
+	if err != nil {
+		t.Fatalf("ffprobe output packet: %v", err)
+	}
+	fields := strings.Split(strings.TrimSpace(string(out)), ",")
+	if len(fields) < 4 {
+		t.Fatalf("unexpected output packet row %q", out)
+	}
+	return fields[3]
 }
 
 func streamStartOf(t *testing.T, path, stream string) float64 {

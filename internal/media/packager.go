@@ -66,6 +66,13 @@ type PackagerOptions struct {
 	// from a session that began mid-file carry timestamps relative to the
 	// session; Session.ShiftSegment moves them back onto the absolute timeline.
 	StartSeconds float64
+	// InputSeekSeconds is the coarse input-stage seek for a two-input source. Its
+	// picture is copied, so seeking directly to StartSeconds can make ffmpeg pick
+	// the preceding keyframe while the independent audio input starts at
+	// StartSeconds. Both inputs seek to this earlier keyframe instead, and
+	// StartSeconds-InputSeekSeconds is applied again at the output stage so both
+	// tracks cross the target keyframe together. Ignored for a single input.
+	InputSeekSeconds float64
 	// StartSegment is this session's first segment number. ffmpeg writes it as
 	// #EXT-X-MEDIA-SEQUENCE, which keeps segment N meaning "N*SegmentSeconds into
 	// the file" wherever the session started.
@@ -196,6 +203,16 @@ func packagerArgs(o PackagerOptions) ([]string, error) {
 	if multi && o.Burn != nil {
 		return nil, fmt.Errorf("packager: 多流源(DASH)不支持烧录字幕")
 	}
+	inputSeek := o.StartSeconds
+	outputSeek := 0.0
+	if multi && o.StartSeconds > 0 {
+		if o.InputSeekSeconds < 0 || o.InputSeekSeconds >= o.StartSeconds {
+			return nil, fmt.Errorf("packager: invalid two-input seek window %.3f -> %.3f",
+				o.InputSeekSeconds, o.StartSeconds)
+		}
+		inputSeek = o.InputSeekSeconds
+		outputSeek = o.StartSeconds - o.InputSeekSeconds
+	}
 
 	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin"}
 	for _, in := range inputs {
@@ -221,13 +238,18 @@ func packagerArgs(o PackagerOptions) ([]string, error) {
 		}
 		// -ss belongs before -i (input seek): ffmpeg then starts reading near that
 		// position instead of decoding from the beginning. Every input is seeked to
-		// the same point — the parts of a DASH source are independent files, and
-		// seeking only one of them would start the sound somewhere else than the
-		// picture.
-		if o.StartSeconds > 0 {
-			args = append(args, "-ss", strconv.FormatFloat(o.StartSeconds, 'f', 3, 64))
+		// the same point. For two independent DASH inputs this is the preceding
+		// keyframe; outputSeek below advances both streams together from there.
+		if inputSeek > 0 {
+			args = append(args, "-ss", strconv.FormatFloat(inputSeek, 'f', 3, 64))
 		}
 		args = append(args, "-i", target)
+	}
+	if outputSeek > 0 {
+		// Output seeking is the accurate half of the two-input cut. Applying it
+		// after both inputs have been opened makes the video keyframe and its
+		// corresponding audio samples cross the output boundary at the same time.
+		args = append(args, "-ss", strconv.FormatFloat(outputSeek, 'f', 3, 64))
 	}
 
 	// Burning a subtitle means re-encoding the video with it overlaid: a bitmap

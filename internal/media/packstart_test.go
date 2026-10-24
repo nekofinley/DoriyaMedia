@@ -3,6 +3,7 @@ package media
 import (
 	"context"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -76,12 +77,12 @@ func TestPackStartAlignsToTheKeyframe(t *testing.T) {
 	file := &models.MediaFile{ID: 7, SourceID: 1, Path: "/ep.mp4"}
 
 	ctx := context.Background()
-	if got := e.PackStart(ctx, file, drv, 21); got != 20 {
-		t.Fatalf("PackStart at 21s = %v, want the keyframe at 20s", got)
+	if got := e.PackStart(ctx, file, drv, 21); math.Abs(got-19.92) > 1e-6 {
+		t.Fatalf("PackStart at 21s = %v, want the keyframe DTS 19.92", got)
 	}
 	// A position that is already a keyframe is answered with itself.
-	if got := e.PackStart(ctx, file, drv, 20); got != 20 {
-		t.Fatalf("PackStart at a keyframe = %v, want 20", got)
+	if got := e.PackStart(ctx, file, drv, 20); math.Abs(got-19.92) > 1e-6 {
+		t.Fatalf("PackStart at a keyframe = %v, want its DTS 19.92", got)
 	}
 	// Nothing to do at the top: a session there is simply the beginning.
 	if got := e.PackStart(ctx, file, drv, 0); got != 0 {
@@ -124,8 +125,8 @@ func TestPackStartFailsToZeroAndKeepsThatAnswer(t *testing.T) {
 	e.partsMu.Lock()
 	e.partsCache = map[string]partsEntry{}
 	e.partsMu.Unlock()
-	if got := e.PackStart(context.Background(), file, drv, 23); got != 22 {
-		t.Fatalf("PackStart at 23s after the failure = %v, want the keyframe at 22", got)
+	if got := e.PackStart(context.Background(), file, drv, 23); math.Abs(got-21.92) > 1e-6 {
+		t.Fatalf("PackStart at 23s after the failure = %v, want the keyframe DTS 21.92", got)
 	}
 }
 
@@ -154,7 +155,7 @@ func TestPackStartAgreesAcrossResolutions(t *testing.T) {
 		t.Fatalf("stream_start %v but packaging from %v: the element's clock would be off by that much",
 			reported, packaged)
 	}
-	if reported != 20 {
-		t.Fatalf("both callers must answer with the keyframe at 20s, got %v", reported)
+	if math.Abs(reported-19.92) > 1e-6 {
+		t.Fatalf("both callers must answer with the keyframe DTS 19.92, got %v", reported)
 	}
 }

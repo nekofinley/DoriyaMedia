@@ -227,8 +227,70 @@ func TestPackagerArgsWriteSegmentsAtomically(t *testing.T) {
 	}
 }
 
+// Two independent inputs need both seek stages. A single input-stage seek can
+// start copied video on the preceding keyframe while audio starts at the target,
+// which is a permanent five-second split on bilibili DASH sources.
+func TestPackagerArgsUsesCoarseAndPreciseSeekForTwoInputs(t *testing.T) {
+	args, err := packagerArgs(PackagerOptions{
+		Inputs: []Input{
+			{Target: "/tmp/video.m4s"},
+			{Target: "/tmp/audio.m4s"},
+		},
+		VideoMode:        "copy",
+		AudioMode:        "copy",
+		StartSeconds:     49.917,
+		InputSeekSeconds: 44.912,
+		Dir:              "/tmp/out",
+	})
+	if err != nil {
+		t.Fatalf("packagerArgs: %v", err)
+	}
+
+	var seeks []string
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-ss" {
+			seeks = append(seeks, args[i+1])
+		}
+	}
+	want := []string{"44.912", "44.912", "5.005"}
+	if len(seeks) != len(want) {
+		t.Fatalf("seek arguments = %v, want %v (args: %v)", seeks, want, args)
+	}
+	for i := range want {
+		if seeks[i] != want[i] {
+			t.Fatalf("seek arguments = %v, want %v", seeks, want)
+		}
+	}
+}
+
+// Ordinary one-input files keep their old one-stage input seek. Adding an output
+// seek there would change their established segment boundaries and is unnecessary:
+// picture and sound share one input.
+func TestPackagerArgsKeepSingleInputSeekOneStage(t *testing.T) {
+	args, err := packagerArgs(PackagerOptions{
+		Target: "/tmp/input.mkv", VideoIndex: 0, AudioOrdinal: 0,
+		VideoMode: "copy", AudioMode: "copy", StartSeconds: 128, Dir: "/tmp/out",
+	})
+	if err != nil {
+		t.Fatalf("packagerArgs: %v", err)
+	}
+	seeks := 0
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-ss" {
+			seeks++
+			if args[i+1] != "128.000" {
+				t.Fatalf("single-input seek = %s, want 128.000", args[i+1])
+			}
+		}
+	}
+	if seeks != 1 {
+		t.Fatalf("single input has %d seeks, want 1 (args: %v)", seeks, args)
+	}
+}
+
 func containsPair(args []string, a, b string) bool {
-	for i := 0; i+1 < len(args); i++ {		if args[i] == a && args[i+1] == b {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == a && args[i+1] == b {
 			return true
 		}
 	}
