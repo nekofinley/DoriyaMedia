@@ -114,10 +114,30 @@ const danmakuTypes = ref(dmStoredTypes())
  *  would otherwise reach above the first lane, so the renderer gives every lane
  *  a small top margin as well (see TOP_PAD_RATIO in danmaku.js). */
 const danmakuStroke = ref(localStorage.getItem('dm:dmStroke') !== '0')
+/* Subtitle text is drawn by the browser's cue renderer, so its outline is a
+ * global CSS rule keyed off this setting (see styles.css). These are discrete
+ * widths rather than a free-form CSS value: every choice must stay readable and
+ * predictable across browsers. The value is a personal viewing preference, like
+ * the subtitle language, and lives in this browser. */
+const SUBTITLE_OUTLINES = [
+  { value: 0, label: '无' },
+  { value: 1, label: '细' },
+  { value: 2, label: '标准' },
+  { value: 3, label: '粗' },
+  { value: 4, label: '特粗' },
+]
+const SUBTITLE_OUTLINE_DEFAULT = 2
+const subtitleOutline = ref(Math.min(
+  SUBTITLE_OUTLINES.length - 1,
+  Math.max(0, Math.round(dmStored('dm:subOutline', SUBTITLE_OUTLINE_DEFAULT))),
+))
 const dmOpacityPct = computed(() => Math.round(danmakuOpacity.value * 100))
 /** The slider reads 慢 → 快, so its value is the crossing time reversed: the
  *  right-hand end is the renderer's smallest number of seconds. */
 const dmSpeedSlider = computed(() => DM_SPEED_MIN + DM_SPEED_MAX - danmakuSpeed.value)
+const subtitleOutlineLabel = computed(
+  () => SUBTITLE_OUTLINES.find((o) => o.value === subtitleOutline.value)?.label || '标准',
+)
 const danmakuCount = ref(0)
 const danmakuFailed = ref(false)
 const danmakuUrl = computed(() => play.value?.danmaku_url || '')
@@ -1652,6 +1672,13 @@ function toggleDanmakuStroke() {
   applyDanmakuOptions()
 }
 
+function setSubtitleOutline(value) {
+  subtitleOutline.value = Math.min(
+    SUBTITLE_OUTLINES.length - 1,
+    Math.max(0, Math.round(Number(value) || 0)),
+  )
+}
+
 function resetDanmakuOptions() {
   danmakuOpacity.value = DM_DEFAULTS.opacity
   danmakuSpeed.value = DM_DEFAULTS.speed
@@ -1774,6 +1801,10 @@ watch([danmakuOpacity, danmakuSpeed, danmakuArea, danmakuFont, danmakuStroke], (
   localStorage.setItem('dm:dmArea', String(danmakuArea.value))
   localStorage.setItem('dm:dmFont', String(danmakuFont.value))
   localStorage.setItem('dm:dmStroke', danmakuStroke.value ? '1' : '0')
+})
+
+watch(subtitleOutline, (value) => {
+  localStorage.setItem('dm:subOutline', String(value))
 })
 
 // Toggles replace the object, so a shallow watch sees every change; deep is
@@ -2522,6 +2553,7 @@ onBeforeUnmount(() => {
             <video
               ref="videoEl"
               :controls="nativeControls"
+              :data-sub-outline="subtitleOutline"
               playsinline
               webkit-playsinline
               preload="auto"
@@ -3121,6 +3153,25 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
+              <!-- WebVTT cues are painted by the browser, which is why this
+                   preference reaches them through a global ::cue rule keyed off
+                   the video's data attribute. Burned and native HLS subtitles
+                   are pixels/native player UI and cannot use it. -->
+              <div
+                v-if="drawerMode !== 'settings' && !nativeSubs && (play?.subtitles || []).some(s => s.url)"
+                class="pn-group"
+              >
+                <div class="label">字幕黑边 <span class="tiny">{{ subtitleOutlineLabel }}</span></div>
+                <div class="pn-chips sub-outline-opts">
+                  <button
+                    v-for="o in SUBTITLE_OUTLINES" :key="o.value"
+                    class="chip sm" :class="{ on: subtitleOutline === o.value }"
+                    @click="setSubtitleOutline(o.value)"
+                  >{{ o.label }}</button>
+                </div>
+                <div class="tiny">只影响网页内绘制的字幕,不会改变烧录字幕。</div>
+              </div>
+
               <!-- Typesetting (ASS) tracks: WebVTT can only approximate where a
                    sign sits and what it looks like, so the original is offered as
                    a burn — the faithful rendering, and the only one iOS shows.
@@ -3510,6 +3561,9 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 }
 .lay-phone .panel .pn-group .chip, .lay-tablet .panel .pn-group .chip { white-space: nowrap; }
 .pn-reason { display: flex; gap: 8px; line-height: 1.55; margin-top: auto; padding-top: 16px; border-top: 1px solid var(--line-1); }
+
+/* Subtitle outline is a short, ordered set rather than a vertical list. */
+.sub-outline-opts { flex-direction: row; flex-wrap: wrap; gap: 6px; }
 
 /* 弹幕 sliders: label and value share a line, the track takes the rest. */
 .pn-range { display: flex; align-items: center; gap: 10px; width: 100%; max-width: 320px; }
