@@ -538,6 +538,35 @@ func TestSessionForStreamFollowsLatestUse(t *testing.T) {
 	}
 }
 
+// A two-stream source is addressed by where its packaging begins. /api/play told
+// the client a stream_start, and the element's clock is relative to it, so the
+// playlist request carrying that start has to be answered by the session that
+// begins there — even when one at another position was used more recently.
+//
+// Following the latest use regardless (as a remembered seek used to) hands a
+// reloaded playback the previous position's timeline: every time, seek and
+// subtitle the player computes is then shifted by the distance between the two,
+// and the first picture lands early.
+func TestSessionForStreamAtHonoursTheRequestedStart(t *testing.T) {
+	e := newTestEngine(t, nil)
+	e.Cfg.DataDir = t.TempDir()
+
+	old := fakeSession(t, e, 7, 0, 5)          // packaging from the top
+	atResume := fakeSession(t, e, 7, 110, 130) // the position a resume is starting at
+	old.lastUsed = time.Now()
+	atResume.lastUsed = time.Now().Add(-2 * time.Second)
+
+	if got := e.SessionForStreamAt(7, "remux", 0, 0, 1080, "", 110); got != atResume {
+		t.Fatal("the playlist for a session starting at 110s must get that session")
+	}
+	if got := e.SessionForStreamAt(7, "remux", 0, 0, 1080, "", 0); got != old {
+		t.Fatal("a different start is a different session")
+	}
+	if got := e.SessionForStreamAt(7, "remux", 0, 0, 1080, "", 12); got != nil {
+		t.Fatal("a start nothing is packaging for has no session")
+	}
+}
+
 // Two rungs of one bilibili episode are two pictures, not two encodings of the
 // same one. Their sessions must never answer for each other: a segment request
 // pinned to 360P that is served by the 1080P packaging job would show the wrong

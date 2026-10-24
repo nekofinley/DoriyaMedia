@@ -213,6 +213,11 @@ func packagerArgs(o PackagerOptions) ([]string, error) {
 		args = ProxyArgs(args, in.Proxy)
 		if isHTTPPath(target) {
 			args = append(args, "-reconnect", "1", "-reconnect_streamed", "1")
+			// -reconnect only helps when a read fails. A connection that goes quiet
+			// without failing would hold ffmpeg forever, and with it the whole
+			// playback waiting on the packaged output. A minute without a byte is a
+			// stall: fail the job, so the session is replaced with a fresh link.
+			args = append(args, "-rw_timeout", strconv.Itoa(packagerReadTimeoutMicros))
 		}
 		// -ss belongs before -i (input seek): ffmpeg then starts reading near that
 		// position instead of decoding from the beginning. Every input is seeked to
@@ -341,6 +346,11 @@ const (
 	packagerInitName       = "init.mp4"
 	packagerSegmentPattern = "seg%05d.m4s"
 )
+
+// packagerReadTimeoutMicros is how long ffmpeg waits for a read from an HTTP
+// source before it gives up (-rw_timeout counts in microseconds). See the
+// argument it is passed with in packagerArgs.
+const packagerReadTimeoutMicros = 60 * 1000 * 1000
 
 // Dir is the directory holding the packaged output.
 func (p *Packager) Dir() string { return p.dir }

@@ -151,6 +151,42 @@ type Session struct {
 	// startedAt is when this session's packager was launched. Progress is reported
 	// against it, so a viewer can see whether production is faster than realtime.
 	startedAt time.Time
+	// initServed is closed once the init segment has been handed to a client (see
+	// MarkInitServed and WaitInitServed).
+	initServed     chan struct{}
+	initServedOnce sync.Once
+}
+
+// MarkInitServed records that the init segment has been answered. It is sticky:
+// once a client has the init, later media segments never wait for it again.
+func (s *Session) MarkInitServed() {
+	s.initServedOnce.Do(func() {
+		if s.initServed != nil {
+			close(s.initServed)
+		}
+	})
+}
+
+// WaitInitServed holds a media segment back until the init segment has been
+// answered, or until max elapses (or ctx ends).
+//
+// The init file is complete long before this matters, so the wait is about the
+// order of responses, not readiness. A player asks for the init and the first
+// segment together, and a segment that finishes first is appended first — which
+// a browser rejects, because a SourceBuffer needs the init before any media. The
+// fence makes the init the first response on the wire. A session whose init
+// nobody asks for falls through after max rather than stalling the segment.
+func (s *Session) WaitInitServed(ctx context.Context, max time.Duration) {
+	if s.initServed == nil {
+		return
+	}
+	timer := time.NewTimer(max)
+	defer timer.Stop()
+	select {
+	case <-s.initServed:
+	case <-ctx.Done():
+	case <-timer.C:
+	}
 }
 
 // Output reports what this session's packager has written so far: how many media
@@ -541,7 +577,7 @@ func (e *Engine) LoadCache() {
 			dropped++
 			continue
 		}
-		s := &Session{key: key, dir: dir, lastUsed: time.Now(), startedAt: time.Now()}
+		s := &Session{key: key, dir: dir, lastUsed: time.Now(), startedAt: time.Now(), initServed: make(chan struct{})}
 		s.markComplete()
 		e.sessMu.Lock()
 		e.sessions[key] = s
@@ -555,23 +591,35 @@ func (e *Engine) LoadCache() {
 }
 
 // looksComplete reports whether a directory holds a usable packaged session: the
-// playlist, the init segment, and every segment the playlist names.
+// playlist, the init segment, every segment the playlist names, and the end marker
+// that says the packaging actually finished.
 //
-// That last part matters more than it looks. A packager killed mid-run leaves a
-// playlist that already lists a segment it never finished writing — with
-// -hls_flags temp_file the half-written file stays behind as <name>.tmp — and
-// adopting such a directory as a finished cache sends the player to a segment
-// that nothing is going to produce.
+// That last part matters more than it looks, and so do the segments. A packager
+// killed mid-run leaves a playlist that already lists a segment it never finished
+// writing — with -hls_flags temp_file the half-written file stays behind as
+// <name>.tmp — and adopting such a directory as a finished cache sends the player
+// to a segment that nothing is going to produce.
+//
+// The end marker is the same signal for the opposite case: output whose packager
+// died before the last segment (a stalled source, a killed process) lists only the
+// segments it managed to write, and every one of them exists. Adopting that leaves
+// a session with no packager and a playlist that never ends — a player waits on it
+// forever, because "there is no session left to warm" and "the job is still
+// running" look identical from the outside.
 func looksComplete(dir string) bool {
 	raw, err := os.ReadFile(filepath.Join(dir, packagerPlaylistName))
 	if err != nil || len(raw) == 0 {
+		return false
+	}
+	text := string(raw)
+	if !strings.Contains(text, "#EXT-X-ENDLIST") {
 		return false
 	}
 	if fi, err := os.Stat(filepath.Join(dir, packagerInitName)); err != nil || fi.Size() == 0 {
 		return false
 	}
 	segments := 0
-	for _, line := range strings.Split(string(raw), "\n") {
+	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") || !reSessionSegment.MatchString(line) {
 			continue
@@ -640,11 +688,20 @@ func (e *Engine) EnsureSession(ctx context.Context, key sessionKey, opts Package
 
 	e.sessMu.Lock()
 	if s, ok := e.sessions[key]; ok {
+		if s.Failed() == nil {
+			e.sessMu.Unlock()
+			s.Touch()
+			return s, nil
+		}
+		// The packager for this key died (a stalled source, a refused link). Its
+		// output is not something to serve again: drop it, and package afresh in
+		// the same directory.
+		delete(e.sessions, key)
 		e.sessMu.Unlock()
-		s.Touch()
-		return s, nil
+		s.close(true)
+	} else {
+		e.sessMu.Unlock()
 	}
-	e.sessMu.Unlock()
 
 	// Make room before writing anything.
 	e.evictCache(nil)
@@ -668,7 +725,8 @@ func (e *Engine) EnsureSession(ctx context.Context, key sessionKey, opts Package
 		return nil, err
 	}
 
-	s := &Session{key: key, dir: dir, pack: p, cancel: cancel, lastUsed: time.Now(), startedAt: time.Now(), startSeconds: opts.StartSeconds}
+	s := &Session{key: key, dir: dir, pack: p, cancel: cancel, lastUsed: time.Now(), startedAt: time.Now(), startSeconds: opts.StartSeconds,
+		initServed: make(chan struct{})}
 
 	e.sessMu.Lock()
 	// Another request may have won the race; keep only one session per key. It
@@ -757,6 +815,11 @@ func (e *Engine) streamSessions(fileID int64, mode string, audio, vindex, height
 	for k, s := range e.sessions {
 		if k.fileID == fileID && k.mode == mode && k.audio == audio &&
 			k.vindex == vindex && k.height == height && k.variant == variant {
+			// A session whose packager died is not something to wait on or to
+			// serve from: the request that finds nothing starts a fresh one.
+			if s.Failed() != nil {
+				continue
+			}
 			out = append(out, s)
 		}
 	}
@@ -770,6 +833,28 @@ func (e *Engine) streamSessions(fileID int64, mode string, audio, vindex, height
 func (e *Engine) SessionForStream(fileID int64, mode string, audio, vindex, height int, variant string) *Session {
 	var best *Session
 	for _, s := range e.streamSessions(fileID, mode, audio, vindex, height, variant) {
+		if best == nil || s.lastUsedTime().After(best.lastUsedTime()) {
+			best = s
+		}
+	}
+	return best
+}
+
+// SessionForStreamAt returns the live session that begins at `start` (a session
+// key's start number), or nil.
+//
+// A two-stream source is addressed by where its packaging begins. /api/play told
+// the client a stream_start, and the element's clock is relative to it, so the
+// playlist it reads has to be the one that begins there: following whatever
+// session was used last would hand a player that just moved a different
+// position's timeline, and every time, seek and subtitle it computes would be
+// shifted by the distance between the two.
+func (e *Engine) SessionForStreamAt(fileID int64, mode string, audio, vindex, height int, variant string, start int) *Session {
+	var best *Session
+	for _, s := range e.streamSessions(fileID, mode, audio, vindex, height, variant) {
+		if s.StartSegment() != start {
+			continue
+		}
 		if best == nil || s.lastUsedTime().After(best.lastUsedTime()) {
 			best = s
 		}

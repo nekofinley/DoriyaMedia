@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +121,12 @@ func TestBiliCookieFromSetCookie(t *testing.T) {
 
 // accountFixture is the shape /x/web-interface/nav answers with, reduced to what
 // the driver reads.
+//
+// vip_label is an OBJECT in the live answer — {"path","text","label_theme",
+// "text_color",…} — and was a plain string in older ones. The fixture uses the
+// live shape on purpose: it used to use the string, which is exactly why a
+// struct that declared `VIPLabel string` passed every test here and then failed
+// against the real API, taking the whole account check down with it.
 func accountFixture(loggedIn bool, uname string, vipStatus int, vipDueMS int64) []byte {
 	body, _ := json.Marshal(map[string]any{
 		"code": 0, "message": "0",
@@ -129,9 +136,23 @@ func accountFixture(loggedIn bool, uname string, vipStatus int, vipDueMS int64) 
 			"uname":      uname,
 			"vipStatus":  vipStatus,
 			"vipType":    2,
-			"vip_label":  "年度大会员",
 			"vipDueDate": vipDueMS,
+			"vip_label": map[string]any{
+				"path":        "http://i0.hdslb.com/bfs/vip/label_annual.png",
+				"text":        "年度大会员",
+				"label_theme": "annual_vip",
+				"text_color":  "#FFFFFF",
+				"bg_style":    1,
+				"bg_color":    "#FB7299",
+			},
 			"level_info": map[string]any{"current_level": 6},
+			// Fields the driver does not read, present in the live answer and
+			// capable of changing shape at any time. None of them may break the
+			// one call that answers "am I logged in".
+			"pendant":  map[string]any{"pid": 0, "name": "", "expire": 0},
+			"wallet":   map[string]any{"mid": 42, "bcoin_balance": 0},
+			"official": map[string]any{"role": 0, "title": "", "type": -1},
+			"wbi_img":  map[string]any{"img_url": "x", "sub_url": "y"},
 		},
 	})
 	return body
@@ -677,6 +698,137 @@ func TestAccountReadsMinusOneAsLoggedOutNotAsAnError(t *testing.T) {
 	}
 	if strings.Contains(h.Hint, "代理") {
 		t.Errorf("hint %q blames the proxy for a dead cookie", h.Hint)
+	}
+}
+
+// vip_label has been a string and is now an object, and it is a decoration: the
+// membership is decided by vipStatus. A label shape this build does not know must
+// therefore cost the label, never the account — the failure mode that made the
+// settings page say "连不上 bilibili" while the picture was fine.
+func TestVIPLabelShapesNeverFailTheAccount(t *testing.T) {
+	resetBiliCache()
+	defer resetBiliCache()
+
+	shapes := map[string]string{
+		"object (the live shape)": `{"path":"http://x/label.png","text":"年度大会员","label_theme":"annual_vip"}`,
+		"bare string (the older shape)": `"年度大会员"`,
+		"empty object":                  `{}`,
+		"null":                          `null`,
+		"a number (unknown)":            `123`,
+		"an array (unknown)":            `["a"]`,
+	}
+	for name, label := range shapes {
+		body := []byte(`{"code":0,"message":"0","data":{"isLogin":true,"mid":42,"uname":"某人",` +
+			`"vipStatus":1,"vipType":2,"vipDueDate":` + strconv.FormatInt(time.Now().Add(100*24*time.Hour).UnixMilli(), 10) + `,` +
+			`"vip_label":` + label + `,"level_info":{"current_level":6}}}`)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write(body)
+		}))
+		oldAPI := biliAPI
+		biliAPI = srv.URL
+		d := &BilibiliDriver{cookie: "SESSDATA=x%2C1%2Cy", client: srv.Client()}
+		acc, err := d.Account(context.Background())
+		h := d.Health(context.Background(), false)
+		srv.Close()
+		biliAPI = oldAPI
+		resetBiliCache()
+
+		if err != nil {
+			t.Errorf("%s: the account failed to parse: %v", name, err)
+			continue
+		}
+		if acc == nil || !acc.LoggedIn || acc.Uname != "某人" {
+			t.Errorf("%s: account = %+v, want a logged-in answer", name, acc)
+			continue
+		}
+		// The membership must be read from vipStatus regardless of the label.
+		if !acc.VIPActive() {
+			t.Errorf("%s: a vipStatus 1 account was not seen as a member", name)
+		}
+		if !strings.Contains(h.Message, "大会员有效") {
+			t.Errorf("%s: health message %q does not report the live membership", name, h.Message)
+		}
+		// The known shapes still yield the label; the unknown ones fall back to
+		// the generic name rather than an empty badge.
+		if name == "object (the live shape)" || name == "bare string (the older shape)" {
+			if acc.VIPLabel != "年度大会员" {
+				t.Errorf("%s: label = %q, want 年度大会员", name, acc.VIPLabel)
+			}
+		}
+	}
+}
+
+// A response this build cannot read is not a network failure: the fix is an
+// upgrade, not a proxy. Reporting it as "连不上 bilibili" sent the user to check a
+// proxy that was working.
+func TestUnreadableAccountAnswerIsNotBlamedOnTheNetwork(t *testing.T) {
+	resetBiliCache()
+	defer resetBiliCache()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// "isLogin" as an object: a shape change this build cannot read.
+		_, _ = w.Write([]byte(`{"code":0,"message":"0","data":{"isLogin":{"x":1},"mid":42,"uname":"某人"}}`))
+	}))
+	defer srv.Close()
+	oldAPI := biliAPI
+	biliAPI = srv.URL
+	defer func() { biliAPI = oldAPI }()
+
+	d := &BilibiliDriver{cookie: "SESSDATA=x%2C1%2Cy", client: srv.Client()}
+	_, err := d.Account(context.Background())
+	if err == nil {
+		t.Fatal("an unreadable answer was accepted")
+	}
+	var dec *biliDecodeError
+	if !errors.As(err, &dec) {
+		t.Fatalf("a decode failure was not classified as one: %v", err)
+	}
+
+	h := d.Health(context.Background(), false)
+	if strings.Contains(h.Message, "连不上") {
+		t.Errorf("a parse failure was reported as unreachable: %q", h.Message)
+	}
+	if !strings.Contains(h.Message, "格式变了") {
+		t.Errorf("message %q does not say the answer's shape changed", h.Message)
+	}
+	if strings.Contains(h.Hint, "代理") {
+		t.Errorf("hint %q blames the proxy for a parsing problem", h.Hint)
+	}
+}
+
+// A -101 straight from playurl needs no nav call to confirm, and the message must
+// not stack "账号未登录" twice around the reason.
+func TestRefusalFromMinusOneDoesNotRepeatItself(t *testing.T) {
+	resetBiliCache()
+	defer resetBiliCache()
+
+	var navCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/x/web-interface/nav":
+			navCalls++
+			_, _ = w.Write(accountFixture(false, "", 0, 0))
+		case "/pgc/player/web/playurl":
+			_, _ = w.Write([]byte(`{"code":-101,"message":"账号未登录"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	oldAPI := biliAPI
+	biliAPI = srv.URL
+	defer func() { biliAPI = oldAPI }()
+
+	d := &BilibiliDriver{cookie: "SESSDATA=dead", codec: "avc", client: srv.Client()}
+	_, err := d.playInfo(context.Background(), biliEpisodeRef{Cid: 1, Aid: 2}, 3)
+	if !errors.Is(err, errCookieDead) {
+		t.Fatalf("-101 was not classified as a dead cookie: %v", err)
+	}
+	if n := strings.Count(err.Error(), "账号未登录"); n > 1 {
+		t.Errorf("message repeats 账号未登录 %d times: %q", n, err.Error())
+	}
+	if navCalls != 0 {
+		t.Errorf("-101 cost %d nav calls; the API already said nobody is logged in", navCalls)
 	}
 }
 

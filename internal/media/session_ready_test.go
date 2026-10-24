@@ -134,12 +134,16 @@ func TestWaitForPlaylistTimesOut(t *testing.T) {
 // A packager killed mid-run leaves a playlist that already lists a segment it
 // never finished. Adopting that as a finished cache sends a player to a segment
 // nothing will produce, so the directory has to be dropped instead.
+//
+// The playlist here carries its end marker throughout, so this is about the
+// segments alone: the end marker is a separate condition, covered by
+// TestLoadCacheDropsOutputWithoutEndMarker.
 func TestLooksCompleteRejectsAPlaylistAheadOfItsSegments(t *testing.T) {
 	dir := t.TempDir()
 	writeFileT(t, filepath.Join(dir, "init.mp4"), "init")
 	writeFileT(t, filepath.Join(dir, "seg00000.m4s"), "first")
 	playlist := "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MAP:URI=\"init.mp4\"\n" +
-		"#EXTINF:4.000,\nseg00000.m4s\n#EXTINF:4.000,\nseg00001.m4s\n"
+		"#EXTINF:4.000,\nseg00000.m4s\n#EXTINF:4.000,\nseg00001.m4s\n#EXT-X-ENDLIST\n"
 	writeFileT(t, filepath.Join(dir, "index.m3u8"), playlist)
 	if looksComplete(dir) {
 		t.Fatal("adopted a session whose playlist names a segment that does not exist")

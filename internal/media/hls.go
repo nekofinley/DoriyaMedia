@@ -36,6 +36,12 @@ type Engine struct {
 	partsMu    sync.Mutex
 	partsCache map[string]partsEntry
 
+	// keyCache holds resolved keyframe alignments for sources whose sessions may
+	// start mid-file (see keyframe.go). Keyed by stream URL and position, so it
+	// cannot outlive the link it was measured against.
+	keyMu    sync.Mutex
+	keyCache map[string]keyframeEntry
+
 	// probe job registry: one job per file, shared by the async path
 	// (/api/play → polling) and the synchronous fallback (HLS/subtitles).
 	probeMu   sync.Mutex
@@ -89,6 +95,7 @@ func NewEngine(store *db.Store, cfg *config.Config) *Engine {
 		resolveCache: map[string]resolveEntry{},
 		resolveLocks: map[string]*sync.Mutex{},
 		partsCache:   map[string]partsEntry{},
+		keyCache:     map[string]keyframeEntry{},
 		probeJobs:    map[int64]*probeJob{},
 		pre:          preProbeQueue{queued: map[int64]bool{}},
 		stream:       map[int64]*streamProgress{},

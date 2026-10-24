@@ -192,18 +192,23 @@ function qualityStored() {
 const qualityPref = ref(qualityStored())
 const qMenuOpen = ref(false)
 const qualityBusy = ref(false)
-// switchAt: while a quality change catches up, the file position the viewer
-// should continue from. A bilibili episode can only be packaged from the start
-// (its picture and sound seek independently), so the new stream begins at 0 and
-// the player waits for the server to reach this point instead of replaying the
-// opening at the audience.
+// switchAt: the file position a quality change or a resume must continue from.
+// Both are a reload of the stream at that position: the server starts a session
+// on the keyframe at or before it (its picture and sound are read from separate
+// inputs, so the break has to be a keyframe), reports where that is as
+// stream_start, and the player states the distance as `startPosition`. switchAt
+// stays set until maybeResume has confirmed the playhead really is there.
 const switchAt = ref(0)
 const switchLabel = ref('')
 // True when switchAt is a saved position being restored (not a quality change).
-// The two share the hold/seek machinery, but the wording must not call a resume
+// The two share the seek machinery, but the wording must not call a resume
 // a switch.
 const switchIsResume = ref(false)
-// Whether playback should resume by itself once a switch has caught up. A
+// packaged: the server will produce nothing more for this stream — its playlist
+// carries the end marker. It is the only state in which waiting longer cannot
+// help, so it is what the loading text reads instead of the produced timeline.
+const packaged = ref(false)
+// Whether playback should resume by itself once the new stream is in place. A
 // viewer who switched while paused expects the new rung at the same frame, not
 // a picture that starts moving on its own.
 let switchAutoPlay = true
@@ -248,6 +253,23 @@ const isIOS = computed(() => {
 })
 /** iOS gets the native control surface; everything else gets the custom chrome. */
 const nativeControls = computed(() => isIOS.value)
+
+/**
+ * Whether this browser's *own* HLS player should be used instead of hls.js.
+ *
+ * Safari's is better than hls.js here — it decodes the fMP4 a session writes, it
+ * honours the tfdt the server shifts onto a mid-file session, and it plays
+ * subtitles as renditions — and on iOS there is nothing else. Chromium also
+ * accepts a playlist URL, but its player cannot seek a playlist that is still
+ * growing (its `seekable` stays empty until the end marker), which would undo the
+ * whole point of a session starting at the viewer's position. So the native
+ * player is kept for WebKit, and MediaSource browsers get hls.js.
+ */
+const nativeHlsPreferred = computed(() => {
+  const ua = navigator.userAgent
+  if (isIOS.value) return true
+  return /Safari\//.test(ua) && !/Chrome\/|Chromium\/|Edg\/|OPR\//.test(ua)
+})
 
 /* ----------------------------------------------------- which player is this?
  *
@@ -331,13 +353,28 @@ const volumePct = computed(() => (muted.value ? 0 : volume.value * 100))
 /** Seconds of timeline the player needs buffered before it will start. */
 const streamNeeded = 12
 
+/**
+ * How much of the wait is done, in seconds of timeline.
+ *
+ * `generated_seconds` is measured from the session's own first segment, and a
+ * two-stream session starts at a keyframe at or before the viewer's position —
+ * not at the file's beginning. So the amount that has to be produced is the
+ * distance from the stream's start to the target, and comparing the two directly
+ * (as this used to) made the bar run to 100% while the wait had barely begun.
+ */
+const streamGoal = computed(() => {
+  const target = switchAt.value || resumeAt.value
+  if (target > 0) return Math.max(1, target - streamStart.value)
+  return streamNeeded
+})
+
 const streamPct = computed(() => {
   const s = streamStatus.value
   if (!s || !s.generated_seconds) return 0
-  // A quality switch has a definite target — where the viewer was — so the bar
-  // measures against that rather than against the few seconds a start needs.
-  const need = switchAt.value > 0 ? Math.max(switchAt.value, 1) : streamNeeded
-  return Math.min(100, (s.generated_seconds / need) * 100)
+  // A quality switch or a resume has a definite target — where the viewer was —
+  // so the bar measures against that rather than against the few seconds a start
+  // needs.
+  return Math.min(100, (s.generated_seconds / streamGoal.value) * 100)
 })
 
 /** Timeline seconds per wall second: below 1 the server cannot keep up. */
@@ -361,15 +398,24 @@ const loadingText = computed(() => {
     const label = switchIsResume.value
       ? `回到 ${fmtTime(switchAt.value)}`
       : (switchLabel.value ? `切换到 ${switchLabel.value}` : '切换清晰度')
-    // Past the viewer's position the number stops meaning progress towards
-    // anything: the client is waiting for the end marker that makes the new
-    // playlist seekable (see warmSession).
-    if (got >= switchAt.value) return `正在${label} · 正在重新封装…`
-    return `正在${label} · 已生成 ${fmtTime(got)} / ${fmtTime(switchAt.value)}`
+    // Both numbers are in the stream's own clock: `got` is what the session has
+    // produced since its start, and the goal is the distance from that start to
+    // where the viewer is going. Reporting the absolute target here (as this used
+    // to) showed "0:00 / 2:00" for a stream that had already produced a minute.
+    const goal = streamGoal.value
+    // The wait is over once the target itself has been produced: from there on the
+    // picture is the player's business — reading the playlist, fetching the
+    // fragment, seeking — not the packager's. The end marker is no longer what is
+    // being waited for, so "已生成 X / Y" turning into "正在加载画面" is the honest
+    // transition, whether or not the episode is fully packaged yet.
+    if (got >= goal || packaged.value) return `正在${label} · 正在加载画面…`
+    return `正在${label} · 已生成 ${fmtTime(got)} / ${fmtTime(goal)}`
   }
   if (resumeAt.value > 0 && play.value?.stream_variant) {
     const got = Math.max(0, Number(streamStatus.value?.generated_seconds) || 0)
-    if (streamStatus.value?.complete) return `正在回到 ${fmtTime(resumeAt.value)}…`
+    if (streamStatus.value?.complete || got + streamStart.value >= resumeAt.value) {
+      return `正在回到 ${fmtTime(resumeAt.value)}…`
+    }
     return `正在生成到 ${fmtTime(resumeAt.value)} · 已就绪 ${fmtTime(got)}`
   }
   const s = streamStatus.value
@@ -560,6 +606,7 @@ async function loadDecision(force, at) {
   // switchAt and must not have it overwritten by the progress saved a moment ago.
   if (switchAt.value === 0) progressChecked = false
   resumeReloaded = false
+  packaged.value = false
   forceMode.value = force || ''
   stopProbePoll()
   try {
@@ -593,11 +640,23 @@ async function loadDecision(force, at) {
     startProbePoll()
     return
   }
-  // A quality switch is a new packaging job that starts at 0. Attaching the
-  // player now would show the opening, and a seek past the few segments hls.js
-  // has read is clamped to them. Start the job with a plain playlist request and
-  // wait for it to pass the viewer's position first; the playlist hls.js then
-  // reads already contains the target.
+  // A two-stream source (bilibili) starts its session on a keyframe at or before
+  // the saved position, so the packager only has to produce from there — the wait
+  // is a few segments, not the whole episode (see warmSession). The resume is
+  // taken on the same path as a quality switch because both need the element
+  // attached *at* a position: `startPosition` is what decides the first fragment,
+  // and it has to be known before hls.js reads the playlist.
+  if (!switchAt.value && play.value?.stream_variant && Number(play.value?.resume_at) > 0) {
+    switchAt.value = Number(play.value.resume_at)
+    switchIsResume.value = true
+    switchLabel.value = ''
+    switchAutoPlay = true
+    streamStatus.value = null
+  }
+  // Start the packaging with a plain playlist request and wait for it to pass the
+  // viewer's position before attaching, so every fragment the element may need is
+  // already listed. That is a few segments — not the whole episode, and not the
+  // end marker (see warmSession).
   if (switchAt.value > 0 && play.value?.stream_variant) {
     await warmSession(play.value.url, switchAt.value)
   }
@@ -606,16 +665,50 @@ async function loadDecision(force, at) {
 }
 
 /**
- * Start a switched stream's packaging without attaching the element, and wait
- * until the episode has been fully packaged.
+ * How far past the resume point the packaging must be before the element is
+ * attached: one fragment.
  *
- * Why the whole episode and not just the viewer's position: while ffmpeg is still
- * writing, the session's playlist is an EVENT (live) playlist, and hls.js starts
- * a live playlist at its first fragment and undoes a seek into the not-yet-VOD
- * part — the picture restarts at 0 however far it had been warmed. The ENDLIST
- * marker makes it a VOD playlist, which hls.js seeks honestly. Remuxing a bilibili
- * episode copies the streams, so this is seconds, not minutes, and the loading
- * text shows the generated timeline meanwhile.
+ * Not a safety margin — it is what makes `startPosition` land. A growing EVENT
+ * playlist is only as long as what ffmpeg has written, and hls.js clamps a start
+ * position to that (measured: with the target fragment not listed yet, asking to
+ * start at 10s started at the playlist's end, 8.13s, and never came back). One
+ * fragment past the target guarantees the fragment holding it is listed, and
+ * waiting any longer is time the viewer spends looking at a spinner: on a 4K
+ * episode each fragment is several seconds of wall time.
+ *
+ * The real fragment length is measured from the session's own progress rather
+ * than assumed: ffmpeg cuts on keyframes, so a 4s setting produces 5s segments on
+ * most bilibili episodes, and a hard-coded guess either waits too long or clamps.
+ */
+const warmAheadFragments = 1
+
+/**
+ * How long the packaging has to be ahead, in seconds, given what it has produced.
+ */
+function warmAhead(stream) {
+  const generated = Number(stream?.generated_seconds) || 0
+  const segments = Number(stream?.segments_ready) || 0
+  const fragLen = segments > 0 && generated > 0 ? generated / segments : 5
+  return Math.max(1, fragLen * warmAheadFragments)
+}
+
+/**
+ * Start a switched stream's packaging without attaching the element, and wait
+ * until it has produced the position being restored.
+ *
+ * Not the whole episode. A growing EVENT playlist used to look unusable — hls.js
+ * pins the playhead to the live edge when no start position is given, and that was
+ * taken to mean it ignores `startPosition` too. It does not: with a start position
+ * stated relative to the stream's own beginning, hls.js seeks into an EVENT
+ * playlist at that position exactly (measured, hls.js 1.7.3: startPosition 10 on a
+ * session packaging from 20s landed at 10 and played on), and it keeps following
+ * the playlist as it grows. So the wait is only until the target fragment exists —
+ * plus one fragment, so that it is listed rather than clamped (see warmAhead).
+ *
+ * With the server starting a two-stream session on the keyframe at or before the
+ * saved position (see media.Engine.PackStart), a resume twenty minutes in waits
+ * for the few seconds between that keyframe and the viewer's position — not for
+ * the rest of the episode.
  *
  * Progress is read for this stream only (`variant`), because the abandoned rung's
  * packager is still alive and is usually further ahead.
@@ -632,8 +725,17 @@ async function warmSession(url, target) {
   } catch { /* the poll will report nothing; attach and let normal handling run */ }
   if (!started || disposed) return
   const query = `?variant=${encodeURIComponent(expectedVariant.value)}`
-  const deadline = Date.now() + 90000
+  // Packaging copies the streams rather than re-encoding them, so it runs far
+  // faster than playback; how long the whole episode would take is set by how fast
+  // the source delivers it. This waits for a few segments, so the deadline is only
+  // a backstop against a packager that never starts.
+  const deadline = Date.now() + 15 * 60 * 1000
+  // Packaging starts at the session's own first segment, so progress is measured
+  // from there: what has to be produced is the distance from the stream's start to
+  // the position being restored, not the position itself.
+  const need = Math.max(0, Number(target) - streamStart.value)
   let sawSession = false
+  let restarts = 0
   while (!disposed && Date.now() < deadline) {
     let st = null
     try { st = await api.get(`/api/play/${route.params.fileId}/status${query}`) } catch { /* transient */ }
@@ -642,9 +744,24 @@ async function warmSession(url, target) {
       sawSession = true
       streamStatus.value = st.stream
       const generated = Number(st.stream.generated_seconds) || 0
-      // The end marker is the VOD signal (see Complete in the server): the
-      // process exiting a moment later is not what hls.js needs.
-      if (st.stream.complete && generated >= target) return
+      // The end marker is the one case where waiting cannot help: the packager is
+      // done, and whatever it produced is all there will ever be. `packaged` is the
+      // "nothing left to wait for" flag the loading text reads.
+      if (st.stream.complete) {
+        packaged.value = true
+        return
+      }
+      // Enough to start at the target. See warmAhead for why exactly one fragment
+      // past it — no more, which is time spent waiting, and no less, which is a
+      // start position hls.js has to clamp.
+      if (generated >= need + warmAhead(st.stream)) return
+      // The packager stopped without finishing (a stalled source, a refused link).
+      // Asking for the playlist again starts a fresh job in its place, so the wait
+      // goes on from there; a bounded number of tries, then the attach takes over.
+      if (!st.stream.packager_running && !st.stream.complete) {
+        if (++restarts > 4) return
+        try { await fetch(url, { credentials: 'same-origin' }) } catch { /* the next poll reports it */ }
+      }
     } else if (sawSession) {
       // The job finished and its cache was torn down (caching disabled): there is
       // no session left to warm, so attaching will start a new one. Waiting for
@@ -850,11 +967,10 @@ function onWaiting() {
 }
 
 function onPlaying() {
-  // A quality switch, or a resume into a still-packaging session, pauses the
-  // picture while the new stream catches up: whatever the element reports, the
-  // viewer is not watching yet. The pending v.play() from startCand can fire
-  // after the metadata handler paused it, so the hold is enforced here too. A
-  // resume on an ordinary file keeps playing from the start while it waits.
+  // A saved position that arrived after the element was attached (see
+  // onLoadedMetadata) parks the picture until the packaging reaches it: whatever
+  // the element reports, the viewer is not watching yet. The pending v.play() from
+  // startCand can fire after that pause, so the hold is enforced here too.
   if (holdForSession()) { videoEl.value?.pause(); return }
   isLoading.value = false
   clearStall()
@@ -873,14 +989,18 @@ function onCanPlay() {
 }
 
 /**
- * The picture is being held for a position the stream cannot reach yet: a quality
- * switch, or a saved position inside a bilibili session that is still packaging.
- * Those playlists are live until their end marker, and hls.js starts a live one at
- * its first fragment; the hold keeps the opening from being played at the viewer
- * while the wait runs.
+ * The picture is parked on purpose, waiting for a position the stream cannot
+ * reach yet.
+ *
+ * A switch or a resume from the decision is not this case: the element is
+ * attached at the viewer's position (`startPosition`), so there is nothing to
+ * hold. The one that parks is a saved position discovered *after* the attach —
+ * a later metadata, the first progress fetch — because it arrives too late to be
+ * a start position: the element is already running somewhere else, so it is
+ * paused until maybeResume can move it.
  */
 function holdForSession() {
-  return switchAt.value > 0 || (resumeAt.value > 0 && !!play.value?.stream_variant)
+  return switchAt.value === 0 && resumeAt.value > 0 && !!play.value?.stream_variant
 }
 
 /** Has the playhead advanced in the last moment? The events lie; the clock does not. */
@@ -995,21 +1115,41 @@ async function startCand(i) {
   mediaRecovered = false
   netRestarted = false
   startStreamPoll()
+  // Stop whatever was playing *before* the new source is attached. `load()` after
+  // hls.js has already put its MediaSource on the element resets the element under
+  // it: the seek hls.js makes to `startPosition` is discarded and playback starts
+  // at the beginning of the session instead (measured on a mid-episode resume —
+  // the element began at 0 while the playlist said fragment 2).
   v.removeAttribute('src')
+  v.load()
   activeSub.value = null
 
   if (c.kind === 'hls') {
-    const canNative = v.canPlayType('application/vnd.apple.mpegurl')
-    if (canNative) {
+    // Whose HLS player to use is not only "can this element play a playlist".
+    // Safari's own player is worth having — it plays the fMP4 the session writes,
+    // it follows a keyframe'd stream's timestamps, and its subtitles arrive as
+    // renditions (see native_subtitles) — and on iOS there is no alternative.
+    //
+    // A Chromium build also answers `canPlayType` with "maybe", but its native
+    // player cannot seek into a playlist that is still growing: `seekable` stays
+    // empty until the end marker, so a resume starts at the beginning of the
+    // session instead of at the viewer's position (measured: the element played
+    // from 0 for ten seconds while the playlist listed the target fragment). That
+    // is precisely the wait this player exists without, so every browser with
+    // MediaSource gets hls.js.
+    if (nativeHlsPreferred.value && v.canPlayType('application/vnd.apple.mpegurl')) {
       v.src = src
     } else {
       if (!HlsLib) HlsLib = (await import('hls.js')).default
       const Hls = HlsLib
       if (Hls.isSupported()) {
-        // A quality switch starts a fresh packaging job at 0, and the session is
-        // warmed only up to the viewer's position. Tell hls.js where to begin: a
-        // bare seek on a still-growing EVENT playlist is treated as live and
-        // reset to the start; startPosition loads the target fragment directly.
+        // A resume or a quality switch is a packaging job that starts at its own
+        // stream position (a keyframe, for a two-stream source), which the server
+        // reported as stream_start. The element's clock is relative to that, so the
+        // position to ask for is the distance from it. `startPosition` is what
+        // decides the very first fragment: calling startLoad() after MANIFEST_PARSED
+        // was too late, and the opening had already been requested and appended
+        // (measured: seg00000 plus the target fragment, playhead stuck at 0).
         const startPos = switchAt.value > 0 ? Math.max(0, switchAt.value - streamStart.value) : -1
         const hlsConfig = {
           maxBufferLength: 30,
@@ -1021,22 +1161,14 @@ async function startCand(i) {
           fragLoadingRetryDelay: 1000,
           nudgeMaxRetry: 10,
         }
-        if (startPos > 0) {
-          // Do not let hls.js start loading at 0: by the time the manifest is
-          // parsed the session exists, and startLoad(position) makes it load the
-          // target fragment as its very first one. The growing EVENT playlist
-          // otherwise resets a bare seek to the beginning.
-          hlsConfig.autoStartLoad = false
-        }
+        if (startPos > 0) hlsConfig.startPosition = startPos
         hls.value = new Hls(hlsConfig)
-        if (startPos > 0) {
-          hls.value.on(Hls.Events.MANIFEST_PARSED, () => {
-            try { hls.value?.startLoad(startPos) } catch { /* the normal error path reports it */ }
-          })
-        }
         hls.value.loadSource(src)
         hls.value.attachMedia(v)
         hls.value.on(Hls.Events.ERROR, onHlsError)
+      } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+        // No MediaSource, but the element can play a playlist: last resort.
+        v.src = src
       } else {
         await startCand(i + 1)
         return
@@ -1048,8 +1180,12 @@ async function startCand(i) {
 
   applyVolume()
   v.playbackRate = rate.value
-  v.load()
-  v.play().catch(() => { /* autoplay may be blocked — user presses play */ })
+  // `startPosition` puts the playhead where the viewer is, so a resume plays on
+  // by itself — but a rung picked while paused must stay paused on the same frame,
+  // and starting the element is what would break that.
+  if (switchAt.value === 0 || switchAutoPlay) {
+    v.play().catch(() => { /* autoplay may be blocked — user presses play */ })
+  }
   showControls()
 }
 
@@ -1195,11 +1331,16 @@ function reachable() {
  * Move to a position the stream has now packaged: a saved resume, or the point
  * a 清晰度 switch was waiting for.
  *
- * A bilibili episode can only be packaged from the start (its picture and sound
- * seek independently), so a quality change starts the new rung at zero and the
- * player has to wait for production to pass the viewer's position. While that
- * happens the element is paused; this is called from the stream poll, which is
- * the only clock still running.
+ * This is the safety net, not the normal path anymore. A resume or a switch that
+ * knows where it is going states it as `startPosition`, and hls.js seeks there by
+ * itself while the playlist is still growing (see warmSession). What is left here
+ * is (a) the correction when that seek did not land — hls.js clamps a start
+ * position to what the playlist listed, and the element can end up short of the
+ * target — and (b) positions that arrive from elsewhere, like a saved progress a
+ * moment after the first attach, or the edge of the packaging (onEnded).
+ *
+ * The element is paused for neither: there is no longer anything to hold at zero
+ * for, since the stream begins where the viewer is.
  */
 function maybeResume() {
   const v = videoEl.value
@@ -1207,14 +1348,22 @@ function maybeResume() {
   if (!v || !target || !candMeta) return
   if (v.readyState < 2) return
   const switching = switchAt.value > 0
-  // A resume into a bilibili session that is still packaging has the same live
-  // playlist problem as a switch: hls.js will not seek into it until the end
-  // marker turns it into VOD. Wait for the packager to finish (the poll keeps
-  // this running), then the seek is exact.
-  if (!switching && play.value?.stream_variant) {
-    const st = streamStatus.value
-    if (!st || !st.complete) return
+  // A target the picture has already passed is spent, not pending. This is what a
+  // resume leaves behind once playback is running: the target was where the viewer
+  // came back to, and the playhead is now beyond it. Seeking to it again would drag
+  // the picture backwards — the "playback jumps to another scene" a viewer sees
+  // after pausing and playing again. Measured: paused at 130s, played, and the
+  // playhead snapped back to the 120s resume point.
+  if (!switching && target <= v.currentTime + streamStart.value + 0.5) {
+    resumeAt.value = 0
+    return
   }
+  // A target ahead of the playhead is only reachable once the fragments exist, and
+  // `reachable` below is the one place that decides whether they do: it reads what
+  // has been buffered plus what the server reports as produced. Waiting for the end
+  // marker first (as this used to) made the jump wait for the whole episode, which
+  // is the wait this player exists without — the playlist being EVENT is not a
+  // reason to hold, only the target not being produced yet is.
   if (play.value?.stream_variant && target > v.currentTime + streamStart.value + 0.5) {
     // The playlist is VOD now, but the element learns the whole duration only
     // after hls.js parses it. Seeking before that clamps the target to the few
@@ -1269,16 +1418,22 @@ function onLoadedMetadata() {
   // Subtitles come on by themselves; the panel is there to change or turn them off.
   autoSelectSub()
 
-  // A quality switch is a new packaging job that begins at the start of the file,
-  // however far the viewer was. Hold the picture at 0 and show the wait rather
-  // than replaying the opening; the stream poll moves the playhead once the
-  // packager has reached the viewer's position.
+  // A quality switch or a resume was attached *at* the viewer's position: the
+  // decision put it in `startPosition` (see startCand), and hls.js seeks there
+  // itself as soon as the first fragment lands. So nothing is held here — the wait
+  // for the packaging is over before this element exists. What is left is the
+  // element's own work: parse the playlist, fetch the fragment holding the target,
+  // seek. `maybeResume` is the safety net if the seek did not land (a start
+  // position hls.js had to clamp to what the playlist listed, a wrong fragment);
+  // it corrects the playhead once the picture is really moving, and until then
+  // `switchAt` keeps the "switching" wording on the overlay.
   if (switchTo > 0) {
     resumeAt.value = switchTo
-    isLoading.value = true
-    v.pause()
-    // The poll kicks the jump once the element really has the position; seeking
-    // here, before hls.js has processed the playlist, is silently undone.
+    // A rung picked while paused stays paused: hls.js has already put the playhead
+    // on the right frame, and `v.play()` in startCand was skipped for this case.
+    // The overlay stays until maybeResume has confirmed the position (it clears
+    // both switchAt and the loading state).
+    if (!switchAutoPlay) v.pause()
     return
   }
 
@@ -1286,7 +1441,6 @@ function onLoadedMetadata() {
   // its loading state (and its bar) until there is enough to play, or until
   // frames actually move.
   if (v.readyState >= 3) isLoading.value = false
-
   // The saved position belongs to the first attach of this playback; a later
   // metadata (a re-attach after a seek, or the second level hls.js builds) must
   // not apply it again over a picture that is already playing.
@@ -1311,9 +1465,11 @@ function onLoadedMetadata() {
     } else {
       resumeAt.value = p.position
       position.value = p.position
-      // A bilibili session is packaged from the start and its playlist is live
-      // until the end marker; seeking into it now is undone by hls.js. Hold the
-      // picture at 0 until the poll reports the packaging finished, then jump.
+      // This position arrived after the element was attached, so unlike a resume
+      // taken from the decision it has no `startPosition` of its own — and holding
+      // the picture is the honest thing while the packaging catches up, rather than
+      // playing the opening at a viewer who asked to continue. maybeResume makes the
+      // jump as soon as the target is produced.
       if (play.value?.stream_variant) {
         isLoading.value = true
         v.pause()
@@ -1332,8 +1488,9 @@ function onLoadedMetadata() {
  * list gains its end marker and the player switches from "live" to "on demand" —
  * and it takes the length it had buffered at that instant as the stream's length.
  * Playback then ends in the middle of an episode that is sitting finished on disk.
- * Reconnecting picks up a playlist that covers everything produced since, and the
- * pending position (resumeAt) takes the playhead back to where it stopped.
+ * The picture also gets here simply by catching up with a packager that is not far
+ * enough ahead yet. Either way, re-reading the playlist brings a timeline that
+ * covers everything produced since.
  */
 function onEnded() {
   const v = videoEl.value
@@ -1349,14 +1506,23 @@ function onEnded() {
   // is the truth about this stream, not a reason to try forever.
   if (Math.abs(at - endedAt) < 30) return
   endedAt = at
-  resumeAt.value = at
   if (reachable() > at + 5) {
     // More exists than this stream knows about: start again with the fuller
-    // timeline, then continue from where it stopped.
+    // timeline, and beginning where it stopped. The position goes through
+    // `switchAt` because that is what becomes the element's `startPosition` — a
+    // bare resumeAt is a plan to seek later, and the fresh attach drops it, which
+    // put the picture back at the stream's start instead of the viewer's place.
+    resumeAt.value = 0
+    switchAt.value = at
+    switchIsResume.value = true
+    switchLabel.value = ''
+    switchAutoPlay = true
     toast.info('继续播放…')
     attachSource()
   } else {
-    // Nothing beyond this point exists yet. Wait for the packaging to pass it.
+    // Nothing beyond this point exists yet. Wait for the packaging to pass it:
+    // hls.js keeps re-reading the playlist and picks the fragments up itself.
+    resumeAt.value = at
     toast.info('正在生成后面的部分…')
   }
 }
@@ -1605,7 +1771,14 @@ function saveProgress() {
   if (!v) return
   // While a switch or a resume holds the picture at 0 and waits for packaging,
   // the element's clock is not where the viewer is — the waiting target is.
-  const waiting = switchAt.value || resumeAt.value
+  //
+  // A pending target only counts while the picture is actually parked on it. Once
+  // playback is running, the element's clock is the truth: a stale target left
+  // behind by a resume would otherwise be saved as the position, and the next
+  // visit would jump to it — which looks exactly like playback skipping ahead on
+  // its own.
+  const parked = v.paused || v.readyState < 2
+  const waiting = parked ? (switchAt.value || resumeAt.value) : 0
   const pos = waiting || v.currentTime + streamStart.value
   const dur = (v.duration && isFinite(v.duration))
     ? v.duration + streamStart.value
@@ -1939,13 +2112,16 @@ function toggleLock() {
 }
 
 function togglePlay() {
-  if (switchAt.value) {
-    // The new rung is still being packaged up to the viewer's position.
+  const v = videoEl.value
+  if (!v) return
+  // A switch in progress is only a reason to refuse while there is nothing to
+  // play: the element is attached *after* the packaging reached the viewer's
+  // position, so once a picture exists a tap means what it says. Without this the
+  // first second of a resumed episode answered "please wait" to a pause.
+  if (switchAt.value && v.readyState < 2) {
     toast.info('正在切换清晰度,请稍等…', 1600)
     return
   }
-  const v = videoEl.value
-  if (!v) return
   if (v.paused) v.play().catch(() => {}); else v.pause()
 }
 
@@ -1956,6 +2132,16 @@ function seekBy(delta) {
   }
   const v = videoEl.value
   if (!v || !isFinite(v.duration)) return
+  // The element's own clock is stream time; the jump is meant in file time.
+  const target = v.currentTime + streamStart.value + delta
+  // Jumping past what has been packaged would only stall on fragments that do not
+  // exist yet. The server can start a stream at any position (can_start_at), and
+  // the same reload that a drag past the window uses lands there directly.
+  if (delta > 0 && target > reachable() && play.value?.can_start_at && target < duration.value - 1) {
+    resumeAt.value = 0
+    seekTo(target)
+    return
+  }
   v.currentTime = Math.max(0, Math.min(v.duration, v.currentTime + delta))
   toast.info(`${delta > 0 ? '快进' : '后退'} ${Math.abs(delta)} 秒`, 1200)
 }
@@ -2000,7 +2186,12 @@ function endScrub() {
     // those fragments do not exist yet.
     const reach = reachable()
     const beyond = target > reach - 0.5
-    if (beyond && play.value?.can_start_at && target > 0) {
+    // The stream does not contain the file's opening when its session began
+    // mid-file (a resume), so a drag before the session's own start is as
+    // unreachable as one past the packaging edge. Same remedy: ask the server for
+    // a stream that begins there.
+    const before = target < streamStart.value - 0.5
+    if ((beyond || before) && play.value?.can_start_at && target > 0) {
       // The server can begin a stream there, so ask for one: the same thing it does
       // for "continue watching", with the position stated instead of remembered.
       seekTo(target)
@@ -2039,6 +2230,9 @@ function endScrub() {
  */
 async function seekTo(at) {
   toast.info(`正在从 ${fmtTime(at)} 开始…`)
+  // Starting somewhere else is a playback the viewer asked for: it plays unless
+  // they had the picture paused, and this path is only taken from a moving one.
+  switchAutoPlay = true
   await loadDecision(forceMode.value, at)
 }
 

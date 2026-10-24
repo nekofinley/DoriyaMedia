@@ -1368,6 +1368,33 @@ func (s *Store) UpsertSubtitle(sub *models.Subtitle) error {
 	return err
 }
 
+// DeleteSubtitlesByPrefixNotIn removes a file's driver-published subtitle rows
+// that are no longer in keep, limited to the given path prefix.
+//
+// The prefix is what keeps this from deleting a subtitle *file* that another
+// driver registered for the same media file: only the source's own tracks (the
+// ones it just listed, and no longer lists) are touched. An empty keep removes
+// every row with the prefix, which is what a source that stopped publishing
+// subtitles for a file means.
+func (s *Store) DeleteSubtitlesByPrefixNotIn(fileID int64, prefix string, keep []string) error {
+	if prefix == "" {
+		return nil
+	}
+	args := []any{fileID, prefix + "%"}
+	clause := ""
+	if len(keep) > 0 {
+		ph := make([]string, len(keep))
+		for i, k := range keep {
+			ph[i] = "?"
+			args = append(args, k)
+		}
+		clause = " AND path NOT IN (" + strings.Join(ph, ",") + ")"
+	}
+	_, err := s.DB.Exec(
+		`DELETE FROM subtitles WHERE file_id=? AND path LIKE ?`+clause, args...)
+	return err
+}
+
 func (s *Store) SubtitlesByFile(fileID int64) ([]models.Subtitle, error) {
 	rows, err := s.DB.Query(`SELECT id, file_id, path, lang, title, format, embedded, stream_idx, convertible
 		FROM subtitles WHERE file_id=? ORDER BY id`, fileID)

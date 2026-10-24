@@ -1,6 +1,7 @@
 package source
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -274,6 +275,12 @@ func biliCacheClear() {
 	biliAccountMu.Lock()
 	biliAccountCache = map[string]biliAccountItem{}
 	biliAccountMu.Unlock()
+
+	// Subtitle lists too: a 会员-only track becomes available the moment somebody
+	// logs in, and a cached "no subtitles" would hide it for another minute.
+	biliSubMu.Lock()
+	biliSubCache = map[int64]biliSubCacheItem{}
+	biliSubMu.Unlock()
 }
 
 // ClearBiliCache is biliCacheClear for callers outside this package: after a
@@ -329,19 +336,29 @@ func (d *BilibiliDriver) fetchAccount(ctx context.Context) (*BiliAccount, error)
 		Level   struct {
 			Current int `json:"current_level"`
 		} `json:"level_info"`
-		VIPStatus  int    `json:"vipStatus"`
-		VIPType    int    `json:"vipType"`
-		VIPLabel   string `json:"vip_label"`
-		VIPDueDate int64  `json:"vipDueDate"` // milliseconds
+		VIPStatus  int   `json:"vipStatus"`
+		VIPType    int   `json:"vipType"`
+		VIPDueDate int64 `json:"vipDueDate"` // milliseconds
+		// vip_label is an object (path/text/label_theme/colors), not a string —
+		// and the shape has changed under us at least once, so it is decoded
+		// defensively. A decorative badge is the least important field here and
+		// must never be able to fail the whole account check: that is exactly
+		// what a plain `string` field did, and the settings page reported the
+		// parse failure as "连不上 bilibili".
+		VIPLabel json.RawMessage `json:"vip_label"`
 	}
+	// DisallowUnknownFields is deliberately NOT set and every optional field is
+	// either raw or absent: nav carries dozens of fields (pendant, wallet,
+	// official, wbi_img, nft badges) that come and go, and none of them may break
+	// the one call that answers "am I logged in".
 	if err := json.Unmarshal(raw, &nav); err != nil {
-		return nil, fmt.Errorf("bilibili: 账号信息无法解析: %w", err)
+		return nil, &biliDecodeError{what: "账号信息", err: err}
 	}
 	acc := &BiliAccount{
 		LoggedIn: nav.IsLogin, Mid: nav.Mid, Uname: strings.TrimSpace(nav.Uname),
 		Face: nav.Face, Level: nav.Level.Current,
 		VIPStatus: nav.VIPStatus, VIPType: nav.VIPType,
-		VIPLabel: strings.TrimSpace(nav.VIPLabel),
+		VIPLabel: biliVIPLabelText(nav.VIPLabel),
 		Checked:  time.Now().Unix(),
 	}
 	if nav.VIPDueDate > 0 {
@@ -352,6 +369,51 @@ func (d *BilibiliDriver) fetchAccount(ctx context.Context) (*BiliAccount, error)
 	}
 	return acc, nil
 }
+
+// biliVIPLabelText reads the label's text out of whatever shape vip_label has.
+//
+// It has been a plain string in older answers and is an object now; both are
+// accepted, and anything else yields "" rather than an error. The label is a
+// decoration — 年度大会员 vs 大会员 — and the membership itself is decided by
+// vipStatus, which is an int and always has been.
+func biliVIPLabelText(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	// An object: take its text field.
+	if raw[0] == '{' {
+		var obj struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(raw, &obj); err == nil {
+			return strings.TrimSpace(obj.Text)
+		}
+		return ""
+	}
+	// A bare string (the older shape).
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return strings.TrimSpace(s)
+	}
+	return ""
+}
+
+// biliDecodeError is a response this build could not read — as opposed to a
+// network failure. The distinction matters because the advice differs: one says
+// "upgrade the program, bilibili changed its answer", the other says "fix your
+// proxy". Reporting the first as the second is what made a one-field parse bug
+// look like an unreachable API.
+type biliDecodeError struct {
+	what string
+	err  error
+}
+
+func (e *biliDecodeError) Error() string {
+	return fmt.Sprintf("bilibili: %s的格式变了,无法解析: %v", e.what, e.err)
+}
+
+func (e *biliDecodeError) Unwrap() error { return e.err }
 
 // Health is the verdict the settings page draws. It never fails: a dead cookie
 // and an unreachable API are both answers, and telling them apart is the whole
@@ -370,8 +432,19 @@ func (d *BilibiliDriver) Health(ctx context.Context, refreshable bool) *BiliHeal
 	acc, err := d.Account(ctx)
 	if err != nil {
 		h.Error = err.Error()
-		h.Message = "连不上 bilibili:" + err.Error()
-		h.Hint = "这是网络或代理的问题,不是 Cookie 的问题。检查存储源上的代理设置后再试"
+		// Three different failures, three different fixes. Calling them all
+		// "连不上 bilibili" is how a one-field parsing bug sent the user to check
+		// a proxy that was working fine.
+		var dec *biliDecodeError
+		switch {
+		case errors.As(err, &dec):
+			h.Message = "B 站的返回格式变了:" + err.Error()
+			h.Hint = "网络和 Cookie 都没问题,是程序还没跟上 B 站的新字段。播放不受影响;" +
+				"升级到最新版本即可恢复这里的账号状态显示"
+		default:
+			h.Message = "连不上 bilibili:" + err.Error()
+			h.Hint = "这是网络或代理的问题,不是 Cookie 的问题。检查存储源上的代理设置后再试"
+		}
 		return h
 	}
 	h.Account = acc

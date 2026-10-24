@@ -1369,6 +1369,11 @@ func (d *BilibiliDriver) explainRefusal(ctx context.Context, err error) error {
 	if err == nil || errors.Is(err, errRegionLocked) || errors.Is(err, errCookieDead) {
 		return err
 	}
+	// The API already said so itself (-101). No nav call is needed to confirm
+	// it, and the message must not repeat "账号未登录" twice around the reason.
+	if errors.Is(err, errNotLoggedIn) {
+		return fmt.Errorf("%w —— 登录后这一集就能正常播放,不需要重新开通大会员", errCookieDead)
+	}
 	acc, aerr := d.Account(ctx)
 	if aerr != nil || acc == nil || acc.LoggedIn {
 		return err

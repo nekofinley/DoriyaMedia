@@ -138,6 +138,53 @@ func SelectedQualityOf(drv Driver) int {
 	return 0
 }
 
+// SubtitleTrack is one subtitle a source publishes for a file.
+//
+// It is not a file: the source hands out an id and, when asked, the bytes. That
+// is what a 番剧's own subtitle catalogue looks like — bilibili keeps them in a
+// separate API keyed by the episode, never as files beside the video. Without
+// this capability a source that has subtitles simply reports none, which is what
+// used to happen here: the picture played and the <track> list was empty.
+type SubtitleTrack struct {
+	// Path is what the subtitle is registered under, and what OpenSubtitle is
+	// given back. It must be stable across rediscoveries — the row's id is what a
+	// player already has loaded — and it must be recognisable as this driver's,
+	// because discovery removes the tracks a source no longer publishes and must
+	// not touch a subtitle file another driver registered for the same file.
+	Path string
+	// Lang is the track's language tag as the source states it ("zh-Hant",
+	// "zh-CN", "en-US"). It drives the automatic choice, so it should be a real
+	// tag rather than a display name.
+	Lang string
+	// Title is what a viewer picks from ("中文（繁體）", "English").
+	Title string
+	// Format is what OpenSubtitle returns, in the converter's terms: "subrip",
+	// "ass", "webvtt".
+	Format string
+	// Convertible says this track can be served as text (WebVTT). Everything this
+	// source publishes is text, so it is true; a bitmap track could not be.
+	Convertible bool
+}
+
+// SubtitleSource is an optional Driver capability: a file's subtitles are not
+// files beside it but tracks the source publishes through its own API.
+//
+// bilibili is why this exists. Its 番剧 subtitles live in /x/player/v2 keyed by
+// the episode, behind a signed URL that expires, so they can be neither listed as
+// directory entries nor stored as links: both ends are resolved per request.
+type SubtitleSource interface {
+	// Subtitles lists the tracks a file has. An empty answer is not an error —
+	// most episodes have none.
+	Subtitles(ctx context.Context, path string) ([]SubtitleTrack, error)
+	// OpenSubtitle returns one track's bytes in the Format it was listed with. It
+	// re-resolves the source's link at call time, because those expire.
+	OpenSubtitle(ctx context.Context, path, trackPath string) (io.ReadCloser, error)
+	// SubtitlePathPrefix is what every Path this driver hands out starts with. It
+	// is how discovery tells this driver's tracks from a subtitle file that
+	// another driver registered for the same file.
+	SubtitlePathPrefix() string
+}
+
 // Comment is one bullet comment (弹幕) published against a file.
 type Comment struct {
 	Time  float64 `json:"t"`     // seconds into the file
