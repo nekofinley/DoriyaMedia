@@ -165,6 +165,14 @@ const volume = ref(Number(localStorage.getItem('dm:volume') ?? 1))
 const rate = ref(Number(localStorage.getItem('dm:rate') ?? 1))
 const controlsVisible = ref(true)
 const panelOpen = ref(false)
+/* The statistics overlay is a diagnostic surface, not a settings tab: it stays
+ * legible while the chrome fades, and can also be opened from the picture's
+ * context menu. Both entry points flip the same switch. */
+const statsOpen = ref(false)
+const statsNow = ref({})
+const statsHistory = ref({ bandwidth: [], activity: [] })
+const ctxMenuOpen = ref(false)
+const ctxMenuPos = ref({ x: 8, y: 8 })
 /** Which face the drawer shows: the subtitles, or everything else. */
 const panelMode = ref('settings')
 const menuOpen = ref(false)
@@ -320,6 +328,7 @@ function onViewport() {
   dmMenuOpen.value = false
   epMenuOpen.value = false
   qMenuOpen.value = false
+  ctxMenuOpen.value = false
 }
 
 const touchOnly = (() => {
@@ -356,7 +365,7 @@ const theaterChrome = computed(() => !isStacked.value || fsActive.value)
 const stageBar = computed(() => theaterChrome.value || layout.value === 'phone')
 const chromeHidden = computed(() => theaterChrome.value && !controlsVisible.value &&
   isPlaying.value && !menuOpen.value && !dmMenuOpen.value && !epMenuOpen.value &&
-  !qMenuOpen.value && !panelOpen.value)
+  !qMenuOpen.value && !panelOpen.value && !ctxMenuOpen.value)
 
 const modeClass = computed(() => `mode-${play.value?.mode || 'direct'}`)
 const MODE_LABELS = { direct: '302 直连', proxy: '代理播放', remux: 'HLS 转封装', unsupported: '无法播放' }
@@ -373,6 +382,326 @@ const shownTime = computed(() => (scrubbing.value ? scrubTime.value : position.v
 const progressPct = computed(() => (duration.value > 0 ? Math.min(100, (shownTime.value / duration.value) * 100) : 0))
 const bufferedPct = computed(() => (duration.value > 0 ? Math.min(100, (buffered.value / duration.value) * 100) : 0))
 const volumePct = computed(() => (muted.value ? 0 : volume.value * 100))
+
+/* --------------------------------------------------- 视频统计信息
+ *
+ * A deliberately technical overlay, in the spirit of Bilibili's and YouTube's
+ * stats panels. The browser element is the source of truth for what is actually
+ * being decoded; hls.js adds the rung and bandwidth estimates it selected. The
+ * server's probe summary fills in source-only values such as the file's frame
+ * rate, which the media element does not expose.
+ */
+let statsTimer = null
+let statsFrameBase = null
+let statsFpsSamples = []
+let statsFragmentBitrates = []
+let statsFragmentSpeeds = []
+const STATS_HISTORY_LEN = 30
+const STATS_BUFFER_TARGET = 30
+
+function resetStatsFrameSamples() {
+  statsFrameBase = null
+  statsFpsSamples = []
+}
+
+function resetStatsHistory() {
+  statsHistory.value = { bandwidth: [], activity: [] }
+}
+
+function resetStatsSamples() {
+  resetStatsFrameSamples()
+  resetStatsHistory()
+  statsFragmentBitrates = []
+  statsFragmentSpeeds = []
+}
+
+function fmtBitrate(bps) {
+  const n = Number(bps)
+  if (!Number.isFinite(n) || n <= 0) return ''
+  if (n >= 1e6) return `${(n / 1e6).toFixed(2)} Mbps`
+  if (n >= 1e3) return `${Math.round(n / 1e3)} kbps`
+  return `${Math.round(n)} bps`
+}
+
+function fmtFps(fps) {
+  const n = Number(fps)
+  if (!Number.isFinite(n) || n <= 0) return ''
+  return `${n.toFixed(3).replace(/\.?0+$/, '')} fps`
+}
+
+function fmtResolution(w, h) {
+  return Number(w) > 0 && Number(h) > 0 ? `${w} × ${h}` : ''
+}
+
+function statsBufferAhead(v) {
+  if (!v?.buffered?.length) return 0
+  const t = Number(v.currentTime) || 0
+  for (let i = 0; i < v.buffered.length; i++) {
+    if (v.buffered.start(i) <= t + 0.25 && v.buffered.end(i) >= t - 0.1) {
+      return Math.max(0, v.buffered.end(i) - t)
+    }
+  }
+  return 0
+}
+
+function statsPlayerName() {
+  if (hls.value) return 'HLS.js'
+  if (play.value?.kind === 'hls') {
+    return nativeHlsPreferred.value ? '浏览器原生 HLS' : 'HLS.js'
+  }
+  return '浏览器原生 MP4'
+}
+
+function averageSample(values) {
+  return values.length
+    ? values.reduce((sum, value) => sum + value, 0) / values.length
+    : 0
+}
+
+function appendStatsHistory(bandwidth, networkState) {
+  const h = statsHistory.value
+  statsHistory.value = {
+    bandwidth: [...h.bandwidth, bandwidth].slice(-STATS_HISTORY_LEN),
+    activity: [...h.activity, networkState].slice(-STATS_HISTORY_LEN),
+  }
+}
+
+function rememberFragmentLoad(_, data) {
+  const frag = data?.frag
+  const payloadBytes = Number(data?.payload?.byteLength)
+  const bytes = payloadBytes > 0 ? payloadBytes : Number(frag?.stats?.loaded)
+  const duration = Number(frag?.duration)
+  if (!Number.isFinite(bytes) || bytes <= 0) return
+
+  if (duration > 0) {
+    statsFragmentBitrates.push((bytes * 8) / duration)
+    if (statsFragmentBitrates.length > 5) statsFragmentBitrates.shift()
+  }
+
+  const start = Number(frag?.stats?.loading?.start)
+  const end = Number(frag?.stats?.loading?.end)
+  const seconds = (end - start) / 1000
+  if (Number.isFinite(seconds) && seconds > 0.03) {
+    statsFragmentSpeeds.push((bytes * 8) / seconds)
+    if (statsFragmentSpeeds.length > 5) statsFragmentSpeeds.shift()
+  }
+}
+
+function refreshStats() {
+  const v = videoEl.value
+  if (!v || document.hidden) return
+  const q = typeof v.getVideoPlaybackQuality === 'function' ? v.getVideoPlaybackQuality() : null
+  const totalRaw = q?.totalVideoFrames ?? v.webkitDecodedFrameCount
+  const droppedRaw = q?.droppedVideoFrames ?? v.webkitDroppedFrameCount
+  const total = Number(totalRaw)
+  const dropped = Number(droppedRaw)
+  const now = performance.now()
+
+  // Frame counters are cumulative. Sampling the delta once a second gives a
+  // real decode rate without asking for another animation loop while stats are
+  // closed, and the five-sample window keeps a seek or a slow second from
+  // making the number jump around.
+  if (Number.isFinite(total) && total >= 0) {
+    if (statsFrameBase && !v.paused && total >= statsFrameBase.frames) {
+      const seconds = (now - statsFrameBase.at) / 1000
+      const measured = (total - statsFrameBase.frames) / seconds
+      if (seconds > 0.15 && measured > 0.5 && measured < 300) {
+        statsFpsSamples.push(measured)
+        if (statsFpsSamples.length > 5) statsFpsSamples.shift()
+      }
+    }
+    statsFrameBase = { frames: total, at: now }
+  } else {
+    statsFrameBase = null
+  }
+  const measuredFps = statsFpsSamples.length
+    ? statsFpsSamples.reduce((sum, n) => sum + n, 0) / statsFpsSamples.length
+    : null
+
+  const h = hls.value
+  const levelIndex = h ? (Number(h.currentLevel) >= 0 ? h.currentLevel : h.loadLevel) : -1
+  const level = levelIndex >= 0 ? h?.levels?.[levelIndex] : null
+  const bandwidth = Number(h?.bandwidthEstimate) || 0
+  const networkState = Number(v.networkState)
+  const networkNames = ['未加载', '空闲', '下载中', '无媒体源']
+  const network = v ? networkNames[networkState] || '' : ''
+  appendStatsHistory(bandwidth, Number.isFinite(networkState) ? networkState : -1)
+
+  statsNow.value = {
+    engine: statsPlayerName(),
+    resolution: fmtResolution(v.videoWidth, v.videoHeight),
+    measuredFps,
+    videoCodec: level?.videoCodec || '',
+    audioCodec: level?.audioCodec || '',
+    fragmentBitrate: averageSample(statsFragmentBitrates),
+    fragmentSpeed: averageSample(statsFragmentSpeeds),
+    bandwidth,
+    buffer: statsBufferAhead(v),
+    network,
+    dropped: Number.isFinite(dropped) ? dropped : null,
+    totalFrames: Number.isFinite(total) ? total : null,
+    automatic: !!h?.autoLevelEnabled,
+    levelHeight: Number(level?.height) || 0,
+  }
+}
+
+function closeStats() {
+  statsOpen.value = false
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null }
+  resetStatsFrameSamples()
+  resetStatsHistory()
+}
+
+function openStats() {
+  menuOpen.value = false
+  dmMenuOpen.value = false
+  epMenuOpen.value = false
+  qMenuOpen.value = false
+  ctxMenuOpen.value = false
+  if (!panelInline.value) panelOpen.value = false
+  resetStatsFrameSamples()
+  resetStatsHistory()
+  statsOpen.value = true
+  refreshStats()
+  if (statsTimer) clearInterval(statsTimer)
+  statsTimer = setInterval(refreshStats, 1000)
+  // On a watch page the panel lives under the picture. Opening stats from the
+  // settings tab should bring the picture back into view rather than silently
+  // updating an overlay above the current scroll position.
+  if (isStacked.value) nextTick(() => watchEl.value?.scrollTo({ top: 0, behavior: 'smooth' }))
+  showControls()
+}
+
+function toggleStats() {
+  if (statsOpen.value) closeStats()
+  else openStats()
+}
+
+const statsCharts = computed(() => {
+  const history = statsHistory.value
+  const bandwidth = history.bandwidth
+  const peak = Math.max(1, ...bandwidth)
+  const missing = STATS_HISTORY_LEN - bandwidth.length
+  const bandwidthBars = [
+    ...Array(Math.max(0, missing)).fill(0),
+    ...bandwidth.map((value) => value > 0 ? Math.max(12, Math.round(Math.sqrt(value / peak) * 100)) : 0),
+  ]
+  const activityNames = ['cold', 'idle', 'active', 'error']
+  const activity = [
+    ...Array(Math.max(0, missing)).fill('empty'),
+    ...history.activity.map((state) => activityNames[state] || 'empty'),
+  ]
+  const buffer = Math.max(0, Number(statsNow.value.buffer) || 0)
+  const duration = Number(play.value?.duration) || STATS_BUFFER_TARGET
+  const bufferTarget = Math.max(5, Math.min(STATS_BUFFER_TARGET, duration))
+  return {
+    bandwidthBars,
+    activity,
+    bufferPct: Math.min(100, (buffer / bufferTarget) * 100),
+  }
+})
+
+const statsGroups = computed(() => {
+  const p = play.value || {}
+  const s = statsNow.value
+  const srcVideo = p.media?.video || {}
+  const srcFps = Number(srcVideo.frame_rate) || 0
+  const srcBitrate = Number(srcVideo.bit_rate) || Number(p.media?.bit_rate) || 0
+  const sourceResolution = fmtResolution(srcVideo.width, srcVideo.height) ||
+    String(p.resolution || '').replace('x', ' × ')
+  const audio = (p.audio_tracks || [])[currentAudio.value]
+  const audioCodec = String(audio?.codec || p.audio_codec || s.audioCodec || '').toUpperCase()
+  const videoCodec = String(p.video_codec || srcVideo.codec || s.videoCodec || '').toUpperCase()
+  const dropped = s.dropped
+  const total = s.totalFrames
+  let droppedText = ''
+  if (dropped !== null && dropped !== undefined && (Number(total) > 0 || Number(dropped) > 0)) {
+    const pct = total > 0 ? ` · ${((dropped / total) * 100).toFixed(2)}%` : ''
+    droppedText = `${dropped} / ${total || 0}${pct}`
+  }
+  const appQuality = qualityFullLabel.value || qualityLabel.value
+  const levelName = s.levelHeight ? `${s.levelHeight}p` : ''
+  const qualityText = appQuality
+    ? `${qualityPref.value > 0 ? '手动' : '自动'} · ${appQuality}`
+    : (levelName ? `${s.automatic ? '自动' : '手动'} · ${levelName}` : '')
+  const stream = streamStatus.value
+
+  const groups = [
+    {
+      title: '播放',
+      rows: [
+        { label: '播放方式', value: modeLabel.value },
+        { label: '播放器', value: s.engine },
+        { label: '实际分辨率', value: s.resolution || sourceResolution },
+        { label: '源分辨率', value: sourceResolution !== (s.resolution || sourceResolution) ? sourceResolution : '' },
+        { label: '质量', value: qualityText },
+      ],
+    },
+    {
+      title: '视频',
+      rows: [
+        { label: '源视频编码', value: videoCodec },
+        { label: '源音频编码', value: audioCodec },
+        { label: '源帧率', value: fmtFps(srcFps), title: 'ffprobe 源平均帧率' },
+        { label: '解码帧率', value: fmtFps(s.measuredFps), title: '浏览器最近 5 秒解码吞吐，会随播放速度变化' },
+        { label: '实测分片码率', value: fmtBitrate(s.fragmentBitrate), title: '最近 5 个 HLS 分片的平均封装码率' },
+        { label: '源码率', value: fmtBitrate(srcBitrate) },
+        { label: '播放速度', value: `${rate.value}×` },
+      ],
+    },
+    {
+      title: '网络与缓冲',
+      rows: [
+        { label: '带宽估算', value: fmtBitrate(s.bandwidth), chart: 'bandwidth', title: 'hls.js ABR 平滑估算，不是链路测速' },
+        { label: '分片下载速度', value: fmtBitrate(s.fragmentSpeed), title: '最近 5 个 HLS 分片的平均下载吞吐' },
+        { label: '媒体状态', value: s.network, chart: 'activity' },
+        { label: '前方缓冲', value: `${Number(s.buffer || 0).toFixed(1)} 秒`, chart: 'buffer' },
+        { label: '丢帧', value: droppedText },
+        { label: '服务端生成', value: Number(stream?.generated_seconds) > 0 ? fmtTime(Number(stream.generated_seconds)) : '' },
+        { label: '生成速度', value: streamRate.value !== null ? `${streamRate.value.toFixed(2)}× 实时` : '' },
+        { label: '存储源', value: p.source },
+      ],
+    },
+  ]
+  return groups
+    .map((g) => ({ ...g, rows: g.rows.filter((row) => row.value) }))
+    .filter((g) => g.rows.length)
+})
+
+/* --------------------------------------------------------- context menu
+ *
+ * A right-click on the picture opens the player's own menu. It is deliberately
+ * mouse-only: a long press on a touch screen belongs to the platform, and iOS
+ * keeps its native video menu.
+ */
+function closeCtxMenu() {
+  ctxMenuOpen.value = false
+}
+
+function onContextMenu(e) {
+  if (nativeControls.value || touchOnly || locked.value) return
+  e.preventDefault()
+  menuOpen.value = false
+  dmMenuOpen.value = false
+  epMenuOpen.value = false
+  qMenuOpen.value = false
+  panelOpen.value = false
+  const rect = stageEl.value?.getBoundingClientRect()
+  if (!rect) return
+  const menuWidth = 238
+  const menuHeight = 258
+  const x = Math.min(Math.max(8, e.clientX - rect.left), Math.max(8, rect.width - menuWidth - 8))
+  const y = Math.min(Math.max(8, e.clientY - rect.top), Math.max(8, rect.height - menuHeight - 8))
+  ctxMenuPos.value = { x, y }
+  ctxMenuOpen.value = true
+  showControls()
+}
+
+function onDocumentPointerDown(e) {
+  if (!ctxMenuOpen.value) return
+  if (e.target instanceof Element && e.target.closest('.video-ctx')) return
+  closeCtxMenu()
+}
 
 /** Seconds of timeline the player needs buffered before it will start. */
 const streamNeeded = 12
@@ -1141,6 +1470,7 @@ async function startCand(i) {
   const v = videoEl.value
   if (!v) return
   destroyHls()
+  resetStatsSamples()
   mediaRecovered = false
   netRestarted = false
   startStreamPoll()
@@ -1193,6 +1523,7 @@ async function startCand(i) {
         }
         if (startPos > 0) hlsConfig.startPosition = startPos
         hls.value = new Hls(hlsConfig)
+        hls.value.on(Hls.Events.FRAG_LOADED, rememberFragmentLoad)
         hls.value.loadSource(src)
         hls.value.attachMedia(v)
         hls.value.on(Hls.Events.ERROR, onHlsError)
@@ -2430,7 +2761,7 @@ function showControls() {
   clearTimeout(hideTimer)
   if (!theaterChrome.value) return   // a page keeps its buttons; only the theater fades
   if (isPlaying.value && !menuOpen.value && !dmMenuOpen.value && !epMenuOpen.value &&
-    !qMenuOpen.value && !panelOpen.value) {
+    !qMenuOpen.value && !panelOpen.value && !ctxMenuOpen.value) {
     hideTimer = setTimeout(() => { controlsVisible.value = false }, 3200)
   }
 }
@@ -2453,7 +2784,9 @@ function onKey(e) {
   // from the keyboard as the drawer's chip always did.
   else if (k === 'd' && dmControl.value) toggleDanmaku()
   else if (k === 'escape') {
-    if (panelOpen.value) panelOpen.value = false
+    if (ctxMenuOpen.value) closeCtxMenu()
+    else if (statsOpen.value) closeStats()
+    else if (panelOpen.value) panelOpen.value = false
     else if (menuOpen.value) menuOpen.value = false
     else if (dmMenuOpen.value) dmMenuOpen.value = false
     else if (epMenuOpen.value) epMenuOpen.value = false
@@ -2476,7 +2809,7 @@ function onKey(e) {
 function consumeFullscreenDrag(e) {
   if (!fsActive.value) return
   const t = e.target
-  if (t instanceof Element && t.closest('.panel, .ctl-menu, .dm-menu, .ep-menu, .q-menu')) return
+  if (t instanceof Element && t.closest('.panel, .ctl-menu, .dm-menu, .ep-menu, .q-menu, .stats-panel, .video-ctx')) return
   if (e.cancelable) e.preventDefault()
 }
 
@@ -2510,6 +2843,7 @@ onMounted(() => {
   window.addEventListener('orientationchange', onViewport)
   document.addEventListener('fullscreenchange', onFsChange)
   document.addEventListener('pointermove', showControls)
+  document.addEventListener('pointerdown', onDocumentPointerDown)
   // Not passive: the whole point is being able to cancel the gesture.
   document.addEventListener('touchmove', consumeFullscreenDrag, { passive: false })
   videoEl.value?.addEventListener('enterpictureinpicture', onPipChange)
@@ -2519,6 +2853,7 @@ onBeforeUnmount(() => {
   disposed = true
   saveProgress()
   destroyHls()
+  closeStats()
   stopDanmaku()
   clearTimeout(switchTimer)
   stopProbePoll()
@@ -2532,6 +2867,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('orientationchange', onViewport)
   document.removeEventListener('fullscreenchange', onFsChange)
   document.removeEventListener('pointermove', showControls)
+  document.removeEventListener('pointerdown', onDocumentPointerDown)
   document.removeEventListener('touchmove', consumeFullscreenDrag)
   cueObs?.disconnect()
   cueObs = null
@@ -2549,7 +2885,7 @@ onBeforeUnmount(() => {
       <div class="wmain">
         <!-- ================= the picture ================= -->
         <div ref="stageEl" class="stage" @pointermove="onStageMove">
-          <div class="frame">
+          <div class="frame" @contextmenu="onContextMenu">
             <video
               ref="videoEl"
               :controls="nativeControls"
@@ -2586,6 +2922,95 @@ onBeforeUnmount(() => {
             <!-- 弹幕层. Under the controls (z-index 3 against their 4 and up) and
                  transparent to input, so every gesture still reaches the picture. -->
             <canvas v-show="danmakuReady && danmakuOn" ref="dmCanvas" class="dm-layer" aria-hidden="true"></canvas>
+
+            <!-- 视频统计信息: a diagnostic overlay over the picture, not a drawer.
+                 It stays visible while the chrome fades, like Bilibili's panel. -->
+            <Transition name="fade">
+              <section
+                v-if="statsOpen && !nativeControls && !error && !fatal" class="stats-panel"
+                role="region" aria-label="视频统计信息"
+                @pointerdown.stop @contextmenu.stop.prevent
+              >
+                <div class="stats-head">
+                  <div class="stats-title">
+                    <span class="stats-live" aria-hidden="true"></span>
+                    视频统计信息
+                  </div>
+                  <button class="icon-btn" aria-label="关闭视频统计信息" @click="closeStats">
+                    <AppIcon name="close" :size="16" />
+                  </button>
+                </div>
+                <div class="stats-body">
+                  <div v-for="(group, gi) in statsGroups" :key="group.title" class="stats-group" :class="{ separated: gi > 0 }">
+                    <div class="stats-group-title">{{ group.title }}</div>
+                    <div v-for="row in group.rows" :key="row.label" class="stats-row" :class="{ 'has-chart': row.chart }">
+                      <span class="stats-key">{{ row.label }}</span>
+                      <span
+                        v-if="row.chart === 'bandwidth'" class="stats-inline-chart stats-spark"
+                        role="img" :aria-label="`最近 30 秒带宽估算，当前 ${fmtBitrate(statsNow.bandwidth)}`"
+                      >
+                        <i
+                          v-for="(height, i) in statsCharts.bandwidthBars" :key="i"
+                          class="stats-spark-bar" :class="{ on: height > 0 }"
+                          :style="{ height: Math.max(4, height) + '%' }" aria-hidden="true"
+                        ></i>
+                      </span>
+                      <span v-else-if="row.chart === 'activity'" class="stats-inline-chart stats-activity" aria-hidden="true">
+                        <i
+                          v-for="(state, i) in statsCharts.activity" :key="i"
+                          class="stats-activity-cell" :class="`is-${state}`"
+                        ></i>
+                      </span>
+                      <span v-else-if="row.chart === 'buffer'" class="stats-inline-chart stats-buffer-meter" aria-hidden="true">
+                        <span class="stats-buffer-fill" :style="{ width: statsCharts.bufferPct + '%' }"></span>
+                      </span>
+                      <span class="stats-val" :title="row.title || row.value">{{ row.value }}</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="stats-foot">每秒刷新 · 浏览器与播放器实时采样</div>
+              </section>
+            </Transition>
+
+            <!-- The picture's own right-click menu. Mouse only: touch devices keep
+                 the platform's long-press behaviour, and iOS keeps its native menu. -->
+            <Transition name="fade">
+              <div
+                v-if="ctxMenuOpen && !nativeControls" class="video-ctx"
+                :style="{ left: ctxMenuPos.x + 'px', top: ctxMenuPos.y + 'px' }"
+                role="menu" aria-label="播放器菜单"
+                @pointerdown.stop @contextmenu.prevent
+              >
+                <div class="ctx-head">播放器</div>
+                <button class="cm-item" role="menuitem" @click="openStats">
+                  <span class="cm-label"><AppIcon name="info" :size="15" /> 视频统计信息</span>
+                  <span class="tiny">分辨率 · 码率 · 缓冲</span>
+                </button>
+                <div class="ctx-sep"></div>
+                <button class="cm-item" role="menuitem" @click="closeCtxMenu(); togglePlay()">
+                  <span class="cm-label">
+                    <AppIcon :name="isPlaying ? 'pause' : 'play'" :size="15" :filled="true" />
+                    {{ isPlaying ? '暂停' : '播放' }}
+                  </span>
+                  <span class="tiny">空格 / K</span>
+                </button>
+                <button class="cm-item" role="menuitem" @click="closeCtxMenu(); toggleMute()">
+                  <span class="cm-label">
+                    <AppIcon :name="muted || volume === 0 ? 'volumeMute' : 'volume'" :size="15" />
+                    {{ muted || volume === 0 ? '取消静音' : '静音' }}
+                  </span>
+                  <span class="tiny">M</span>
+                </button>
+                <button class="cm-item" role="menuitem" @click="closeCtxMenu(); togglePip()">
+                  <span class="cm-label"><AppIcon name="pip" :size="15" /> 画中画</span>
+                  <span class="tiny">P</span>
+                </button>
+                <button class="cm-item" role="menuitem" @click="closeCtxMenu(); toggleFullscreen()">
+                  <span class="cm-label"><AppIcon :name="fsActive ? 'fullscreenExit' : 'fullscreen'" :size="15" /> {{ fsActive ? '退出全屏' : '全屏' }}</span>
+                  <span class="tiny">F</span>
+                </button>
+              </div>
+            </Transition>
 
             <!-- On the immersive player the top bar carries the title; on a watch
                  page that lives in the page below, so only the way back stays on
@@ -2959,6 +3384,10 @@ onBeforeUnmount(() => {
                       <span class="cm-label"><AppIcon name="pip" :size="15" /> 画中画</span>
                       <span class="tiny">{{ pipActive ? '已开启' : '小窗播放' }}</span>
                     </button>
+                    <button class="cm-item" :class="{ on: statsOpen }" @click="toggleStats">
+                      <span class="cm-label"><AppIcon name="info" :size="15" /> 视频统计信息</span>
+                      <span class="tiny">{{ statsOpen ? '已开启' : '分辨率 · 码率 · 缓冲' }}</span>
+                    </button>
                     <!-- The full drawer used to hang off the top bar's list button.
                          That button is gone, so its remaining job — versions, audio
                          tracks, the reason the server picked this mode — lands here,
@@ -3215,6 +3644,16 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
+              <div v-if="drawerMode !== 'subs'" class="pn-group">
+                <div class="label">诊断</div>
+                <div class="pn-chips">
+                  <button class="chip" :class="{ on: statsOpen }" @click="toggleStats">
+                    <AppIcon name="info" :size="14" /> 视频统计信息{{ statsOpen ? ' · 已开启' : '' }}
+                  </button>
+                </div>
+                <div class="tiny">查看实际分辨率、编码、码率、缓冲与丢帧。</div>
+              </div>
+
               <div v-if="play?.reason" class="pn-reason tiny">
                 <AppIcon name="sparkles" :size="13" />
                 <span>{{ play.reason }}</span>
@@ -3387,6 +3826,225 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 }
 .big-play:hover { transform: translate(-50%, -50%) scale(1.06); background: #fff; }
 
+/* ======================== 视频统计信息 overlay =========================== */
+/* The panel is intentionally narrow and monospaced: this is a diagnostic
+   surface, not another settings page. It sits above the video chrome so it can
+   stay on screen while the controls fade away, and its body scrolls on short
+   screens instead of extending past the picture. */
+.stats-panel {
+  position: absolute;
+  top: max(72px, calc(env(safe-area-inset-top) + 58px));
+  left: max(16px, env(safe-area-inset-left));
+  z-index: 11;
+  width: min(470px, calc(100% - 32px));
+  max-height: calc(100% - 96px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid rgba(240, 169, 46, 0.24);
+  border-radius: var(--r-m);
+  background:
+    linear-gradient(180deg, rgba(23, 25, 31, 0.97), rgba(11, 13, 17, 0.95));
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  color: var(--text-1);
+  font-family: var(--font-mono);
+}
+.stats-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 10px 10px 14px;
+  border-bottom: 1px solid var(--line-1);
+  background: rgba(255, 255, 255, 0.025);
+}
+.stats-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font);
+  font-size: var(--fs-13);
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+.stats-live {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #67dda2;
+  box-shadow: 0 0 0 3px rgba(103, 221, 162, 0.12);
+  animation: stats-pulse 2s ease-in-out infinite;
+}
+@keyframes stats-pulse {
+  50% { opacity: 0.45; box-shadow: 0 0 0 5px rgba(103, 221, 162, 0.04); }
+}
+.stats-head .icon-btn {
+  width: 28px;
+  height: 28px;
+  color: var(--text-3);
+}
+.stats-head .icon-btn:hover { color: var(--text-1); background: rgba(255, 255, 255, 0.08); }
+.stats-body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 12px 14px;
+  scrollbar-width: thin;
+}
+.stats-group.separated {
+  margin-top: 11px;
+  padding-top: 11px;
+  border-top: 1px solid var(--line-1);
+}
+.stats-group-title {
+  margin-bottom: 6px;
+  color: var(--brand);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+}
+.stats-row {
+  display: grid;
+  grid-template-columns: minmax(82px, 0.8fr) minmax(0, 1.4fr);
+  gap: 14px;
+  padding: 3px 0;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.stats-row.has-chart {
+  grid-template-columns: minmax(70px, max-content) minmax(88px, 1fr) minmax(64px, max-content);
+  align-items: center;
+  gap: 9px;
+  min-height: 20px;
+}
+.stats-key { color: var(--text-3); }
+.stats-val {
+  min-width: 0;
+  color: var(--text-1);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.stats-row.has-chart .stats-val { white-space: nowrap; }
+.stats-inline-chart {
+  min-width: 0;
+  justify-self: stretch;
+  align-self: center;
+}
+.stats-spark {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 14px;
+  padding: 2px;
+  overflow: hidden;
+  border: 1px solid rgba(90, 203, 232, 0.16);
+  border-radius: 3px;
+  background:
+    repeating-linear-gradient(90deg, transparent 0 7.5%, rgba(255, 255, 255, 0.04) 7.5% calc(7.5% + 1px)),
+    rgba(5, 9, 13, 0.72);
+}
+.stats-spark-bar {
+  flex: 1;
+  min-width: 1px;
+  border-radius: 1px 1px 0 0;
+  background: rgba(95, 176, 205, 0.14);
+  transition: height 220ms ease, background 220ms ease;
+}
+.stats-spark-bar.on {
+  background: linear-gradient(180deg, #75e0f5, #318fbf);
+  box-shadow: 0 0 4px rgba(79, 196, 231, 0.32);
+}
+.stats-activity,
+.stats-buffer-meter {
+  height: 12px;
+  padding: 2px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+  background: rgba(5, 9, 13, 0.72);
+}
+.stats-activity {
+  display: flex;
+  gap: 1px;
+}
+.stats-activity-cell {
+  flex: 1;
+  min-width: 1px;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.055);
+}
+.stats-activity-cell.is-active {
+  background: #67dda2;
+  box-shadow: 0 0 4px rgba(103, 221, 162, 0.32);
+}
+.stats-activity-cell.is-cold { background: #a37a34; }
+.stats-activity-cell.is-error { background: #ee6a68; }
+.stats-buffer-meter {
+  position: relative;
+}
+.stats-buffer-fill {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: 1px;
+  background: linear-gradient(90deg, #b97621, #f0a92e);
+  box-shadow: 0 0 5px rgba(240, 169, 46, 0.28);
+  transition: width 300ms ease;
+}
+.stats-buffer-meter::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    90deg,
+    transparent 0 calc(20% - 1px),
+    rgba(0, 0, 0, 0.48) calc(20% - 1px) 20%
+  );
+}
+.stats-foot {
+  flex: none;
+  padding: 7px 14px 8px;
+  border-top: 1px solid var(--line-1);
+  background: rgba(0, 0, 0, 0.16);
+  color: var(--text-4);
+  font-size: 9.5px;
+}
+
+/* ========================= right-click menu ============================== */
+.video-ctx {
+  position: absolute;
+  z-index: 12;
+  width: min(238px, calc(100% - 16px));
+  max-height: calc(100% - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 6px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-m);
+  background: rgba(14, 16, 21, 0.97);
+  box-shadow: var(--sh-4);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+.ctx-head {
+  padding: 5px 9px 7px;
+  color: var(--text-4);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.ctx-sep {
+  height: 1px;
+  margin: 4px 7px;
+  background: var(--line-1);
+}
+.video-ctx .cm-item { padding: 7px 9px; }
+.video-ctx .cm-item .tiny { font-size: 10px; }
+
 /* Theater position: laid over the foot of the picture. */
 .controls {
   position: absolute;
@@ -3406,7 +4064,7 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
    the browser's own gesture machinery running is not a lock. */
 .locked .controls { opacity: 0; transform: translateY(12px); pointer-events: none; }
 .locked .top-bar { opacity: 0; transform: translateY(-12px); pointer-events: none; }
-.locked .panel, .locked .ctl-menu { display: none; }
+.locked .panel, .locked .ctl-menu, .locked .stats-panel, .locked .video-ctx { display: none; }
 .locked { touch-action: none; }
 .locked video { touch-action: none; }
 .locked .hints { opacity: 0; }
@@ -3732,6 +4390,13 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 .lay-phone .stage { display: block; flex: none; }
 .lay-phone .frame { position: relative; inset: auto; width: 100%; aspect-ratio: 16 / 9; }
 .lay-phone .top-bar { padding: max(10px, env(safe-area-inset-top)) 10px 10px; background: none; }
+.lay-phone:not(.fs) .stats-panel, .lay-tablet:not(.fs) .stats-panel {
+  top: 8px;
+  left: 8px;
+  width: calc(100% - 16px);
+  max-height: calc(100% - 16px);
+  border-radius: var(--r-s);
+}
 .lay-phone .controls {
   position: static;
   inset: auto;

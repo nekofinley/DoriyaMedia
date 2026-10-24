@@ -1,11 +1,39 @@
 package api
 
 import (
+	"math"
 	"net/url"
 	"testing"
 
 	"doriyamedia/internal/media"
 )
+
+func TestProbeSummaryIncludesSourceFrameRate(t *testing.T) {
+	raw := `{
+		"streams": [{
+			"index": 0,
+			"codec_type": "video",
+			"codec_name": "h264",
+			"width": 1920,
+			"height": 1080,
+			"avg_frame_rate": "24000/1001",
+			"bit_rate": "4500000"
+		}],
+		"format": {
+			"format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+			"duration": "1431.5",
+			"bit_rate": "4800000"
+		}
+	}`
+
+	got := probeSummary(raw)
+	if got == nil || got.Video == nil {
+		t.Fatal("probeSummary returned no video stream")
+	}
+	if math.Abs(got.Video.FrameRate-24000.0/1001.0) > 0.0001 {
+		t.Fatalf("frame rate = %v, want %v", got.Video.FrameRate, 24000.0/1001.0)
+	}
+}
 
 func TestResolveSessionOriginUsesPinnedKeyframeWithoutStart(t *testing.T) {
 	aligned := false

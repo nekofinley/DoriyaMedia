@@ -13,13 +13,14 @@ func jsonUnmarshal(s string, v any) error { return json.Unmarshal([]byte(s), v) 
 func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
 
 type videoInfo struct {
-	Codec     string `json:"codec"`
-	Tag       string `json:"tag,omitempty"`
-	Profile   string `json:"profile,omitempty"`
-	Width     int    `json:"width"`
-	Height    int    `json:"height"`
-	DVProfile int    `json:"dv_profile,omitempty"`
-	BitRate   int64  `json:"bit_rate,omitempty"`
+	Codec     string  `json:"codec"`
+	Tag       string  `json:"tag,omitempty"`
+	Profile   string  `json:"profile,omitempty"`
+	Width     int     `json:"width"`
+	Height    int     `json:"height"`
+	FrameRate float64 `json:"frame_rate,omitempty"`
+	DVProfile int     `json:"dv_profile,omitempty"`
+	BitRate   int64   `json:"bit_rate,omitempty"`
 }
 
 type audioInfo struct {
@@ -55,7 +56,8 @@ func probeSummary(raw string) *mediaSummary {
 	if v := p.Video(); v != nil {
 		out.Video = &videoInfo{
 			Codec: v.CodecName, Tag: v.CodecTagString, Profile: v.Profile,
-			Width: v.Width, Height: v.Height, DVProfile: v.DVProfile(), BitRate: v.BitRateVal(),
+			Width: v.Width, Height: v.Height, FrameRate: v.FrameRate(),
+			DVProfile: v.DVProfile(), BitRate: v.BitRateVal(),
 		}
 	}
 	for i, a := range p.AudioStreams() {

@@ -225,6 +225,11 @@ func (s *ProbeStream) BitRateVal() int64 {
 	return 0
 }
 
+// FrameRate returns ffprobe's average frame rate as frames per second.
+func (s *ProbeStream) FrameRate() float64 {
+	return frameRateFloat(s.AvgFrameRate)
+}
+
 func frameRateFloat(s string) float64 {
 	parts := strings.Split(s, "/")
 	if len(parts) == 2 {
