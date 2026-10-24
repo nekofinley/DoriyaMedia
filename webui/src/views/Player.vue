@@ -992,15 +992,19 @@ function onCanPlay() {
  * The picture is parked on purpose, waiting for a position the stream cannot
  * reach yet.
  *
- * A switch or a resume from the decision is not this case: the element is
- * attached at the viewer's position (`startPosition`), so there is nothing to
- * hold. The one that parks is a saved position discovered *after* the attach —
- * a later metadata, the first progress fetch — because it arrives too late to be
- * a start position: the element is already running somewhere else, so it is
- * paused until maybeResume can move it.
+ * A switch or resume normally attaches at the viewer's position
+ * (`startPosition`), so there is nothing to hold. But hls.js clamps that
+ * position when the target fragment has not reached the playlist, and a failed
+ * seek can fall back to the opening. Playing that opening while `switchAt` keeps
+ * the progress bar and danmaku at the target is the exact desync this guard
+ * prevents: if the element is still behind the pending target, keep it paused
+ * until maybeResume has moved it there.
  */
 function holdForSession() {
-  return switchAt.value === 0 && resumeAt.value > 0 && !!play.value?.stream_variant
+  const v = videoEl.value
+  const target = switchAt.value || resumeAt.value
+  if (!v || !target || !play.value?.stream_variant) return false
+  return Number(v.currentTime) + streamStart.value < target - 1
 }
 
 /** Has the playhead advanced in the last moment? The events lie; the clock does not. */
@@ -1263,7 +1267,13 @@ function onHlsError(_, data) {
   }
   if (data.type === HlsLib.ErrorTypes.NETWORK_ERROR && !netRestarted) {
     netRestarted = true
-    hls.value?.startLoad()
+    // startLoad() without a position means "start from the earliest point" in
+    // hls.js. On a failed seek that silently moves the picture and sound to the
+    // opening while switchAt keeps the progress bar and danmaku at the target.
+    // Restart the loader at the position the viewer is actually waiting for.
+    const target = switchAt.value || resumeAt.value || position.value
+    const at = target > 0 ? target - streamStart.value : (videoEl.value?.currentTime || 0)
+    hls.value?.startLoad(Math.max(0, at))
     return
   }
   // hls.js has spent its own retries on this; the question is still whether the

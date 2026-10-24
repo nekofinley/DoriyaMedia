@@ -328,6 +328,13 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		}
 	}
 	streamStart := s.streamStartFor(dec.Mode, packFrom, multiPart)
+	// For a two-stream source, stream_start is not something the HLS handler can
+	// re-derive reliably on every playlist refresh: keyframe probes expire, CDN
+	// links rotate, and a transient failure must not silently turn a playback that
+	// started at 2:10 into one that starts at 0:00. Pin the exact origin /api/play
+	// reported on the first URL; every playlist, init segment and media segment
+	// then names the same session without measuring it again.
+	originQ := sessionOriginQuery(multiPart, streamStart)
 	// Whether a stream can be asked to begin at an arbitrary position. A two-stream
 	// source can now, since its session starts on a keyframe (see AlignedStart), so
 	// the player may reload with a different position instead of waiting for the
@@ -403,7 +410,7 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		if burnSub > 0 {
 			burnQ = "&burn=" + strconv.FormatInt(burnSub, 10)
 		}
-		dec.URL = fmt.Sprintf("/api/hls/%d/%s%s&m=%s%s%s%s", file.ID, playlist, sq, dec.Mode, startQ, burnQ, qualityQ)
+		dec.URL = fmt.Sprintf("/api/hls/%d/%s%s&m=%s%s%s%s%s", file.ID, playlist, sq, dec.Mode, startQ, originQ, burnQ, qualityQ)
 		dec.MimeType = "application/vnd.apple.mpegurl"
 	}
 
@@ -414,7 +421,7 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 	proxyURL := fmt.Sprintf("/api/stream/%d?proxy=1", file.ID) + strings.Replace(sq, "?", "&", 1)
 	directURL := fmt.Sprintf("/api/stream/%d%s", file.ID, sq)
 	hlsURL := func(m string) string {
-		return fmt.Sprintf("/api/hls/%d/%s%s&m=%s%s%s", file.ID, playlist, sq, m, startQ, qualityQ)
+		return fmt.Sprintf("/api/hls/%d/%s%s&m=%s%s%s%s", file.ID, playlist, sq, m, startQ, originQ, qualityQ)
 	}
 	alts := make([]media.DecisionAlt, 0, len(dec.Alternates))
 	for _, a := range dec.Alternates {
@@ -1116,6 +1123,76 @@ type sessionRequest struct {
 	prepare   func(dir string) error
 }
 
+// resolveSessionOrigin maps an HLS request to the packaging session it belongs
+// to. A playlist request states a viewer position in `start`; the init and media
+// URLs the rewritten playlist hands back state the session's keyframe in `ss`.
+//
+// The pinned keyframe is deliberately accepted without `start`. A segment URL
+// carries no viewer position, so requiring both made a segment request fall back
+// to a session starting at zero. That served the opening of the episode while the
+// player still showed the seek target on its progress bar and danmaku clock.
+//
+// For an initial two-stream seek, the keyframe still has to be measured once.
+// Aligning here uses the same PackStart answer /api/play reported as stream_start,
+// so the playlist and the element agree on where the session begins. A failed
+// alignment starts at zero rather than between keyframes, where picture and sound
+// would remain out of step for the whole playback.
+func resolveSessionOrigin(startSec float64, multi bool, pinnedStart float64, pinned bool,
+	segLen, duration float64, align func() float64) (startSeg int, sessionStart float64) {
+	if multi && pinned {
+		if pinnedStart >= 0 && (duration <= 0 || pinnedStart < duration) {
+			return 0, pinnedStart
+		}
+	}
+	if startSec <= 0 {
+		return 0, 0
+	}
+	if multi {
+		if align == nil {
+			return 0, 0
+		}
+		sessionStart = align()
+		if duration > 0 && sessionStart >= duration {
+			sessionStart = 0
+		}
+		// Two-stream sessions are always numbered from their own keyframe.
+		return 0, sessionStart
+	}
+	startSeg = int(startSec / segLen)
+	sessionStart = float64(startSeg) * segLen
+	if duration > 0 && sessionStart >= duration {
+		// Past the end: nothing to resume, play from the start.
+		return 0, 0
+	}
+	return startSeg, sessionStart
+}
+
+// pinnedSessionOrigin reads the origin a generated playback URL carries. It is
+// deliberately accepted without `start`: init and media requests have no viewer
+// position of their own, and the playlist is the authority on where their
+// session began.
+func pinnedSessionOrigin(q url.Values) (float64, bool) {
+	v := q.Get("ss")
+	if v == "" {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 {
+		return 0, false
+	}
+	return f, true
+}
+
+// sessionOriginQuery pins a two-stream session's exact starting keyframe. It is
+// emitted even for zero: after an alignment failure /api/play reported 0, and a
+// later probe must not silently move a playback that was told 0 to a keyframe.
+func sessionOriginQuery(multi bool, start float64) string {
+	if !multi {
+		return ""
+	}
+	return "&ss=" + strconv.FormatFloat(start, 'f', 3, 64)
+}
+
 // serveByteRangeHLS serves an already-fragmented MP4 as HLS by pointing the player
 // at byte ranges of the original file: no transcoding, no remuxing, and nothing
 // written to disk. The player issues Range requests against the ordinary stream
@@ -1292,12 +1369,12 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		fail(w, 502, "获取源地址失败: "+err.Error())
 		return
 	}
-	// A multi-stream source is packaged in one pass from the start. Its parts seek
-	// independently — asking for 8s lands the picture and the sound in different
-	// places — so there is no honest way to begin mid-file, and one pass over the
-	// whole episode (at many times realtime) is cheaper than re-opening the source
-	// for every segment anyway.
-	multi := len(inputs) > 1
+	// The driver's declared shape, not the number of links a particular resolution
+	// happened to return, decides the timeline semantics. A two-stream source that
+	// momentarily yields only its video link must still number the session from a
+	// keyframe and keep the origin /api/play reported; switching to single-stream
+	// segment rounding here would move the element's clock away from the UI.
+	_, multi := drv.(source.MultiPart)
 
 	// The rung these inputs were resolved at, and the one every request that
 	// follows carries so the playlist and the segments behind it are the same
@@ -1325,57 +1402,11 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 	// alignment there would serve a different packaging job than the playlist the
 	// player is following. The playlist that carries these URLs was written by the
 	// session they name, so it is taken as given.
-	sessionPinned := 0.0
-	sessionPinnedOK := false
-	if v := q.Get("ss"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
-			sessionPinned, sessionPinnedOK = f, true
-		}
-	}
-	startSeg := 0
-	sessionStart := 0.0
-	if startSec > 0 {
-		if multi {
-			// A two-stream source starts on a video keyframe: its picture and its
-			// sound are read from separate inputs, and a start between keyframes
-			// puts the sound a whole GOP ahead of the picture (measured on a 5s-GOP
-			// source: asking for 21s began the picture at 20.08s and the sound at
-			// 21.07s, and that offset never goes away).
-			//
-			// This is the same alignment /api/play reported as stream_start, so it
-			// has to reach the same answer — the same file, the same request
-			// position, the same keyframe. PackStart answers for both callers (and
-			// caches what it measured, a failure included), so they agree without a
-			// second round trip.
-			//
-			// When it cannot answer, the session starts at zero — the same fallback
-			// /api/play reports — because a start between keyframes leaves the sound
-			// a GOP out of step for the whole playback.
-			//
-			// Its segments still number from zero. Numbering them from
-			// floor(start/segLen) would claim the session's first segment begins at
-			// that boundary, which it does not — it begins at the keyframe just
-			// before it — and Session.ShiftSegment would then move every timestamp
-			// by the wrong amount. Zero says "this stream starts where the session
-			// says it does", which is what the player is told through stream_start.
-			startSeg = 0
-			if sessionPinnedOK {
-				sessionStart = sessionPinned
-			} else {
-				sessionStart = s.Engine.PackStart(ctx, file, drv, startSec)
-			}
-			if d := probe.Duration(); d > 0 && sessionStart >= d {
-				sessionStart = 0
-			}
-		} else {
-			startSeg = int(startSec / segLen)
-			sessionStart = float64(startSeg) * segLen
-			if d := probe.Duration(); d > 0 && sessionStart >= d {
-				// Past the end: nothing to resume, play from the start.
-				startSeg, sessionStart = 0, 0
-			}
-		}
-	}
+	sessionPinned, sessionPinnedOK := pinnedSessionOrigin(q)
+	startSeg, sessionStart := resolveSessionOrigin(startSec, multi, sessionPinned, sessionPinnedOK,
+		segLen, probe.Duration(), func() float64 {
+			return s.Engine.PackStart(ctx, file, drv, startSec)
+		})
 
 	audioMode := "copy"
 	if audioOrdinal >= 0 {
@@ -1417,14 +1448,12 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		// and could choose another rung mid-stream.
 		sig += "&q=" + strconv.Itoa(sessionQuality)
 	}
-	if multi {
-		// A two-stream session is addressed by where it begins, and the URLs of its
-		// playlist are the only place that says it: a segment request carries no
-		// position of its own. Stating it here keeps every fragment of this
-		// playlist on the session that wrote it — and keeps a fragment request from
-		// having to re-measure a keyframe the playlist already begins at.
-		sig += "&ss=" + strconv.FormatFloat(sessionStart, 'f', 3, 64)
-	}
+	// A two-stream session is addressed by where it begins, and the URLs of its
+	// playlist are the only place that says it: a segment request carries no
+	// position of its own. Stating it here keeps every fragment of this playlist
+	// on the session that wrote it — and keeps a fragment request from having to
+	// re-measure a keyframe the playlist already begins at.
+	sig += sessionOriginQuery(multi, sessionStart)
 	base := fmt.Sprintf("/api/hls/%d", file.ID)
 
 	// Packaging output is identified by the stream it was made from as well as by
@@ -1496,7 +1525,8 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 			// session this playback is still consuming wins over starting afresh.
 			if sessionStart <= 0 && startSec > 0 {
 				if live := s.Engine.SessionForStream(file.ID, mode, audioOrdinal, videoIndex, height, variant); live != nil &&
-					live.StartSegment() > 0 && live.IdleFor() < media.SessionActiveFor {
+					(live.StartSegment() > 0 || live.StartSeconds() > 0) &&
+					live.IdleFor() < media.SessionActiveFor {
 					live.Touch()
 					return live, nil
 				}
@@ -1641,13 +1671,31 @@ func (s *Server) serveHLSSubtitles(w http.ResponseWriter, r *http.Request, ctx c
 	}
 	defSubID := media.PickDefaultSubtitle(servable)
 	// Rendition cues are timed against the stream the player is on, which begins
-	// where packaging begins; the VTT endpoint shifts them by this much.
-	streamStart := s.streamStartFor(mode, startSec, false)
+	// where packaging begins; the VTT endpoint shifts them by this much. A Safari
+	// master playlist is another entry point into the same playback, so it must
+	// carry the origin /api/play reported exactly, not recompute a two-stream
+	// session as if it were an ordinary file.
+	_, multiPart := drv.(source.MultiPart)
+	streamStart := 0.0
+	if multiPart {
+		segLen := s.Cfg.Playback.SegmentSeconds
+		if segLen <= 0 {
+			segLen = 4
+		}
+		pinnedStart, pinned := pinnedSessionOrigin(q)
+		_, streamStart = resolveSessionOrigin(startSec, true, pinnedStart, pinned, segLen,
+			probe.Duration(), func() float64 {
+				return s.Engine.PackStart(ctx, file, drv, startSec)
+			})
+	} else {
+		streamStart = s.streamStartFor(mode, startSec, false)
+	}
 	sig := signedQuery(s.Cfg.Secret, file.ID, sigTTL)
 	startParam := ""
 	if streamStart > 0 {
 		startParam = "&start=" + strconv.FormatFloat(streamStart, 'f', 3, 64)
 	}
+	originParam := sessionOriginQuery(multiPart, streamStart)
 	// The master playlist is a second entry point into the media stream, so the
 	// variant it names has to carry the same rung the master was asked for.
 	qParam := ""
@@ -1680,7 +1728,7 @@ func (s *Server) serveHLSSubtitles(w http.ResponseWriter, r *http.Request, ctx c
 			}
 		}
 		fmt.Fprintf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%d,SUBTITLES=\"subs\"\n", bw)
-		fmt.Fprintf(&b, "/api/hls/%d/index.m3u8%s&m=%s%s%s\n", file.ID, sig, mode, startParam, qParam)
+		fmt.Fprintf(&b, "/api/hls/%d/index.m3u8%s&m=%s%s%s%s\n", file.ID, sig, mode, startParam, originParam, qParam)
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write([]byte(b.String()))
