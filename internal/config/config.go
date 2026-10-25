@@ -396,7 +396,14 @@ func (c *Config) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, raw, 0o644)
+	// config.json contains the session secret, SMTP password and API keys. The
+	// owner needs read/write; no other local account needs either. The chmod is
+	// also applied to an existing file, because WriteFile only uses the mode
+	// when it creates one.
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
 }
 
 func (c *Config) Abs() string {

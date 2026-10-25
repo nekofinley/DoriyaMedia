@@ -191,6 +191,95 @@ type Progress struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// BangumiAccount is one viewer's own Bangumi.tv authorization. The access
+// token is encrypted before it reaches the database and is never included in
+// API responses.
+type BangumiAccount struct {
+	UserID int64 `json:"-"`
+	// Generation changes whenever the viewer replaces the credential. Jobs
+	// carry the generation they were queued under, so a worker that read the
+	// old account cannot finish its work against a new one.
+	Generation  int64      `json:"-"`
+	Username    string     `json:"username"`
+	Nickname    string     `json:"nickname"`
+	AvatarURL   string     `json:"avatar_url,omitempty"`
+	TokenEnc    string     `json:"-"`
+	SyncEnabled bool       `json:"sync_enabled"`
+	ConnectedAt time.Time  `json:"connected_at"`
+	LastSyncAt  *time.Time `json:"last_sync_at,omitempty"`
+	LastError   string     `json:"last_error,omitempty"`
+}
+
+// BangumiSyncJob is one completed local file waiting to be marked as watched
+// on Bangumi. It lives in the database so a restart or an outage can resume it.
+type BangumiSyncJob struct {
+	ID        int64 `json:"id"`
+	UserID    int64 `json:"user_id"`
+	FileID    int64 `json:"file_id"`
+	SubjectID int   `json:"subject_id"`
+	EpisodeID int   `json:"episode_id"`
+	// EpisodeNumber is the local episode number captured at enqueue time. The
+	// worker resolves the Bangumi chapter after the progress response returns.
+	EpisodeNumber int       `json:"-"`
+	AccountGen    int64     `json:"-"`
+	Status        string    `json:"status"`
+	Attempts      int       `json:"attempts"`
+	LeaseToken    string    `json:"-"`
+	NextAttemptAt time.Time `json:"next_attempt_at"`
+	LastError     string    `json:"last_error,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// BangumiSyncStatus is the account view the settings dialog consumes.
+type BangumiSyncStatus struct {
+	Connected   bool       `json:"connected"`
+	Username    string     `json:"username,omitempty"`
+	Nickname    string     `json:"nickname,omitempty"`
+	AvatarURL   string     `json:"avatar_url,omitempty"`
+	SyncEnabled bool       `json:"sync_enabled"`
+	ConnectedAt *time.Time `json:"connected_at,omitempty"`
+	LastSyncAt  *time.Time `json:"last_sync_at,omitempty"`
+	LastError   string     `json:"last_error,omitempty"`
+	Pending     int        `json:"pending"`
+	Failed      int        `json:"failed"`
+	Synced      int        `json:"synced"`
+}
+
+// BangumiCollectionsPage is the safe, paginated collection view used by the
+// viewer's Bangumi shelf. The access token is intentionally absent: the
+// account fields mirror only the public identity stored with the credential.
+type BangumiCollectionsPage struct {
+	Connected bool                    `json:"connected"`
+	Username  string                  `json:"username"`
+	Nickname  string                  `json:"nickname"`
+	AvatarURL string                  `json:"avatar_url"`
+	Total     int                     `json:"total"`
+	Offset    int                     `json:"offset"`
+	Limit     int                     `json:"limit"`
+	HasMore   bool                    `json:"has_more"`
+	Items     []BangumiCollectionItem `json:"items"`
+}
+
+// BangumiCollectionItem combines one Bangumi anime collection with the local
+// media item that carries the same bgm_id. LocalItemID is zero when the title
+// is not in the library.
+type BangumiCollectionItem struct {
+	SubjectID      int     `json:"subject_id"`
+	Name           string  `json:"name"`
+	NameCN         string  `json:"name_cn"`
+	Summary        string  `json:"summary"`
+	CoverURL       string  `json:"cover_url"`
+	Date           string  `json:"date"`
+	Eps            int     `json:"eps"`
+	Score          float64 `json:"score"`
+	Rank           int     `json:"rank"`
+	CollectionType int     `json:"collection_type"`
+	EpStatus       int     `json:"ep_status"`
+	UpdatedAt      string  `json:"updated_at"`
+	LocalItemID    int64   `json:"local_item_id"`
+}
+
 // ScanState is the snapshot of a scan's counters, as the settings page reads
 // them. The live one is owned by ScanProgress, which copies it out under a lock.
 type ScanState struct {

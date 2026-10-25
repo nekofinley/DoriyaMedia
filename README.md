@@ -685,6 +685,22 @@ pwsh scripts/bilibili-live-test.ps1 -Cookie "SESSDATA=…" # 带账号
 并且**始终按原标题做相似度校验**;搜索结果第一条如果跟标题不像,不会硬套(对「别再当欧尼酱了！」直接搜,
 bgm 的第一条是《凡人修仙传 年番》,那种结果会被拒绝)。实在认不出来就保持空白,在详情页按 **Bangumi ID** 钉住即可。
 
+### 每人自己的 Bangumi 观看同步
+
+右上角头像 → **账号设置 → Bangumi 追番同步**,每个用户都可以连接自己的 Bangumi 账户,互不影响。
+这里的个人令牌只用于写自己的收藏,与管理员在设置页配置的 Bangumi 刮削令牌完全分开:
+
+1. 打开 [Bangumi 个人令牌页](https://next.bgm.tv/demo/access-token)生成令牌,粘贴到账号设置;
+2. 打开「播放到 90% 自动标记看过」;
+3. 往后播放已匹配 Bangumi 条目的番剧,到 90% 时这一集会自动标记为 **看过**;
+4. 旧进度可在同一处点 **补同步已看完剧集**,把本地已经到 90% 的剧集补进队列。
+
+同步由服务端持久化队列执行,不会阻塞播放;重复保存进度、网络失败或服务重启都不会重复写入。
+多季番剧如果共用剧集级 Bangumi 条目,请在各季详情页用 **按 ID 匹配** 绑定该季对应的条目,
+避免第二季的集数按第一季编号写入。
+条目不在收藏中时会先自动加入 **在看**,已有收藏状态则保持不变。令牌以服务器 `secret` 派生密钥加密后
+存入数据库,接口只返回 Bangumi 昵称/头像/同步统计,永远不回显令牌。断开账户会同时删除令牌和待同步队列。
+
 ### 搜「还没入库」的番剧(B 站源)
 
 搜索框(⌘/Ctrl + K)除了搜媒体库,也会用挂了 B 站源的剧集库去搜 **B 站片库**。库里还没有的条目
@@ -864,6 +880,11 @@ bgm 的第一条是《凡人修仙传 年番》,那种结果会被拒绝)。实�
 | `POST /api/sources/{id}/bili-qr/poll` | 管理员。`{key}` → `{state,message,account}`;`state` 是 `waiting`/`scanned`/`expired`/`confirmed`。`confirmed` 时服务器把新 Cookie 与 `refresh_token` 写回源配置,并清空所有用旧凭据读到的缓存 |
 | `POST /api/sources/{id}/bili-refresh` | 管理员。用 `refresh_token` 换一套新 Cookie(不用重新扫码),返回新的账号状态 |
 | `POST /api/items/{id}/refresh` | 重新识别;可带 `{"bgm_id":328609}` 手动钉住 Bangumi 条目 |
+| `GET /api/bangumi/account` | 当前用户自己的 Bangumi 连接状态、上次同步与队列统计(不返回令牌) |
+| `PUT /api/bangumi/account` | `{token}` 验证并保存当前用户的 Bangumi 个人访问令牌 |
+| `PUT /api/bangumi/account/settings` | `{sync_enabled}` 开关该用户的自动观看同步 |
+| `POST /api/bangumi/account/sync` | 把本地已看到 90% 的剧集补进同步队列,并重试失败任务 |
+| `DELETE /api/bangumi/account` | 断开当前用户的 Bangumi,删除令牌与待同步队列(不影响其他人) |
 | `GET /api/catalog/search?q=…` | 用 B 站片库搜还没入库的番剧;每条带可导入的 `season_id` 与目标媒体库 |
 | `POST /api/catalog/import` | `{library_id,source_id,season_id}` 开始入库(只读该系列子树),返回 `job_id` |
 | `GET /api/import/{jobId}` | 入库进度:阶段、当前目录、已处理文件数、成片条目 id |

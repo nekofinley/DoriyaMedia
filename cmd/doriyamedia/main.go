@@ -86,6 +86,7 @@ func main() {
 		log.Fatalf("open site content: %v", err)
 	}
 	srv.Site = siteStore
+	srv.BangumiSync.Start()
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
 	if os.Getenv("DORIYAMEDIA_LOCAL") == "1" {

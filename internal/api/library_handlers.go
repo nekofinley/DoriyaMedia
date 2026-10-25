@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -679,15 +680,31 @@ func (s *Server) handleSaveProgress(w http.ResponseWriter, r *http.Request, user
 		fail(w, 400, "file_id 必填")
 		return
 	}
+	if req.Duration <= 0 || req.Position < 0 || req.Position > req.Duration {
+		fail(w, 400, "播放进度超出有效范围")
+		return
+	}
 	f, err := s.Store.FileByID(req.FileID)
 	if err != nil {
 		fail(w, 404, "文件不存在")
 		return
 	}
+	watched := req.Position >= req.Duration*0.9
 	p := &models.Progress{UserID: user.ID, FileID: f.ID, ItemID: f.ItemID, Position: req.Position, Duration: req.Duration}
 	if err := s.Store.SaveProgress(p); err != nil {
 		fail(w, 500, err.Error())
 		return
+	}
+	// Reaching the end of an episode is the only event that writes to Bangumi.
+	// The outbox makes repeated progress saves harmless, and checking again on
+	// every >=90% save also recovers a local enqueue that failed earlier.
+	if s.BangumiSync != nil && watched {
+		// EnqueueWatched only touches the local database now. A failure here
+		// must not turn a successfully saved playback position into an HTTP
+		// error, but it should be visible in the server log for diagnosis.
+		if err := s.BangumiSync.EnqueueWatched(user.ID, f.ID); err != nil {
+			log.Printf("Bangumi 同步入队失败(user=%d file=%d): %v", user.ID, f.ID, err)
+		}
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }

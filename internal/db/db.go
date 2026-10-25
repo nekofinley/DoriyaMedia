@@ -1,7 +1,10 @@
 package db
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -17,6 +20,10 @@ import (
 type Store struct {
 	DB *sql.DB
 }
+
+var (
+	ErrBangumiJobLeaseLost = errors.New("bangumi sync job lease lost")
+)
 
 // legacyDBName is the database file used before the DoriyaMedia rename.
 const legacyDBName = "doriya.db"
@@ -188,11 +195,53 @@ func (s *Store) migrate() error {
 			updated_at TIMESTAMP NOT NULL,
 			PRIMARY KEY (user_id, file_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS bangumi_accounts (
+			user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+			username TEXT NOT NULL,
+			nickname TEXT NOT NULL DEFAULT '',
+			avatar_url TEXT NOT NULL DEFAULT '',
+			token_enc TEXT NOT NULL,
+			sync_enabled INTEGER NOT NULL DEFAULT 1,
+			generation INTEGER NOT NULL DEFAULT 1,
+			connected_at TIMESTAMP NOT NULL,
+			last_sync_at TIMESTAMP,
+			last_error TEXT NOT NULL DEFAULT ''
+		)`,
+		// The worker fills episode_id after resolving it. The local episode
+		// number is the idempotency key; the remote ID is snapshotted later.
+		`CREATE TABLE IF NOT EXISTS bangumi_sync_jobs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+			subject_id INTEGER NOT NULL DEFAULT 0,
+			episode_id INTEGER NOT NULL DEFAULT 0,
+			episode_number INTEGER NOT NULL DEFAULT 0,
+			account_generation INTEGER NOT NULL DEFAULT 1,
+			status TEXT NOT NULL DEFAULT 'pending',
+			attempts INTEGER NOT NULL DEFAULT 0,
+			lease_token TEXT NOT NULL DEFAULT '',
+			next_attempt_at TIMESTAMP NOT NULL,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_bangumi_sync_pending
+			ON bangumi_sync_jobs(status, next_attempt_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_bangumi_sync_user
+			ON bangumi_sync_jobs(user_id, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_bangumi_sync_file
+			ON bangumi_sync_jobs(user_id, file_id)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.DB.Exec(stmt); err != nil {
 			return fmt.Errorf("migrate: %w", err)
 		}
+	}
+	if err := s.migrateBangumiSyncJobs(); err != nil {
+		return err
+	}
+	if err := s.migrateBangumiSchema(); err != nil {
+		return err
 	}
 	if err := s.migrateFilesUnique(); err != nil {
 		return err
@@ -214,6 +263,266 @@ func (s *Store) migrateLibrarySources() error {
 	_, err := s.DB.Exec(`INSERT OR IGNORE INTO library_sources (library_id, source_id, path)
 		SELECT id, source_id, path FROM libraries WHERE source_id > 0 AND name NOT LIKE '__browse__%'`)
 	return err
+}
+
+// migrateBangumiSyncJobs upgrades the first release of the sync queue, whose
+// idempotency key was a local file. The current key is (subject, local episode)
+// so two versions of one episode cannot produce two remote writes. Old rows
+// have no snapshotted target and can be rebuilt by explicit backfill.
+func (s *Store) migrateBangumiSyncJobs() error {
+	hasSubject, err := s.hasColumn("bangumi_sync_jobs", "subject_id")
+	if err != nil {
+		return err
+	}
+	if hasSubject {
+		return nil
+	}
+	// A table from an even older build may not have the local file key either.
+	// Recreating it is intentional: old jobs have no snapshotted remote target,
+	// and the explicit backfill rebuilds them from local progress.
+	_, err = s.DB.Exec(`DROP INDEX IF EXISTS idx_bangumi_sync_pending;
+		DROP INDEX IF EXISTS idx_bangumi_sync_user;
+		DROP INDEX IF EXISTS idx_bangumi_sync_file;
+		DROP TABLE bangumi_sync_jobs;
+		CREATE TABLE bangumi_sync_jobs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+			subject_id INTEGER NOT NULL DEFAULT 0,
+			episode_id INTEGER NOT NULL DEFAULT 0,
+			episode_number INTEGER NOT NULL DEFAULT 0,
+			account_generation INTEGER NOT NULL DEFAULT 1,
+			status TEXT NOT NULL DEFAULT 'pending',
+			attempts INTEGER NOT NULL DEFAULT 0,
+			lease_token TEXT NOT NULL DEFAULT '',
+			next_attempt_at TIMESTAMP NOT NULL,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL
+		);
+		CREATE INDEX idx_bangumi_sync_pending ON bangumi_sync_jobs(status, next_attempt_at);
+		CREATE INDEX idx_bangumi_sync_user ON bangumi_sync_jobs(user_id, status);
+		CREATE INDEX idx_bangumi_sync_file ON bangumi_sync_jobs(user_id, file_id);`)
+	return err
+}
+
+// migrateBangumiSchema upgrades databases created by the first version of the
+// per-user sync feature. Those rows already carry a resolved Bangumi episode;
+// the new columns add the account generation and local episode number.
+func (s *Store) migrateBangumiSchema() error {
+	hadGeneration, err := s.hasColumn("bangumi_sync_jobs", "account_generation")
+	if err != nil {
+		return err
+	}
+	hadEpisodeNumber, err := s.hasColumn("bangumi_sync_jobs", "episode_number")
+	if err != nil {
+		return err
+	}
+	columns := []struct{ table, name, ddl string }{
+		{"bangumi_accounts", "generation", `ALTER TABLE bangumi_accounts ADD COLUMN generation INTEGER NOT NULL DEFAULT 1`},
+		{"bangumi_sync_jobs", "episode_number", `ALTER TABLE bangumi_sync_jobs ADD COLUMN episode_number INTEGER NOT NULL DEFAULT 0`},
+		{"bangumi_sync_jobs", "account_generation", `ALTER TABLE bangumi_sync_jobs ADD COLUMN account_generation INTEGER NOT NULL DEFAULT 1`},
+		{"bangumi_sync_jobs", "lease_token", `ALTER TABLE bangumi_sync_jobs ADD COLUMN lease_token TEXT NOT NULL DEFAULT ''`},
+	}
+	for _, c := range columns {
+		if err := s.addColumn(c.table, c.name, c.ddl); err != nil {
+			return err
+		}
+	}
+	// Jobs from the first release predate the generation column; their account
+	// row is still the one they were created under, so adopt its generation.
+	// Re-running this later would hand stale jobs the current generation after
+	// a credential change, so only do it on the upgrade that adds the column.
+	if !hadGeneration {
+		if _, err := s.DB.Exec(`UPDATE bangumi_sync_jobs
+			SET account_generation = COALESCE((SELECT generation FROM bangumi_accounts
+				WHERE bangumi_accounts.user_id = bangumi_sync_jobs.user_id), 1)
+			WHERE account_generation = 0`); err != nil {
+			return err
+		}
+	}
+	if !hadEpisodeNumber {
+		// Fill the local episode number for jobs created before the worker took
+		// over chapter resolution. Rows with no local episode are left at zero
+		// and are outside the partial unique index.
+		if _, err := s.DB.Exec(`UPDATE bangumi_sync_jobs
+			SET episode_number = COALESCE((
+				SELECT i.episode FROM files f JOIN items i ON i.id = f.item_id
+				WHERE f.id = bangumi_sync_jobs.file_id
+			), 0)`); err != nil {
+			return err
+		}
+	}
+	// Two versions of one episode from the first release are redundant: the
+	// remote write is keyed by the episode number. This also has to run when a
+	// previous build already added episode_number but still carries its old
+	// UNIQUE(user_id, subject_id, episode_id) constraint.
+	if _, err := s.DB.Exec(`DELETE FROM bangumi_sync_jobs
+		WHERE episode_number > 0 AND id NOT IN (
+			SELECT MAX(id) FROM bangumi_sync_jobs
+			WHERE episode_number > 0
+			GROUP BY user_id, subject_id, episode_number
+		)`); err != nil {
+		return err
+	}
+	// That older constraint treats every not-yet-resolved row as episode_id=0,
+	// so a second episode of the same subject fails to enqueue. SQLite cannot
+	// drop a table constraint in place; rebuild once, preserving valid jobs.
+	legacyUnique, err := s.hasLegacyBangumiSyncUnique()
+	if err != nil {
+		return err
+	}
+	if legacyUnique {
+		if err := s.rebuildBangumiSyncJobs(); err != nil {
+			return err
+		}
+	}
+	_, err = s.DB.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_bangumi_sync_episode
+		ON bangumi_sync_jobs(user_id, subject_id, episode_number)
+		WHERE episode_number > 0`)
+	if err != nil {
+		return err
+	}
+	return s.reconcileBangumiSyncGenerations(time.Now())
+}
+
+// reconcileBangumiSyncGenerations repairs rows left behind by an older build
+// that changed a credential without moving its in-flight or pending jobs to the
+// new generation. Such rows would otherwise remain invisible to Claim forever.
+func (s *Store) reconcileBangumiSyncGenerations(now time.Time) error {
+	_, err := s.DB.Exec(`UPDATE bangumi_sync_jobs
+		SET account_generation=(SELECT a.generation FROM bangumi_accounts a
+				WHERE a.user_id=bangumi_sync_jobs.user_id),
+			status=CASE WHEN status='processing' THEN 'pending' ELSE status END,
+			lease_token=CASE WHEN status='processing' THEN '' ELSE lease_token END,
+			next_attempt_at=CASE WHEN status='processing' THEN ? ELSE next_attempt_at END,
+			updated_at=?
+		WHERE status IN ('pending','failed','processing')
+		  AND EXISTS (SELECT 1 FROM bangumi_accounts a
+			WHERE a.user_id=bangumi_sync_jobs.user_id)
+		  AND account_generation <> (SELECT a.generation FROM bangumi_accounts a
+			WHERE a.user_id=bangumi_sync_jobs.user_id)`, now, now)
+	return err
+}
+
+// hasLegacyBangumiSyncUnique reports whether an older table-level UNIQUE
+// constraint (or the index backing it) still keys jobs by episode_id. The
+// current partial index uses episode_number and is deliberately ignored.
+func (s *Store) hasLegacyBangumiSyncUnique() (bool, error) {
+	rows, err := s.DB.Query(`SELECT name FROM pragma_index_list('bangumi_sync_jobs')
+		WHERE "unique"=1 AND partial=0`)
+	if err != nil {
+		return false, err
+	}
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return false, err
+		}
+		names = append(names, name)
+	}
+	if err := rows.Close(); err != nil {
+		return false, err
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	for _, name := range names {
+		cols, err := s.DB.Query(`SELECT name FROM pragma_index_info(?) ORDER BY seqno`, name)
+		if err != nil {
+			return false, err
+		}
+		var columns []string
+		for cols.Next() {
+			var column string
+			if err := cols.Scan(&column); err != nil {
+				cols.Close()
+				return false, err
+			}
+			columns = append(columns, column)
+		}
+		if err := cols.Close(); err != nil {
+			return false, err
+		}
+		if err := cols.Err(); err != nil {
+			return false, err
+		}
+		if len(columns) >= 3 &&
+			strings.EqualFold(columns[0], "user_id") &&
+			strings.EqualFold(columns[1], "subject_id") &&
+			strings.EqualFold(columns[2], "episode_id") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// rebuildBangumiSyncJobs replaces the legacy table without the episode_id
+// constraint. Any interrupted claims become pending because no worker from
+// before this startup transaction can still hold their lease.
+func (s *Store) rebuildBangumiSyncJobs() error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now()
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS bangumi_sync_jobs_new`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE TABLE bangumi_sync_jobs_new (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+		subject_id INTEGER NOT NULL DEFAULT 0,
+		episode_id INTEGER NOT NULL DEFAULT 0,
+		episode_number INTEGER NOT NULL DEFAULT 0,
+		account_generation INTEGER NOT NULL DEFAULT 1,
+		status TEXT NOT NULL DEFAULT 'pending',
+		attempts INTEGER NOT NULL DEFAULT 0,
+		lease_token TEXT NOT NULL DEFAULT '',
+		next_attempt_at TIMESTAMP NOT NULL,
+		last_error TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMP NOT NULL,
+		updated_at TIMESTAMP NOT NULL
+	)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO bangumi_sync_jobs_new
+		(id, user_id, file_id, subject_id, episode_id, episode_number,
+		 account_generation, status, attempts, lease_token, next_attempt_at,
+		 last_error, created_at, updated_at)
+		SELECT id, user_id, file_id, subject_id, episode_id, episode_number,
+			account_generation,
+			CASE WHEN status='processing' THEN 'pending' ELSE status END,
+			attempts, '',
+			CASE WHEN status='processing' THEN ? ELSE next_attempt_at END,
+			last_error, created_at, updated_at
+		FROM bangumi_sync_jobs`, now); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE bangumi_sync_jobs`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`ALTER TABLE bangumi_sync_jobs_new RENAME TO bangumi_sync_jobs`); err != nil {
+		return err
+	}
+	indexes := []string{
+		`CREATE INDEX idx_bangumi_sync_pending ON bangumi_sync_jobs(status, next_attempt_at)`,
+		`CREATE INDEX idx_bangumi_sync_user ON bangumi_sync_jobs(user_id, status)`,
+		`CREATE INDEX idx_bangumi_sync_file ON bangumi_sync_jobs(user_id, file_id)`,
+		`CREATE UNIQUE INDEX idx_bangumi_sync_episode
+			ON bangumi_sync_jobs(user_id, subject_id, episode_number)
+			WHERE episode_number > 0`,
+	}
+	for _, stmt := range indexes {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // migrateUsers adds the columns a database from before multi-user support is
@@ -932,6 +1241,53 @@ func (s *Store) ItemByID(id int64) (*models.Item, error) {
 	return it, nil
 }
 
+// ItemIDsByBGMIDs resolves one page of Bangumi subject IDs to local items in a
+// single query. When metadata produced more than one row for the same subject,
+// the title-level row wins because that is the one a detail page can present.
+func (s *Store) ItemIDsByBGMIDs(ids []int) (map[int]int64, error) {
+	out := make(map[int]int64)
+	seen := make(map[int]struct{}, len(ids))
+	unique := make([]any, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	if len(unique) == 0 {
+		return out, nil
+	}
+	rows, err := s.DB.Query(`SELECT bgm_id, id FROM items
+		WHERE bgm_id IN (`+placeholders(len(unique))+`)
+		  AND library_id NOT IN (SELECT id FROM libraries WHERE name LIKE '__browse__%')
+		ORDER BY CASE type
+			WHEN 'show' THEN 0
+			WHEN 'movie' THEN 1
+			WHEN 'season' THEN 2
+			WHEN 'episode' THEN 3
+			ELSE 4
+		END, id`, unique...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var bgmID int
+		var itemID int64
+		if err := rows.Scan(&bgmID, &itemID); err != nil {
+			return nil, err
+		}
+		if _, exists := out[bgmID]; !exists {
+			out[bgmID] = itemID
+		}
+	}
+	return out, rows.Err()
+}
+
 // ItemChildren returns child items ordered by season/episode or name.
 func (s *Store) ItemChildren(parentID int64) ([]models.Item, error) {
 	rows, err := s.DB.Query(`SELECT `+itemCols+` FROM items WHERE parent_id=? ORDER BY season, episode, name`, parentID)
@@ -1468,4 +1824,433 @@ func (s *Store) ProgressForFile(userID, fileID int64) (*models.Progress, error) 
 		return nil, err
 	}
 	return p, nil
+}
+
+// ---------- bangumi accounts and sync queue ----------
+
+func (s *Store) BangumiAccountByUser(userID int64) (*models.BangumiAccount, error) {
+	a := &models.BangumiAccount{}
+	var lastSync sql.NullTime
+	err := s.DB.QueryRow(`SELECT user_id, generation, username, nickname, avatar_url, token_enc,
+		sync_enabled, connected_at, last_sync_at, last_error
+		FROM bangumi_accounts WHERE user_id=?`, userID).
+		Scan(&a.UserID, &a.Generation, &a.Username, &a.Nickname, &a.AvatarURL, &a.TokenEnc,
+			&a.SyncEnabled, &a.ConnectedAt, &lastSync, &a.LastError)
+	if err != nil {
+		return nil, err
+	}
+	if lastSync.Valid {
+		t := lastSync.Time
+		a.LastSyncAt = &t
+	}
+	return a, nil
+}
+
+// SaveBangumiCredential replaces the viewer's credential in one transaction.
+// Replacing a token increments the generation; switching to another Bangumi
+// identity also drops the old queue. The update is guarded by the generation
+// read in the same transaction, so two near-simultaneous connections cannot
+// both claim the same successor generation.
+func (s *Store) SaveBangumiCredential(a *models.BangumiAccount) error {
+	for attempt := 0; attempt < 4; attempt++ {
+		retry, err := s.saveBangumiCredentialOnce(a)
+		if err == nil && !retry {
+			return nil
+		}
+		if err != nil && !retry {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
+	}
+	return fmt.Errorf("Bangumi 账户正在被同时修改,请重试")
+}
+
+func (s *Store) saveBangumiCredentialOnce(a *models.BangumiAccount) (retry bool, err error) {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var currentGeneration int64
+	var currentUsername string
+	var currentEnabled int
+	var currentLastSync sql.NullTime
+	err = tx.QueryRow(`SELECT generation, username, sync_enabled, last_sync_at
+		FROM bangumi_accounts WHERE user_id=?`, a.UserID).
+		Scan(&currentGeneration, &currentUsername, &currentEnabled, &currentLastSync)
+	exists := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+
+	if !exists {
+		a.Generation = 1
+		_, err = tx.Exec(`INSERT INTO bangumi_accounts
+			(user_id, generation, username, nickname, avatar_url, token_enc, sync_enabled, connected_at, last_sync_at, last_error)
+			VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			a.UserID, a.Generation, a.Username, a.Nickname, a.AvatarURL, a.TokenEnc,
+			boolToInt(a.SyncEnabled), a.ConnectedAt, a.LastSyncAt, a.LastError)
+		if err != nil {
+			if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+				return true, nil
+			}
+			return false, err
+		}
+		if err := tx.Commit(); err != nil {
+			if isSQLiteBusy(err) {
+				return true, nil
+			}
+			return false, err
+		}
+		return false, nil
+	}
+
+	a.Generation = currentGeneration + 1
+	a.SyncEnabled = currentEnabled != 0
+	if currentUsername == a.Username && currentLastSync.Valid {
+		lastSync := currentLastSync.Time
+		a.LastSyncAt = &lastSync
+	} else {
+		a.LastSyncAt = nil
+	}
+	if currentUsername != a.Username {
+		if _, err := tx.Exec(`DELETE FROM bangumi_sync_jobs WHERE user_id=?`, a.UserID); err != nil {
+			return false, err
+		}
+	} else {
+		// The old token's permanent failures are exactly what a credential
+		// replacement is meant to recover. Pending jobs also move to the new
+		// generation, while an in-flight row is returned to the queue and its
+		// lease cleared so the old worker cannot complete it with stale
+		// credentials.
+		now := time.Now()
+		if _, err := tx.Exec(`UPDATE bangumi_sync_jobs
+			SET status=CASE WHEN status IN ('failed','processing') THEN 'pending' ELSE status END,
+				attempts=CASE WHEN status IN ('failed','processing') THEN 0 ELSE attempts END,
+				next_attempt_at=CASE WHEN status IN ('failed','processing') THEN ? ELSE next_attempt_at END,
+				last_error=CASE WHEN status IN ('failed','processing') THEN '' ELSE last_error END,
+				lease_token='',
+				updated_at=?,
+				account_generation=?
+			WHERE user_id=? AND status IN ('failed','pending','processing')`,
+			now, now, a.Generation, a.UserID); err != nil {
+			if isSQLiteBusy(err) {
+				return true, nil
+			}
+			return false, err
+		}
+	}
+	res, err := tx.Exec(`UPDATE bangumi_accounts
+		SET generation=?, username=?, nickname=?, avatar_url=?, token_enc=?,
+			sync_enabled=?, connected_at=?, last_sync_at=?, last_error=?
+		WHERE user_id=? AND generation=? AND username=?`,
+		a.Generation, a.Username, a.Nickname, a.AvatarURL, a.TokenEnc,
+		boolToInt(a.SyncEnabled), a.ConnectedAt, a.LastSyncAt, a.LastError,
+		a.UserID, currentGeneration, currentUsername)
+	if err != nil {
+		if isSQLiteBusy(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return true, nil
+	}
+	if err := tx.Commit(); err != nil {
+		if isSQLiteBusy(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	return false, nil
+}
+
+func isSQLiteBusy(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "database table is locked") ||
+		strings.Contains(msg, "sqlite_busy")
+}
+
+func (s *Store) SetBangumiSyncEnabled(userID int64, enabled bool) error {
+	_, err := s.DB.Exec(`UPDATE bangumi_accounts SET sync_enabled=? WHERE user_id=?`, boolToInt(enabled), userID)
+	return err
+}
+
+// ResumePausedBangumiJobs makes the user's paused queue due immediately when
+// sync is turned back on. Failed jobs are deliberately not included.
+func (s *Store) ResumePausedBangumiJobs(userID int64, now time.Time) error {
+	_, err := s.DB.Exec(`UPDATE bangumi_sync_jobs
+		SET next_attempt_at=?, updated_at=?
+		WHERE user_id=? AND status='pending' AND next_attempt_at>?`, now, now, userID, now)
+	return err
+}
+
+func (s *Store) MarkBangumiSyncSuccess(userID int64, at time.Time) error {
+	_, err := s.DB.Exec(`UPDATE bangumi_accounts SET last_sync_at=?, last_error='' WHERE user_id=?`, at, userID)
+	return err
+}
+
+func (s *Store) SetBangumiAccountError(userID int64, msg string) error {
+	_, err := s.DB.Exec(`UPDATE bangumi_accounts SET last_error=? WHERE user_id=?`, msg, userID)
+	return err
+}
+
+// DeleteBangumiAccount removes both the credential and its outstanding queue.
+// Leaving jobs behind would make a later reconnect replay work the user has
+// already disconnected from.
+func (s *Store) DeleteBangumiAccount(userID int64) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM bangumi_sync_jobs WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM bangumi_accounts WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// EnqueueBangumiSync records a completed local episode without any network
+// access. The worker resolves the Bangumi chapter later, which keeps the
+// player's progress save independent of Bangumi latency. The account generation
+// pins the job to the credential the viewer had when they watched it.
+func (s *Store) EnqueueBangumiSync(userID, fileID int64, subjectID, episodeNumber int, now time.Time) error {
+	if subjectID <= 0 || episodeNumber <= 0 {
+		return fmt.Errorf("Bangumi 条目或本地集数无效")
+	}
+	// A duplicate is a successful no-op. The unique index below turns a
+	// simultaneous duplicate into the same no-op.
+	_, err := s.DB.Exec(`INSERT INTO bangumi_sync_jobs
+		(user_id, file_id, subject_id, episode_id, episode_number, account_generation,
+		 status, attempts, lease_token, next_attempt_at, last_error, created_at, updated_at)
+		SELECT ?, ?, ?, 0, ?, COALESCE((SELECT generation FROM bangumi_accounts WHERE user_id=?), 0),
+			'pending', 0, '', ?, '', ?, ?
+		WHERE EXISTS (SELECT 1 FROM bangumi_accounts WHERE user_id=?)
+		  AND NOT EXISTS (SELECT 1 FROM bangumi_sync_jobs
+			WHERE user_id=? AND subject_id=? AND episode_number=?)`,
+		userID, fileID, subjectID, episodeNumber, userID, now, now, now,
+		userID, userID, subjectID, episodeNumber)
+	if err != nil {
+		if isBangumiEpisodeDuplicate(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// SetBangumiJobTarget snapshots the resolved Bangumi chapter. A legacy row may
+// have a target but no local episode number; filling both in one update keeps
+// the unique index meaningful without a second queue row.
+func (s *Store) SetBangumiJobTarget(jobID int64, subjectID, episodeID, episodeNumber int, generation int64, leaseToken string) error {
+	// A legacy placeholder has no target. If another row already owns this
+	// local episode, merging it here would violate the partial unique index;
+	// remove the placeholder instead.
+	var duplicate int
+	err := s.DB.QueryRow(`SELECT 1 FROM bangumi_sync_jobs
+		WHERE user_id=(SELECT user_id FROM bangumi_sync_jobs WHERE id=?)
+		  AND subject_id=? AND episode_number=? AND id<>? LIMIT 1`,
+		jobID, subjectID, episodeNumber, jobID).Scan(&duplicate)
+	if err == nil {
+		return s.DeleteBangumiJobIfLeased(jobID, leaseToken)
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+	res, err := s.DB.Exec(`UPDATE bangumi_sync_jobs
+		SET subject_id=?, episode_id=?, episode_number=?
+		WHERE id=? AND status='processing' AND account_generation=? AND lease_token=?
+		  AND EXISTS (SELECT 1 FROM bangumi_accounts a
+			WHERE a.user_id=bangumi_sync_jobs.user_id
+			  AND a.generation=bangumi_sync_jobs.account_generation)`,
+		subjectID, episodeID, episodeNumber, jobID, generation, leaseToken)
+	if err != nil {
+		if isBangumiEpisodeDuplicate(err) {
+			// Another job already covers this local episode. Delete this
+			// placeholder so it cannot remain stuck in processing.
+			return s.DeleteBangumiJobIfLeased(jobID, leaseToken)
+		}
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrBangumiJobLeaseLost
+	}
+	return nil
+}
+
+func isBangumiEpisodeDuplicate(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique constraint failed") &&
+		strings.Contains(msg, "bangumi_sync_jobs.user_id") &&
+		strings.Contains(msg, "bangumi_sync_jobs.subject_id") &&
+		strings.Contains(msg, "bangumi_sync_jobs.episode_number")
+}
+
+// DeleteBangumiJobIfLeased removes an obsolete processing row only if the
+// caller still holds its lease. It is used when a job turns out to be a
+// duplicate of a target another row already owns.
+func (s *Store) DeleteBangumiJobIfLeased(jobID int64, leaseToken string) error {
+	_, err := s.DB.Exec(`DELETE FROM bangumi_sync_jobs WHERE id=? AND lease_token=?`, jobID, leaseToken)
+	return err
+}
+
+// RetryBangumiSyncJobs is the explicit retry path used by the account dialog.
+// It revives failed targets (for example after fixing a token) and also makes
+// paused jobs due immediately.
+func (s *Store) RetryBangumiSyncJobs(userID int64, now time.Time) (int64, error) {
+	res, err := s.DB.Exec(`UPDATE bangumi_sync_jobs
+		SET status='pending', attempts=0, next_attempt_at=?, last_error='', updated_at=?,
+			account_generation=COALESCE((SELECT generation FROM bangumi_accounts WHERE user_id=?), account_generation)
+		WHERE user_id=? AND status IN ('failed','pending')`, now, now, userID, userID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// CompletedProgressFiles lists local files whose progress reached the watched
+// threshold. The service still resolves and validates the Bangumi target before
+// queueing, so films and unmatched shows never create jobs.
+func (s *Store) CompletedProgressFiles(userID int64) ([]int64, error) {
+	rows, err := s.DB.Query(`SELECT p.file_id
+		FROM progress p
+		WHERE p.user_id=? AND p.duration>0 AND p.position>=p.duration*0.9
+		ORDER BY p.updated_at DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) BangumiSyncStats(userID int64) (pending, failed, synced int, err error) {
+	err = s.DB.QueryRow(`SELECT
+		COALESCE(SUM(CASE WHEN status IN ('pending','processing') THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status='done' THEN 1 ELSE 0 END), 0)
+		FROM bangumi_sync_jobs WHERE user_id=?`, userID).
+		Scan(&pending, &failed, &synced)
+	return
+}
+
+// RecoverBangumiSyncJobs returns claims interrupted by a crash to the queue.
+func (s *Store) RecoverBangumiSyncJobs(now time.Time) error {
+	_, err := s.DB.Exec(`UPDATE bangumi_sync_jobs
+		SET status='pending', next_attempt_at=?, updated_at=?
+		WHERE status='processing' AND next_attempt_at<=?`, now, now, now)
+	return err
+}
+
+// ClaimBangumiSyncJob leases one due job. The service is single-worker, but a
+// lease also prevents a second process sharing the database from double-posting.
+func (s *Store) ClaimBangumiSyncJob(now time.Time) (*models.BangumiSyncJob, error) {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	job := &models.BangumiSyncJob{}
+	err = tx.QueryRow(`SELECT id, user_id, file_id, subject_id, episode_id, episode_number,
+		account_generation, status, attempts, next_attempt_at,
+		last_error, created_at, updated_at
+		FROM bangumi_sync_jobs
+		WHERE status='pending' AND next_attempt_at<=?
+		  AND EXISTS (SELECT 1 FROM bangumi_accounts a
+			WHERE a.user_id=bangumi_sync_jobs.user_id
+			  AND a.generation=bangumi_sync_jobs.account_generation)
+		ORDER BY next_attempt_at, id LIMIT 1`, now).
+		Scan(&job.ID, &job.UserID, &job.FileID, &job.SubjectID, &job.EpisodeID,
+			&job.EpisodeNumber, &job.AccountGen, &job.Status, &job.Attempts, &job.NextAttemptAt,
+			&job.LastError,
+			&job.CreatedAt, &job.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	lease := now.Add(5 * time.Minute)
+	leaseToken := newLeaseToken()
+	res, err := tx.Exec(`UPDATE bangumi_sync_jobs
+		SET status='processing', lease_token=?, next_attempt_at=?, updated_at=?
+		WHERE id=? AND status='pending'`, leaseToken, lease, now, job.ID)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return nil, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	job.Status = "processing"
+	job.LeaseToken = leaseToken
+	job.NextAttemptAt = lease
+	job.UpdatedAt = now
+	return job, nil
+}
+
+// RequeueBangumiJobIfLeased returns a paused job to pending. It keeps the
+// claim lease intact until the transition succeeds, so a stale worker cannot
+// un-pause a newer claim.
+func (s *Store) RequeueBangumiJobIfLeased(jobID int64, leaseToken string, next time.Time, msg string) error {
+	res, err := s.DB.Exec(`UPDATE bangumi_sync_jobs
+		SET status='pending', next_attempt_at=?, last_error=?, updated_at=?, lease_token=''
+		WHERE id=? AND status='processing' AND lease_token=?`,
+		next, msg, time.Now(), jobID, leaseToken)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrBangumiJobLeaseLost
+	}
+	return nil
+}
+
+// UpdateBangumiSyncJob fences a worker's result on the lease it claimed. An
+// expired worker that wakes up after another worker reclaimed the job cannot
+// overwrite the newer attempt.
+func (s *Store) UpdateBangumiSyncJob(job *models.BangumiSyncJob) error {
+	res, err := s.DB.Exec(`UPDATE bangumi_sync_jobs
+		SET status=?, attempts=?, lease_token='', next_attempt_at=?, last_error=?, updated_at=?
+		WHERE id=? AND status='processing' AND lease_token=? AND account_generation=?
+		  AND EXISTS (SELECT 1 FROM bangumi_accounts a
+			WHERE a.user_id=bangumi_sync_jobs.user_id
+			  AND a.generation=bangumi_sync_jobs.account_generation)`,
+		job.Status, job.Attempts, job.NextAttemptAt, job.LastError, job.UpdatedAt,
+		job.ID, job.LeaseToken, job.AccountGen)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrBangumiJobLeaseLost
+	}
+	job.LeaseToken = ""
+	return nil
+}
+
+func newLeaseToken() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
 }

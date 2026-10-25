@@ -136,6 +136,12 @@ func (m *Manager) bgm() *BangumiClient {
 	return NewBangumiClient(c.Token, c.APIBase, m.bgmHTTPClient(30*time.Second))
 }
 
+// BangumiEpisodes exposes the cached subject episode list to features outside
+// metadata enrichment (notably per-user watch-progress sync).
+func (m *Manager) BangumiEpisodes(ctx context.Context, subjectID int) ([]BgmEpisodeMeta, error) {
+	return m.bgmEpisodes(ctx, subjectID)
+}
+
 // bgmEpisodes caches one subject's episode list for the duration of an
 // enrichment run — otherwise every episode of a show refetches it.
 func (m *Manager) bgmEpisodes(ctx context.Context, subjectID int) ([]BgmEpisodeMeta, error) {
@@ -148,7 +154,13 @@ func (m *Manager) bgmEpisodes(ctx context.Context, subjectID int) ([]BgmEpisodeM
 		return eps, nil
 	}
 	m.bgmMu.Unlock()
+	return m.RefreshBangumiEpisodes(ctx, subjectID)
+}
 
+// RefreshBangumiEpisodes bypasses the in-process cache. An airing show gains
+// episodes after the initial scan, so progress sync needs a way to discover a
+// newly aired episode instead of accepting a stale list as final.
+func (m *Manager) RefreshBangumiEpisodes(ctx context.Context, subjectID int) ([]BgmEpisodeMeta, error) {
 	eps, err := m.bgm().Episodes(ctx, subjectID)
 	if err != nil {
 		return nil, err

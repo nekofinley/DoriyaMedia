@@ -122,6 +122,7 @@ type BgmSubject struct {
 
 // BgmEpisodeMeta is per-episode metadata (Chinese + original title, air date).
 type BgmEpisodeMeta struct {
+	ID       int
 	Number   int
 	Title    string // 中文优先
 	Original string
@@ -285,15 +286,29 @@ func (c *BangumiClient) Subject(ctx context.Context, id int) (*BgmSubject, error
 
 // Episodes lists main-story episodes (type=0) with Chinese + original titles.
 func (c *BangumiClient) Episodes(ctx context.Context, subjectID int) ([]BgmEpisodeMeta, error) {
-	var res struct {
-		Data []bgmEpisode `json:"data"`
+	const pageSize = 200
+	var all []bgmEpisode
+	for offset := 0; ; {
+		var res struct {
+			Data  []bgmEpisode `json:"data"`
+			Total int          `json:"total"`
+		}
+		u := fmt.Sprintf("%s/v0/episodes?subject_id=%d&type=0&limit=%d&offset=%d",
+			c.APIBase, subjectID, pageSize, offset)
+		if err := c.do(ctx, "GET", u, nil, &res); err != nil {
+			return nil, err
+		}
+		all = append(all, res.Data...)
+		if len(res.Data) < pageSize || (res.Total > 0 && len(all) >= res.Total) {
+			break
+		}
+		offset += len(res.Data)
+		if offset > 20000 {
+			break
+		}
 	}
-	u := fmt.Sprintf("%s/v0/episodes?subject_id=%d&type=0&limit=200", c.APIBase, subjectID)
-	if err := c.do(ctx, "GET", u, nil, &res); err != nil {
-		return nil, err
-	}
-	out := make([]BgmEpisodeMeta, 0, len(res.Data))
-	for _, e := range res.Data {
+	out := make([]BgmEpisodeMeta, 0, len(all))
+	for _, e := range all {
 		num := int(e.Ep)
 		if num == 0 {
 			num = int(e.Sort)
@@ -302,6 +317,7 @@ func (c *BangumiClient) Episodes(ctx context.Context, subjectID int) ([]BgmEpiso
 			continue
 		}
 		out = append(out, BgmEpisodeMeta{
+			ID:       e.ID,
 			Number:   num,
 			Title:    orDefaultStr(e.NameCN, e.Name),
 			Original: e.Name,

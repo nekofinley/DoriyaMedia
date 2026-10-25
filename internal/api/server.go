@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"doriyamedia/internal/auth"
+	"doriyamedia/internal/bangumi"
 	"doriyamedia/internal/config"
 	"doriyamedia/internal/db"
 	"doriyamedia/internal/media"
@@ -47,6 +48,9 @@ type Server struct {
 	// SubtitleAudits holds the per-library "which BDRip episodes have no
 	// subtitles" audits and their last results. See subaudit.go.
 	SubtitleAudits *subtitleAuditRegistry
+	// BangumiSync holds each viewer's own Bangumi credential and the durable
+	// watch-progress outbox. See bangumi_handlers.go.
+	BangumiSync *bangumi.Service
 
 	// imports holds "search a bilibili title, click it, import it" jobs. They are
 	// short-lived and in memory: a job is only useful while its loading page is
@@ -60,6 +64,7 @@ func New(store *db.Store, cfg *config.Config, scanner *scan.Scanner, meta *metad
 		Store: store, Cfg: cfg, Scanner: scanner, Metadata: meta, Engine: engine,
 		WebFS: webFS, DevWeb: cfg.DevWebDir, Version: version,
 		SubtitleAudits: newSubtitleAuditRegistry(),
+		BangumiSync:    bangumi.NewService(store, meta, cfg),
 		imports:        map[string]*importJob{},
 		// Ten wrong passwords per address per five minutes is far more than a
 		// person needs and far too slow to guess with; five signups per hour
@@ -316,6 +321,13 @@ func (s *Server) Handler() http.Handler {
 	// progress
 	mux.HandleFunc("POST /api/progress", s.requireAuth(s.handleSaveProgress))
 	mux.HandleFunc("GET /api/progress", s.requireAuth(s.handleListProgress))
+	mux.HandleFunc("GET /api/bangumi/account", s.requireAuth(s.handleBangumiAccount))
+	mux.HandleFunc("PUT /api/bangumi/account", s.requireAuth(s.handleBangumiConnect))
+	mux.HandleFunc("DELETE /api/bangumi/account", s.requireAuth(s.handleBangumiDisconnect))
+	mux.HandleFunc("PUT /api/bangumi/account/settings", s.requireAuth(s.handleBangumiSettings))
+	mux.HandleFunc("POST /api/bangumi/account/sync", s.requireAuth(s.handleBangumiBackfill))
+	mux.HandleFunc("GET /api/bangumi/collections", s.requireAuth(s.handleBangumiCollections))
+	mux.HandleFunc("GET /api/bangumi/cover", s.requireAuth(s.handleBangumiCover))
 
 	// static SPA
 	mux.HandleFunc("/", s.serveStatic)
