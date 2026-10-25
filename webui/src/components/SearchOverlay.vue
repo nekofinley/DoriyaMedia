@@ -151,6 +151,12 @@ function go(item) {
   router.push(`/item/${item.id}`)
 }
 
+function goRequests() {
+  const term = q.value.trim()
+  emit('update:open', false)
+  router.push({ path: '/requests', query: term ? { q: term } : {} })
+}
+
 function onKeydown(e) {
   if (e.key === 'Escape') { emit('update:open', false); return }
   if (!shown.value.length) return
@@ -188,6 +194,9 @@ function onKeydown(e) {
               <AppIcon name="search" :size="26" />
               <div class="t">没有找到「{{ q }}」</div>
               <div class="tiny">媒体库里没有,B 站片库里也没有相近的番剧</div>
+              <button class="btn sm request-cta" @click="goRequests">
+                <AppIcon name="inbox" :size="14" /> 去求片
+              </button>
             </div>
 
             <div v-if="shown.length" class="results stagger">
@@ -370,6 +379,7 @@ function onKeydown(e) {
   text-align: center;
 }
 .none .t { font-size: var(--fs-15); font-weight: 650; color: var(--text-2); }
+.request-cta { margin-top: 8px; }
 .foot {
   display: flex;
   align-items: center;

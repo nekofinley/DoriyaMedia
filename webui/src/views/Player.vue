@@ -1169,6 +1169,14 @@ const clientCaps = (() => {
       'video/mp4; codecs="hvc1.2.4.L153.B0"', // Main 10
     ].some((t) => MediaSource.isTypeSupported(t))
     caps.push(hevc ? 'hevc' : 'nohevc')
+    // Hi10P is profile 0x6e in the avc1 codec string. Chrome/Edge can decode it
+    // in software even without a hardware path, so ask before the server refuses
+    // the file. Safari has no MediaSource check and stays on the safe answer.
+    const hi10p = [
+      'video/mp4; codecs="avc1.6e0033"',
+      'video/mp4; codecs="avc1.6e0033,mp4a.40.2"',
+    ].some((t) => MediaSource.isTypeSupported(t))
+    if (hi10p) caps.push('hi10p')
     for (const [name, codecs] of AUDIO_CAPS) {
       if (codecs.some((c) => MediaSource.isTypeSupported(`audio/mp4; codecs="${c}"`))) caps.push(name)
     }

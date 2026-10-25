@@ -31,6 +31,7 @@ const nav = computed(() => {
   if (movieLib.value) out.push({ label: '电影', to: `/library/${movieLib.value.id}?type=movie`, icon: 'film' })
   if (seriesLib.value) out.push({ label: '剧集', to: `/library/${seriesLib.value.id}?type=show`, icon: 'tv' })
   out.push({ label: '追番', to: '/bangumi', icon: 'bookmark' })
+  out.push({ label: '求片', to: '/requests', icon: 'inbox' })
   out.push({ label: '文件', to: '/browse', icon: 'folder' })
   return out
 })
@@ -39,6 +40,7 @@ const tabs = computed(() => {
   const out = [{ label: '首页', to: '/', icon: 'home', exact: true }]
   if (movieLib.value) out.push({ label: '电影', to: `/library/${movieLib.value.id}?type=movie`, icon: 'film' })
   if (seriesLib.value) out.push({ label: '剧集', to: `/library/${seriesLib.value.id}?type=show`, icon: 'tv' })
+  out.push({ label: '求片', to: '/requests', icon: 'inbox' })
   out.push({ label: '文件', to: '/browse', icon: 'folder' })
   // The settings backend is the admin's; a viewer gets no tab that would only
   // bounce them back to the home page.
@@ -144,6 +146,12 @@ defineExpose({ openSearch: () => { searching.value = true } })
             </button>
             <router-link to="/bangumi" class="dd-item">
               <AppIcon name="bookmark" :size="16" /><span class="dd-name">Bangumi 追番</span>
+            </router-link>
+            <router-link to="/requests" class="dd-item">
+              <AppIcon name="inbox" :size="16" /><span class="dd-name">我的求片</span>
+            </router-link>
+            <router-link v-if="isAdmin" to="/requests/manage" class="dd-item">
+              <AppIcon name="layers" :size="16" /><span class="dd-name">求片管理</span>
             </router-link>
             <router-link v-if="isAdmin" to="/settings" class="dd-item">
               <AppIcon name="settings" :size="16" /><span class="dd-name">设置</span>

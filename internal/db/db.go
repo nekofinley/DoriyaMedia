@@ -195,6 +195,38 @@ func (s *Store) migrate() error {
 			updated_at TIMESTAMP NOT NULL,
 			PRIMARY KEY (user_id, file_id)
 		)`,
+		// Viewer-submitted titles. The account name is snapshotted because an
+		// administrator may delete the account later and still needs to know who
+		// asked for a title. Completed rows keep their original timestamp and are
+		// retained as the processed half of the request board.
+		`CREATE TABLE IF NOT EXISTS media_requests (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			user_name TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','completed')),
+			provider TEXT NOT NULL DEFAULT '',
+			title TEXT NOT NULL,
+			original_title TEXT NOT NULL DEFAULT '',
+			year INTEGER NOT NULL DEFAULT 0,
+			cover_url TEXT NOT NULL DEFAULT '',
+			overview TEXT NOT NULL DEFAULT '',
+			rating REAL NOT NULL DEFAULT 0,
+			episodes INTEGER NOT NULL DEFAULT 0,
+			source_id INTEGER NOT NULL DEFAULT 0,
+			library_id INTEGER NOT NULL DEFAULT 0,
+			season_id INTEGER NOT NULL DEFAULT 0,
+			bgm_id INTEGER NOT NULL DEFAULT 0,
+			item_id INTEGER NOT NULL DEFAULT 0,
+			note TEXT NOT NULL DEFAULT '',
+			admin_note TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL,
+			completed_at TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_media_requests_status
+			ON media_requests(status, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_media_requests_user
+			ON media_requests(user_id, status, created_at)`,
 		`CREATE TABLE IF NOT EXISTS bangumi_accounts (
 			user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
 			username TEXT NOT NULL,
@@ -1824,6 +1856,163 @@ func (s *Store) ProgressForFile(userID, fileID int64) (*models.Progress, error) 
 		return nil, err
 	}
 	return p, nil
+}
+
+// ---------- media requests ----------
+
+const mediaRequestCols = `id, user_id, user_name, status, provider, title, original_title,
+	year, cover_url, overview, rating, episodes, source_id, library_id, season_id,
+	bgm_id, item_id, note, admin_note, created_at, updated_at, completed_at`
+
+func scanMediaRequest(row interface{ Scan(...any) error }) (*models.MediaRequest, error) {
+	r := &models.MediaRequest{}
+	var completed sql.NullTime
+	err := row.Scan(&r.ID, &r.UserID, &r.UserName, &r.Status, &r.Provider,
+		&r.Title, &r.OriginalTitle, &r.Year, &r.CoverURL, &r.Overview, &r.Rating,
+		&r.Episodes, &r.SourceID, &r.LibraryID, &r.SeasonID, &r.BGMID, &r.ItemID,
+		&r.Note, &r.AdminNote, &r.CreatedAt, &r.UpdatedAt, &completed)
+	if err != nil {
+		return nil, err
+	}
+	if completed.Valid {
+		r.CompletedAt = &completed.Time
+	}
+	return r, nil
+}
+
+// CreateMediaRequest stores one viewer request. An identical pending title from
+// the same account is returned instead of creating a duplicate card; that also
+// makes a double-clicked submit button harmless.
+func (s *Store) CreateMediaRequest(r *models.MediaRequest) (*models.MediaRequest, error) {
+	now := time.Now()
+	if r.Status == "" {
+		r.Status = models.MediaRequestPending
+	}
+	if r.CreatedAt.IsZero() {
+		r.CreatedAt = now
+	}
+	r.UpdatedAt = now
+
+	// The existence check lives inside the INSERT so two concurrent submits
+	// cannot both observe "no pending row" and create duplicate cards.
+	res, err := s.DB.Exec(`INSERT INTO media_requests
+		(user_id, user_name, status, provider, title, original_title, year, cover_url,
+		 overview, rating, episodes, source_id, library_id, season_id, bgm_id, item_id,
+		 note, admin_note, created_at, updated_at, completed_at)
+		SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+		WHERE NOT EXISTS (
+			SELECT 1 FROM media_requests
+			WHERE user_id=? AND status='pending' AND title=? COLLATE NOCASE
+		)`,
+		r.UserID, r.UserName, r.Status, r.Provider, r.Title, r.OriginalTitle, r.Year,
+		r.CoverURL, r.Overview, r.Rating, r.Episodes, r.SourceID, r.LibraryID,
+		r.SeasonID, r.BGMID, r.ItemID, r.Note, r.AdminNote, r.CreatedAt,
+		r.UpdatedAt, nil, r.UserID, r.Title)
+	if err != nil {
+		return nil, err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return nil, err
+	} else if n == 0 {
+		existing, err := s.mediaRequestByUserTitle(r.UserID, r.Title)
+		if err != nil {
+			return nil, err
+		}
+		return existing, nil
+	}
+	r.ID, _ = res.LastInsertId()
+	return r, nil
+}
+
+func (s *Store) mediaRequestByUserTitle(userID int64, title string) (*models.MediaRequest, error) {
+	return scanMediaRequest(s.DB.QueryRow(`SELECT `+mediaRequestCols+`
+		FROM media_requests
+		WHERE user_id=? AND status='pending' AND title=? COLLATE NOCASE
+		ORDER BY id DESC LIMIT 1`, userID, title))
+}
+
+// MediaRequests lists one status (or every status when empty) newest first.
+// Viewer requests are scoped by userID; admins pass 0 to see the whole board.
+func (s *Store) MediaRequests(userID int64, status string) ([]models.MediaRequest, error) {
+	where := []string{"1=1"}
+	args := []any{}
+	if userID > 0 {
+		where = append(where, "user_id=?")
+		args = append(args, userID)
+	}
+	if status != "" {
+		where = append(where, "status=?")
+		args = append(args, status)
+	}
+	rows, err := s.DB.Query(`SELECT `+mediaRequestCols+` FROM media_requests
+		WHERE `+strings.Join(where, " AND ")+`
+		ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END,
+			CASE WHEN status='completed' THEN COALESCE(completed_at, created_at) ELSE created_at END DESC,
+			id DESC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []models.MediaRequest{}
+	for rows.Next() {
+		r, err := scanMediaRequest(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) MediaRequestByID(id int64) (*models.MediaRequest, error) {
+	return scanMediaRequest(s.DB.QueryRow(`SELECT `+mediaRequestCols+`
+		FROM media_requests WHERE id=?`, id))
+}
+
+// CompleteMediaRequest archives one pending request. itemID is optional: an
+// administrator may close a request manually after importing the title through
+// another path. The status predicate makes a repeated complete idempotent.
+func (s *Store) CompleteMediaRequest(id, itemID int64, adminNote string) (*models.MediaRequest, error) {
+	now := time.Now()
+	res, err := s.DB.Exec(`UPDATE media_requests
+		SET status='completed', item_id=CASE WHEN ? > 0 THEN ? ELSE item_id END,
+			admin_note=?, updated_at=?, completed_at=?
+		WHERE id=? AND status='pending'`, itemID, itemID, adminNote, now, now, id)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		existing, readErr := s.MediaRequestByID(id)
+		if readErr != nil {
+			return nil, readErr
+		}
+		if existing.Status != models.MediaRequestCompleted {
+			return nil, fmt.Errorf("求片状态未更新")
+		}
+		return existing, nil
+	}
+	return s.MediaRequestByID(id)
+}
+
+// ReopenMediaRequest moves a completed card back to the pending board, for the
+// case where an import was reversed or a request was closed by mistake.
+func (s *Store) ReopenMediaRequest(id int64) (*models.MediaRequest, error) {
+	now := time.Now()
+	res, err := s.DB.Exec(`UPDATE media_requests
+		SET status='pending', item_id=0, admin_note='', completed_at=NULL, updated_at=?
+		WHERE id=?`, now, id)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return s.MediaRequestByID(id)
+}
+
+func (s *Store) DeleteMediaRequest(id int64) error {
+	_, err := s.DB.Exec(`DELETE FROM media_requests WHERE id=?`, id)
+	return err
 }
 
 // ---------- bangumi accounts and sync queue ----------

@@ -301,6 +301,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/catalog/import", s.requireAuth(s.handleCatalogImport))
 	mux.HandleFunc("GET /api/import/{id}", s.requireAuth(s.handleImportStatus))
 
+	// viewer wishlist: search a title, submit it, and let an administrator work
+	// through the pending poster wall. The two listing routes deliberately have
+	// different scopes: a viewer sees only their own requests, an admin sees all.
+	mux.HandleFunc("GET /api/requests/search", s.requireAuth(s.handleRequestSearch))
+	mux.HandleFunc("GET /api/requests", s.requireAuth(s.handleListMediaRequests))
+	mux.HandleFunc("POST /api/requests", s.requireAuth(s.handleCreateMediaRequest))
+	mux.HandleFunc("GET /api/admin/requests", s.requireAdmin(s.handleAdminListMediaRequests))
+	mux.HandleFunc("PUT /api/admin/requests/{id}", s.requireAdmin(s.handleUpdateMediaRequest))
+	mux.HandleFunc("DELETE /api/admin/requests/{id}", s.requireAdmin(s.handleDeleteMediaRequest))
+	mux.HandleFunc("POST /api/admin/requests/{id}/import", s.requireAdmin(s.handleRequestImport))
+
 	// playback
 	mux.HandleFunc("GET /api/play/{id}", s.requireAuth(s.handlePlay))
 	mux.HandleFunc("GET /api/play/{id}/status", s.requireAuth(s.handlePlayStatus))

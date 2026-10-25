@@ -191,6 +191,42 @@ type Progress struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// Media request states. A viewer's wish starts pending and moves to completed
+// once an administrator has imported it or explicitly closed the request.
+const (
+	MediaRequestPending   = "pending"
+	MediaRequestCompleted = "completed"
+)
+
+// MediaRequest is one title a viewer asked DoriyaMedia to add. The metadata is
+// snapshotted at submission time so the request stays readable when an upstream
+// catalogue is unavailable later. UserName is also copied for the same reason:
+// deleting an account must not turn old requests into anonymous rows.
+type MediaRequest struct {
+	ID            int64      `json:"id"`
+	UserID        int64      `json:"user_id"`
+	UserName      string     `json:"user_name"`
+	Status        string     `json:"status"`
+	Provider      string     `json:"provider"` // bilibili | bangumi
+	Title         string     `json:"title"`
+	OriginalTitle string     `json:"original_title,omitempty"`
+	Year          int        `json:"year,omitempty"`
+	CoverURL      string     `json:"cover_url,omitempty"`
+	Overview      string     `json:"overview,omitempty"`
+	Rating        float64    `json:"rating,omitempty"`
+	Episodes      int        `json:"episodes,omitempty"`
+	SourceID      int64      `json:"source_id,omitempty"`
+	LibraryID     int64      `json:"library_id,omitempty"`
+	SeasonID      int64      `json:"season_id,omitempty"`
+	BGMID         int        `json:"bgm_id,omitempty"`
+	ItemID        int64      `json:"item_id,omitempty"`
+	Note          string     `json:"note,omitempty"`
+	AdminNote     string     `json:"admin_note,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	CompletedAt   *time.Time `json:"completed_at,omitempty"`
+}
+
 // BangumiAccount is one viewer's own Bangumi.tv authorization. The access
 // token is encrypted before it reaches the database and is never included in
 // API responses.

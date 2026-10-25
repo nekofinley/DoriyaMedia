@@ -176,9 +176,10 @@ func CanDirectPlay(probe *Probe, path string, client ClientKind, reportedAudio m
 		return table[codec] || reportedAudio[codec]
 	}
 
-	// 10-bit H.264 (Hi10P) has no consumer hardware decode path — no client
-	// can direct-play it; everything else is gated per client below.
-	if v != nil && v.CodecName == "h264" && strings.Contains(strings.ToLower(v.Profile), "10") {
+	// 10-bit H.264 (Hi10P) has no consumer hardware decode path, so the table
+	// cannot vouch for it. A client may still prove it decodes the profile in
+	// software; canDirectPlay applies that report before reaching this check.
+	if isHi10P(v) {
 		return false, "10bit H.264(Hi10P)没有硬件解码路径"
 	}
 
@@ -311,6 +312,13 @@ type DecideOptions struct {
 	// and handing such a client a stream it cannot decode just looks broken. So a
 	// negative report rules out both direct play and copying.
 	ClientNoHEVC bool
+	// ClientHi10P is the client's own report that it can decode 10-bit H.264.
+	// Hi10P has no hardware path in most browsers, but Chromium can decode it in
+	// software and demux Matroska, so the blanket refusal must not hide a file the
+	// client has just proven it can play. Without this report the old refusal
+	// stays, because a browser that only answers "maybe" cannot be trusted with a
+	// profile that usually fails.
+	ClientHi10P bool
 	// ClientAudio is the set of audio codecs the client reported it can decode
 	// (ffprobe names, e.g. "eac3"). It only ever widens direct play; see
 	// CanDirectPlay.
@@ -342,13 +350,47 @@ func Decide(probe *Probe, path string, client ClientKind, opts DecideOptions) *D
 // examined itself and found no HEVC decoder must not be handed HEVC just because
 // the generic codec table assumes browsers cope.
 func canDirectPlay(probe *Probe, path string, client ClientKind, opts DecideOptions) (bool, string) {
-	can, why := CanDirectPlay(probe, path, client, opts.ClientAudio)
+	can, why := canDirectPlayWithHi10P(probe, path, client, opts.ClientAudio, opts.ClientHi10P)
 	if can && opts.ClientNoHEVC {
 		if v := probe.Video(); v != nil && v.CodecName == "hevc" {
 			return false, "客户端自报不支持 HEVC"
 		}
 	}
 	return can, why
+}
+
+// canDirectPlayWithHi10P is CanDirectPlay with the one exception the client can
+// prove: a Hi10P file on a browser that reported it decodes this profile. The
+// public CanDirectPlay keeps refusing it, so callers that cannot consult the
+// client's report (and every test that pins the old conservative answer) still
+// get a safe verdict.
+func canDirectPlayWithHi10P(probe *Probe, path string, client ClientKind, reportedAudio map[string]bool, clientHi10P bool) (bool, string) {
+	v := probe.Video()
+	if clientHi10P && v != nil && v.CodecName == "h264" && isHi10P(v) {
+		// The check lives inside CanDirectPlay because it applies before the
+		// per-client codec tables. Re-run the rest of the decision with the profile
+		// hidden, then put the original probe back: a copy of the stream struct is
+		// enough, and no caller owns a Probe by pointer.
+		copied := *probe
+		streams := make([]ProbeStream, len(probe.Streams))
+		copy(streams, probe.Streams)
+		copied.Streams = streams
+		for i := range copied.Streams {
+			if copied.Streams[i].Index == v.Index {
+				copied.Streams[i].Profile = "High"
+				break
+			}
+		}
+		return CanDirectPlay(&copied, path, client, reportedAudio)
+	}
+	return CanDirectPlay(probe, path, client, reportedAudio)
+}
+
+// isHi10P reports whether ffprobe labelled an H.264 stream as 10-bit. ffprobe
+// calls it "High 10"; the codec string's profile byte is 0x6e, which is what the
+// browser's own MediaSource check uses.
+func isHi10P(v *ProbeStream) bool {
+	return v != nil && v.CodecName == "h264" && strings.Contains(strings.ToLower(v.Profile), "10")
 }
 
 // fallbackPlan lists the strategies a client may try after the primary one fails,

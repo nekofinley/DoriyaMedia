@@ -55,6 +55,15 @@ func TestPickBGM(t *testing.T) {
 			want:    0,
 		},
 		{
+			name:  "地区限定后缀不影响精确匹配",
+			query: "86－不存在的戰區－（僅限港澳台地區）",
+			results: []BgmSubject{
+				subj("86 -不存在的战区-", "86-エイティシックス-", 2021),
+				subj("86 -不存在的战区- 第2部分", "86-エイティシックス- 第2クール", 2021),
+			},
+			want: 0,
+		},
+		{
 			name:    "续作不会被主条目抢走(精确优先)",
 			query:   "咒术回战",
 			results: []BgmSubject{subj("咒术回战", "呪術廻戦", 2020), subj("咒术回战 怀玉･玉折 / 涩谷事变", "", 2023)},
@@ -254,6 +263,57 @@ func TestSearchBGMTriesSimplifiedSpelling(t *testing.T) {
 	defer mu.Unlock()
 	if len(seen) < 2 || seen[0] != "間諜家家酒" || seen[1] != "间谍家家酒" {
 		t.Fatalf("searches = %v, want the original then its Simplified spelling", seen)
+	}
+}
+
+func TestSearchBGMStripsRegionQualifier(t *testing.T) {
+	const sourceTitle = "86－不存在的戰區－（僅限港澳台地區）"
+	const core = "86－不存在的战区－"
+	var mu sync.Mutex
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/search/subjects":
+			var body struct {
+				Keyword string `json:"keyword"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			seen = append(seen, body.Keyword)
+			mu.Unlock()
+			hits := []map[string]any{}
+			if body.Keyword == core {
+				hits = append(hits, map[string]any{
+					"id": 302189, "name": "86-エイティシックス-", "name_cn": "86 -不存在的战区-",
+					"type": 2, "date": "2021-04-11", "eps": 11,
+				})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": hits, "total": len(hits)})
+		case "/v0/subjects/302189":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 302189, "name": "86-エイティシックス-", "name_cn": "86 -不存在的战区-",
+				"type": 2, "date": "2021-04-11", "eps": 11,
+				"images": map[string]any{"large": "https://lain.bgm.tv/pic/cover/l/x.jpg"},
+				"rating": map[string]any{"score": 8.4},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	m := NewManager(nil, &config.Config{BGM: config.BGMTV{APIBase: srv.URL}})
+	sub, err := m.searchBGM(context.Background(), sourceTitle, 2021)
+	if err != nil {
+		t.Fatalf("searchBGM: %v", err)
+	}
+	if sub == nil || sub.ID != 302189 {
+		t.Fatalf("searchBGM = %+v, want subject 302189", sub)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 || seen[0] != sourceTitle || seen[1] != core {
+		t.Fatalf("searches = %v, want original then Simplified core", seen)
 	}
 }
 

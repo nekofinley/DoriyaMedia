@@ -46,6 +46,7 @@ const initials = computed(() => (props.seed || props.alt || '?').trim().slice(0,
       :src="src" :alt="alt"
       :loading="eager ? 'eager' : 'lazy'"
       :fetchpriority="eager ? 'high' : 'auto'"
+      referrerpolicy="no-referrer"
       decoding="async"
       :class="{ in: loaded }"
       @load="loaded = true"

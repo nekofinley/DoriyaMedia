@@ -115,16 +115,17 @@ func (s *Server) handleCatalogSearch(w http.ResponseWriter, r *http.Request, use
 type importJob struct {
 	mu sync.Mutex
 
-	ID        string
-	LibraryID int64
-	SourceID  int64
-	SeasonID  int64
-	Path      string
-	Title     string
-	Phase     string // walk | organize | meta | done | error
-	Error     string
-	ItemID    int64
-	created   time.Time
+	ID         string
+	LibraryID  int64
+	SourceID   int64
+	SeasonID   int64
+	Path       string
+	Title      string
+	Phase      string // walk | organize | meta | done | error
+	Error      string
+	ItemID     int64
+	RequestIDs map[int64]struct{}
+	created    time.Time
 
 	prog *models.ScanProgress
 }
@@ -135,20 +136,48 @@ func (j *importJob) setPhase(phase string) {
 	j.mu.Unlock()
 }
 
-func (j *importJob) finish(err error) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	if err != nil {
-		j.Phase, j.Error = "error", err.Error()
-		return
-	}
-	j.Phase = "done"
-}
-
 func (j *importJob) finished() bool {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.Phase == "done" || j.Phase == "error"
+}
+
+func (j *importJob) fail(err error) {
+	j.mu.Lock()
+	j.Phase, j.Error = "error", err.Error()
+	j.mu.Unlock()
+}
+
+func (j *importJob) addRequest(id int64) {
+	if id <= 0 {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.Phase == "done" || j.Phase == "error" {
+		return
+	}
+	if j.RequestIDs == nil {
+		j.RequestIDs = map[int64]struct{}{}
+	}
+	j.RequestIDs[id] = struct{}{}
+}
+
+// complete marks the import done only after any request cards that joined the
+// job have been archived server-side. Keeping the job lock while updating the
+// rows prevents another request from attaching between archiving and "done".
+func (j *importJob) complete(s *Server, itemID int64) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.Phase == "done" || j.Phase == "error" {
+		return
+	}
+	for requestID := range j.RequestIDs {
+		if _, err := s.Store.CompleteMediaRequest(requestID, itemID, ""); err != nil {
+			log.Printf("import: archive media request %d for item %d failed: %v", requestID, itemID, err)
+		}
+	}
+	j.Phase = "done"
 }
 
 func (j *importJob) snapshot() map[string]any {
@@ -175,7 +204,7 @@ func newImportID() string {
 
 // startImport reuses a still-running job for the same season, so double-clicking
 // a card cannot start two walks of the same series.
-func (s *Server) startImport(lib *models.Library, src *models.Source, seasonID int64, path, title string) (*importJob, bool) {
+func (s *Server) startImport(lib *models.Library, src *models.Source, seasonID int64, path, title string, requestID int64) (*importJob, bool) {
 	s.importsMu.Lock()
 	defer s.importsMu.Unlock()
 	if s.imports == nil {
@@ -187,14 +216,16 @@ func (s *Server) startImport(lib *models.Library, src *models.Source, seasonID i
 			delete(s.imports, id)
 		}
 		if j.LibraryID == lib.ID && j.SeasonID == seasonID && !j.finished() {
+			j.addRequest(requestID)
 			return j, false
 		}
 	}
 	j := &importJob{
 		ID: newImportID(), LibraryID: lib.ID, SourceID: src.ID, SeasonID: seasonID,
 		Path: path, Title: title, Phase: "walk", created: now,
-		prog: models.NewScanProgress(lib.ID),
+		prog: models.NewScanProgress(lib.ID), RequestIDs: map[int64]struct{}{},
 	}
+	j.addRequest(requestID)
 	s.imports[j.ID] = j
 	return j, true
 }
@@ -205,17 +236,17 @@ func (j *importJob) run(s *Server, lib *models.Library, src *models.Source) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	if s.Scanner == nil {
-		j.finish(fmt.Errorf("扫描器未就绪"))
+		j.fail(fmt.Errorf("扫描器未就绪"))
 		return
 	}
 	j.prog.Update(func(st *models.ScanState) { st.Current = "正在读取季度与剧集…" })
 	itemID, err := s.Scanner.ImportSeries(ctx, lib, src.ID, j.Path, j.prog)
 	if err != nil {
-		j.finish(err)
+		j.fail(err)
 		return
 	}
 	if itemID == 0 {
-		j.finish(fmt.Errorf("剧集已建立,但找不到对应的番剧条目"))
+		j.fail(fmt.Errorf("剧集已建立,但找不到对应的番剧条目"))
 		return
 	}
 	j.mu.Lock()
@@ -235,7 +266,7 @@ func (j *importJob) run(s *Server, lib *models.Library, src *models.Source) {
 	j.prog.Update(func(st *models.ScanState) {
 		st.Phase, st.Running, st.Current = "done", false, "入库完成"
 	})
-	j.finish(nil)
+	j.complete(s, itemID)
 }
 
 // POST /api/catalog/import — starts (or joins) the import of one catalogue season.
@@ -292,7 +323,7 @@ func (s *Server) handleCatalogImport(w http.ResponseWriter, r *http.Request, use
 		fail(w, 502, "解析番剧失败: "+err.Error())
 		return
 	}
-	job, fresh := s.startImport(lib, src, req.SeasonID, path, title)
+	job, fresh := s.startImport(lib, src, req.SeasonID, path, title, 0)
 	if fresh {
 		go job.run(s, lib, src)
 	}

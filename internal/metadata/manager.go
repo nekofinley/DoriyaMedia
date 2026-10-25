@@ -142,6 +142,16 @@ func (m *Manager) BangumiEpisodes(ctx context.Context, subjectID int) ([]BgmEpis
 	return m.bgmEpisodes(ctx, subjectID)
 }
 
+// SearchBangumi exposes the metadata client's public anime search to the
+// request page. It follows the same proxy and token settings as scraping, so a
+// deployment that can identify its library can also search the catalogue.
+func (m *Manager) SearchBangumi(ctx context.Context, keyword string) ([]BgmSubject, error) {
+	if m == nil {
+		return nil, fmt.Errorf("元数据服务未就绪")
+	}
+	return m.bgm().Search(ctx, keyword, BgmTypeAnime)
+}
+
 // bgmEpisodes caches one subject's episode list for the duration of an
 // enrichment run — otherwise every episode of a show refetches it.
 func (m *Manager) bgmEpisodes(ctx context.Context, subjectID int) ([]BgmEpisodeMeta, error) {
@@ -779,11 +789,11 @@ func findImage(names map[string]source.Entry, candidates []string) string {
 // ---------- tmdb ----------
 
 // searchTMDB asks for a title in every spelling the providers index. A 港澳台
-// source names its shows in Traditional Chinese; TMDB's zh-CN titles are
-// Simplified, and a search for the Traditional spelling can return nothing at
-// all. The original spelling is tried first, then the Simplified one; a hit
-// that resembles the title wins, otherwise the first answer of the first
-// non-empty search is kept (the behaviour before this existed).
+// source names its shows in Traditional Chinese and may append a regional
+// qualifier; TMDB indexes the title without that qualifier, in Simplified
+// Chinese. The original spelling is tried first, then the Simplified and
+// Traditional core titles; a hit that resembles the title wins, otherwise the
+// first answer of the first non-empty search is kept.
 func (m *Manager) searchTMDB(ctx context.Context, kind, query string, year int) int {
 	t := m.tmdb()
 	if !t.Enabled() || strings.TrimSpace(query) == "" {
@@ -791,6 +801,7 @@ func (m *Manager) searchTMDB(ctx context.Context, kind, query string, year int) 
 	}
 	fallback := 0
 	for _, spelling := range searchSpellings(query) {
+		matchQuery := coreTitle(spelling)
 		throttle()
 		var results []TMDBSearchItem
 		var err error
@@ -802,7 +813,7 @@ func (m *Manager) searchTMDB(ctx context.Context, kind, query string, year int) 
 		if err != nil || len(results) == 0 {
 			continue
 		}
-		best, score := pickTMDB(results, query, year)
+		best, score := pickTMDB(results, matchQuery, year)
 		if fallback == 0 {
 			fallback = results[0].ID
 		}
@@ -817,12 +828,12 @@ func (m *Manager) searchTMDB(ctx context.Context, kind, query string, year int) 
 // title. Only names and the year are used: taking results[0] blindly is what
 // turns a Traditional title with no exact hit into a random show.
 func pickTMDB(results []TMDBSearchItem, query string, year int) (int, int) {
-	nq := normTitle(query)
+	nq := normTitle(coreTitle(query))
 	best, bestScore := 0, 0
 	for i, r := range results {
 		score := 10
 		for _, name := range []string{r.Title, r.Name, r.OriginalTitle, r.OriginalName} {
-			nn := normTitle(name)
+			nn := normTitle(coreTitle(name))
 			if nn == "" {
 				continue
 			}
@@ -942,13 +953,15 @@ func (m *Manager) tryShowBGM(ctx context.Context, show *models.Item, query strin
 }
 
 // searchBGM finds the best Bangumi subject for a name: exact title match first,
-// then a one-character edit, with the year as a tie-breaker.
+// then a one-character edit, with the year as a tie-breaker. Regional
+// qualifiers on the source title are removed for both the search and the
+// scoring pass.
 //
 // When nothing in the search results is close enough, it retries with spellings
 // that drop one character. Release folder names routinely carry one extra or
 // wrong character ("别再当欧尼酱了" vs "别当欧尼酱了！", "监狱学院" vs "监狱学园"),
 // and the search engine cannot find the subject from the longer spelling at all.
-// Every rewritten search is scored against the *original* name, so a variant
+// Every rewritten search is scored against the core title, so a variant
 // keyword can never pick a subject that does not resemble the title.
 func (m *Manager) searchBGM(ctx context.Context, query string, year int) (*BgmSubject, error) {
 	q := strings.TrimSpace(query)
@@ -959,11 +972,12 @@ func (m *Manager) searchBGM(ctx context.Context, query string, year int) (*BgmSu
 	if !b.Enabled() {
 		return nil, nil
 	}
-	// A 港澳台 source states its titles in Traditional Chinese, while the
-	// providers index the Simplified spelling. Both spellings are searched, the
-	// original first; every hit is still scored against the original name
-	// (normTitle folds the two forms together), so a variant search cannot
-	// select an unrelated subject.
+	// A 港澳台 source states its titles in Traditional Chinese and may append a
+	// regional qualifier, while the providers index the title without it. Both
+	// Chinese spellings and the core title are searched, the original first;
+	// every hit is still scored against the core title, so a variant search
+	// cannot select an unrelated subject.
+	matchQuery := coreTitle(q)
 	var variantBases []string
 	for _, spelling := range searchSpellings(q) {
 		throttle()
@@ -971,7 +985,7 @@ func (m *Manager) searchBGM(ctx context.Context, query string, year int) (*BgmSu
 		if err != nil {
 			return nil, err
 		}
-		if sub := m.bgmSubjectFor(ctx, b, q, year, results); sub != nil {
+		if sub := m.bgmSubjectFor(ctx, b, matchQuery, year, results); sub != nil {
 			m.logApproxBGM(q, sub)
 			return sub, nil
 		}
@@ -996,7 +1010,7 @@ func (m *Manager) searchBGM(ctx context.Context, query string, year int) (*BgmSu
 			if err != nil {
 				return nil, err
 			}
-			if sub := m.bgmSubjectFor(ctx, b, q, year, hits); sub != nil {
+			if sub := m.bgmSubjectFor(ctx, b, matchQuery, year, hits); sub != nil {
 				m.logApproxBGM(q, sub)
 				return sub, nil
 			}
@@ -1009,7 +1023,7 @@ func (m *Manager) searchBGM(ctx context.Context, query string, year int) (*BgmSu
 // and summary that search results may omit). The detail call is best-effort:
 // the search hit is still usable metadata when it fails.
 func (m *Manager) bgmSubjectFor(ctx context.Context, b *BangumiClient, query string, year int, results []BgmSubject) *BgmSubject {
-	best := pickBGM(query, year, results)
+	best := pickBGM(coreTitle(query), year, results)
 	if best < 0 {
 		return nil
 	}
@@ -1026,8 +1040,8 @@ func (m *Manager) logApproxBGM(query string, sub *BgmSubject) {
 	if sub == nil {
 		return
 	}
-	nq := normTitle(query)
-	if nq == normTitle(sub.NameCN) || nq == normTitle(sub.Name) {
+	nq := normTitle(coreTitle(query))
+	if nq == normTitle(coreTitle(sub.NameCN)) || nq == normTitle(coreTitle(sub.Name)) {
 		return
 	}
 	log.Printf("Bangumi 近似匹配: %q → #%d《%s》", query, sub.ID, preferCN(sub.NameCN, sub.Name))
@@ -1038,11 +1052,11 @@ func (m *Manager) logApproxBGM(query string, sub *BgmSubject) {
 // title really matches — better no metadata than a random anime (a mock or
 // fictional name must not become "Another (2012)").
 func pickBGM(query string, year int, results []BgmSubject) int {
-	nq := normTitle(query)
+	nq := normTitle(coreTitle(query))
 	best, bestScore := -1, 0
 	for i, r := range results {
 		score := 20
-		ncn, norig := normTitle(r.NameCN), normTitle(r.Name)
+		ncn, norig := normTitle(coreTitle(r.NameCN)), normTitle(coreTitle(r.Name))
 		switch {
 		case ncn != "" && ncn == nq, norig != "" && norig == nq:
 			score = 100
@@ -1241,13 +1255,18 @@ func (m *Manager) saveBGMImage(ctx context.Context, itemID int64, kind, rawURL s
 
 // normTitle lowercases, folds Traditional to Simplified and strips
 // punctuation/spaces so "孤独摇滚！", "孤獨搖滾！" and "孤独摇滚" compare equal.
+// It also folds the common Unicode dash forms that release names use
+// interchangeably.
 func normTitle(s string) string {
-	s = strings.ToLower(strings.TrimSpace(toSimplified(s)))
+	s = strings.ToLower(strings.TrimSpace(toSimplified(coreTitle(s))))
 	var b strings.Builder
 	for _, r := range s {
+		if unicode.Is(unicode.Dash, r) {
+			continue
+		}
 		switch r {
 		case ' ', '\t', '　', '!', '！', '?', '？', '.', '。', '·', '・', '、', ',', '，',
-			'-', '_', '—', '～', '~', ':', '：', '\'', '"', '「', '」', '《', '》', '(', ')', '（', '）':
+			'_', '～', '~', ':', '：', '\'', '"', '「', '」', '《', '》', '(', ')', '（', '）':
 			continue
 		}
 		b.WriteRune(r)

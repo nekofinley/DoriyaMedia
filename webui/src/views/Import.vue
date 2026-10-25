@@ -17,6 +17,7 @@ const router = useRouter()
 
 const title = ref(String(route.query.title || '番剧'))
 const cover = computed(() => String(route.query.cover || '').replace(/^http:/, 'https:'))
+const requestId = ref(Number(route.query.request) || 0)
 const coverBroken = ref(false)
 const job = ref(null)
 const state = ref(null)
@@ -80,11 +81,13 @@ async function start() {
   }
   ticker = setInterval(() => { elapsed.value++ }, 1000)
   try {
-    const r = await api.post('/api/catalog/import', {
-      library_id: library,
-      source_id: Number(route.params.sourceId),
-      season_id: Number(route.params.seasonId),
-    })
+    const r = requestId.value
+      ? await api.post(`/api/admin/requests/${requestId.value}/import`)
+      : await api.post('/api/catalog/import', {
+        library_id: library,
+        source_id: Number(route.params.sourceId),
+        season_id: Number(route.params.seasonId),
+      })
     if (r.title) title.value = r.title
     job.value = r
     poll(r.job_id)

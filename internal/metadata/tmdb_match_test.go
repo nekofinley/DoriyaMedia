@@ -61,3 +61,41 @@ func TestPickTMDBPrefersAResemblingResult(t *testing.T) {
 		t.Fatalf("pickTMDB = %d/%d, want the second result with a strong score", idx, score)
 	}
 }
+
+func TestSearchTMDBStripsRegionQualifier(t *testing.T) {
+	const sourceTitle = "86－不存在的戰區－（僅限港澳台地區）"
+	const core = "86－不存在的战区－"
+	var mu sync.Mutex
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/search/tv" {
+			http.NotFound(w, r)
+			return
+		}
+		query := r.URL.Query().Get("query")
+		mu.Lock()
+		seen = append(seen, query)
+		mu.Unlock()
+		results := []map[string]any{}
+		if query == core {
+			results = append(results, map[string]any{
+				"id": 100565, "name": "86 -不存在的战区-", "original_name": "86-エイティシックス-",
+				"first_air_date": "2021-04-11", "vote_average": 8.4,
+			})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": results})
+	}))
+	defer srv.Close()
+
+	m := NewManager(nil, &config.Config{TMDB: config.TMDB{
+		APIKey: "test-key", APIBase: srv.URL, Language: "zh-CN",
+	}})
+	if got := m.searchTMDB(context.Background(), "tv", sourceTitle, 2021); got != 100565 {
+		t.Fatalf("searchTMDB = %d, want 100565", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 || seen[0] != sourceTitle || seen[1] != core {
+		t.Fatalf("searches = %v, want original then Simplified core", seen)
+	}
+}

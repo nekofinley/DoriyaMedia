@@ -18,15 +18,60 @@ func TestSearchSpellings(t *testing.T) {
 	}
 }
 
+func TestSearchSpellingsStripsRegionQualifier(t *testing.T) {
+	got := searchSpellings("86－不存在的戰區－（僅限港澳台地區）")
+	want := []string{
+		"86－不存在的戰區－（僅限港澳台地區）",
+		"86－不存在的战区－",
+		"86－不存在的戰區－",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("searchSpellings = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("searchSpellings[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	if got := searchSpellings("間諜家家酒（僅限港澳台）"); len(got) != 3 ||
+		got[1] != "间谍家家酒" || got[2] != "間諜家家酒" {
+		t.Fatalf("searchSpellings with short qualifier = %v", got)
+	}
+	if got := searchSpellings("86（限港澳台地区）"); len(got) != 2 || got[1] != "86" {
+		t.Fatalf("searchSpellings with simplified qualifier = %v", got)
+	}
+}
+
+func TestCoreTitleOnlyStripsRegionQualifier(t *testing.T) {
+	cases := map[string]string{
+		"86－不存在的戰區－（僅限港澳台地區）":        "86－不存在的戰區－",
+		"86－不存在的戰區－（僅限港澳台地區） (2021)": "86－不存在的戰區－（僅限港澳台地區） (2021)",
+		"鬼滅之刃（第一季）":                  "鬼滅之刃（第一季）",
+		"鬼滅之刃（劇場版）":                  "鬼滅之刃（劇場版）",
+		"（僅限港澳台地區）":                  "（僅限港澳台地區）",
+	}
+	for input, want := range cases {
+		if got := coreTitle(input); got != want {
+			t.Errorf("coreTitle(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestNormTitleFoldsTraditional(t *testing.T) {
 	pairs := [][2]string{
 		{"鬼滅之刃", "鬼灭之刃"},
 		{"葬送的芙莉蓮！", "葬送的芙莉莲"},
 		{"孤獨搖滾", "孤独摇滚"},
+		{"86－不存在的戰區－", "86-不存在的战区-"},
+		{"86—不存在的戰區—", "86–不存在的战区–"},
 	}
 	for _, p := range pairs {
 		if a, b := normTitle(p[0]), normTitle(p[1]); a != b {
 			t.Errorf("normTitle(%q) = %q, normTitle(%q) = %q; want equal", p[0], a, p[1], b)
 		}
+	}
+	if got := normTitle("86－不存在的戰區－（僅限港澳台地區）"); got != "86不存在的战区" {
+		t.Fatalf("normTitle with region qualifier = %q, want 86不存在的战区", got)
 	}
 }

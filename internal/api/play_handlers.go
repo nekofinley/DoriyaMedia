@@ -141,6 +141,10 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		// The same report, negative: this browser looked and cannot play HEVC, so
 		// neither direct play nor copying is on offer for it.
 		ClientNoHEVC: capsHas(r.URL.Query().Get("caps"), "nohevc"),
+		// Chromium can decode Hi10P in software even though it has no hardware
+		// path. The player asks MediaSource before making this report; without
+		// it, the conservative refusal below stays in force.
+		ClientHi10P: capsHas(r.URL.Query().Get("caps"), "hi10p"),
 		// The client's own audio report, if it made one: a codec the machine says
 		// it can decode is allowed to direct-play even where the server's tables
 		// guessed otherwise. Absent tokens keep the tables' verdict.

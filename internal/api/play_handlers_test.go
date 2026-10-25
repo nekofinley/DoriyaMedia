@@ -8,6 +8,19 @@ import (
 	"doriyamedia/internal/media"
 )
 
+func TestCapsHasHi10P(t *testing.T) {
+	for _, caps := range []string{"hi10p", "hevc,hi10p,eac3", "nohevc, hi10p"} {
+		if !capsHas(caps, "hi10p") {
+			t.Fatalf("capsHas(%q, hi10p) = false, want true", caps)
+		}
+	}
+	for _, caps := range []string{"", "hevc", "nohevc", "hi10p2"} {
+		if capsHas(caps, "hi10p") {
+			t.Fatalf("capsHas(%q, hi10p) = true, want false", caps)
+		}
+	}
+}
+
 func TestProbeSummaryIncludesSourceFrameRate(t *testing.T) {
 	raw := `{
 		"streams": [{

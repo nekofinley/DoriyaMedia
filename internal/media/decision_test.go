@@ -247,6 +247,43 @@ func TestClientNoHEVCReportRulesOutDirectAndCopy(t *testing.T) {
 	}
 }
 
+// Hi10P has no hardware path, but Chromium can decode it in software. The
+// refusal must therefore yield to a client that has actually tested the profile;
+// a silent client, Safari, and a forced remux keep the conservative answer.
+func TestClientHi10PReportAllowsDirectPlay(t *testing.T) {
+	probe := probeFor("h264", "High 10", "avc1", "aac", "matroska,webm")
+
+	reported := Decide(probe, "/m/x.mkv", ClientChrome,
+		DecideOptions{HasDirect: true, ClientHi10P: true})
+	if reported.Mode != "direct" {
+		t.Fatalf("mode=%q, want direct when the client reports Hi10P (reason: %s)", reported.Mode, reported.Reason)
+	}
+	if !equalModes(altModes(reported), "proxy") {
+		t.Fatalf("chain = %v, want [proxy]: a Hi10P copy is not a fallback here", altModes(reported))
+	}
+
+	// No report: keep the old refusal rather than guessing.
+	silent := Decide(probe, "/m/x.mkv", ClientChrome, DecideOptions{HasDirect: true})
+	if silent.Mode != "unsupported" {
+		t.Fatalf("mode=%q, want unsupported without a Hi10P report", silent.Mode)
+	}
+
+	// Safari has no MediaSource to ask, so it must not inherit Chromium's answer.
+	safari := Decide(probe, "/m/x.mp4", ClientSafari,
+		DecideOptions{HasDirect: true, ClientHi10P: true})
+	if safari.Mode != "unsupported" {
+		t.Fatalf("mode=%q, want unsupported for Safari", safari.Mode)
+	}
+
+	// Remuxing is a copy into HLS, where a 10-bit H.264 stream still has no MSE
+	// path; a direct-play report must not turn that into a black picture.
+	remux := Decide(probe, "/m/x.mkv", ClientChrome,
+		DecideOptions{Force: "remux", ClientHi10P: true})
+	if remux.Mode != "unsupported" {
+		t.Fatalf("mode=%q, want unsupported for a Hi10P remux", remux.Mode)
+	}
+}
+
 // ---------- the fallback chain ----------
 
 // A fallback must be able to work, or it is not a fallback. The chain used to
