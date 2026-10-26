@@ -546,7 +546,7 @@ func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *mo
 		if fr.Strm || fr.Path == fr.Dir || fr.Dir == strings.TrimSuffix(fr.Root, "/") {
 			// flat file: parse by filename
 			p := ParseName(baseName(fr.Path))
-			add(groupKey(p), orDefault(p.Title, baseName(fr.Path)), p.Year, fr)
+			add(groupKey(p), orDefault(p.Title, displayBaseName(fr.Path)), p.Year, fr)
 			continue
 		}
 		fp := ParseName(baseName(fr.Path))
@@ -558,7 +558,7 @@ func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *mo
 			}
 			add(groupKey(dp), dp.Title, year, fr)
 		} else {
-			add(groupKey(fp), orDefault(fp.Title, baseName(fr.Path)), fp.Year, fr)
+			add(groupKey(fp), orDefault(fp.Title, displayBaseName(fr.Path)), fp.Year, fr)
 		}
 	}
 
@@ -712,6 +712,28 @@ func planShow(childCount map[string]int, libPath, dir, filePath string, parsedSe
 	}
 
 	num, lbl, ok := seasonMetaFor(showDir, filePath)
+	// The show folder itself may carry the season, the way a collection keeps one
+	// show's seasons in sibling directories: "[CLANNAD][S2]", "[中二病也要谈恋爱!]
+	// [S2][恋!]". Without this every season of such a show collapsed into 第 1 季
+	// and two seasons that both number an episode 11 became one card with two
+	// files — one of the two unreachable.
+	dirSeason, dirLabel := 0, ""
+	if _, ds, dn, dm := ParseShowDirName(baseName(showDir)); dm || ds > 0 || dn != "" {
+		switch {
+		case dm:
+			// "[S0]" is the show's film, not a zeroth season.
+			dirSeason, dirLabel = specialSeasonBase["movie"], "剧场版"
+		case ds >= 91 && dn != "":
+			// A special collection ("[OVA]") is its own card, named by itself.
+			dirSeason, dirLabel = ds, dn
+		case ds > 0 && dn != "":
+			dirSeason, dirLabel = ds, fmt.Sprintf("第 %d 季 · %s", ds, dn)
+		case ds > 0:
+			dirSeason, dirLabel = ds, fmt.Sprintf("第 %d 季", ds)
+		case dn != "":
+			dirLabel = dn
+		}
+	}
 	// A child folder that names its own season ("第一季", "Season 2") *is* that
 	// season: the number orders it and the name labels it. Without this every
 	// season of a franchise was a name-only slot with number 0 — bilibili numbers
@@ -736,6 +758,8 @@ func planShow(childCount map[string]int, libPath, dir, filePath string, parsedSe
 		return showDir, parsedSeason, fmt.Sprintf("第 %d 季", parsedSeason)
 	case ok:
 		return showDir, num, lbl
+	case dirSeason > 0 || dirLabel != "":
+		return showDir, dirSeason, dirLabel
 	default:
 		return showDir, 1, "第 1 季"
 	}
@@ -860,11 +884,17 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 		showDir, season, seasonName := planShow(childCount, fr.Root, fr.Dir, fr.Path, p.Season)
 		showTitle := ""
 		if showDir != "" {
-			dp := ParseName(baseName(showDir))
-			showTitle = orDefault(dp.Title, baseName(showDir))
+			// A folder in the "[show][S2][季名]" convention names the show in its
+			// first bracket; the later ones are the season, never the title.
+			if t, _, _, _ := ParseShowDirName(baseName(showDir)); t != "" {
+				showTitle = t
+			} else {
+				dp := ParseName(baseName(showDir))
+				showTitle = orDefault(dp.Title, baseName(showDir))
+			}
 		}
 		if showTitle == "" {
-			showTitle = orDefault(stripTitleYear(p.Title), baseName(fr.Path))
+			showTitle = orDefault(stripTitleYear(p.Title), displayBaseName(fr.Path))
 		}
 		epName := ""
 		if p.Extra {
@@ -1257,6 +1287,17 @@ func baseName(path string) string {
 	return p
 }
 
+// displayBaseName is baseName without the video extension. It is the last-resort
+// name for a file the parser could not identify: "…[1080p][JPSC].mp4" is a bad
+// name for a show, but it is not made better by ending in ".mp4".
+func displayBaseName(path string) string {
+	b := baseName(path)
+	if i := strings.LastIndex(b, "."); i > 0 {
+		return b[:i]
+	}
+	return b
+}
+
 // parentDir returns the directory above dir, or "" when there is none.
 func parentDir(dir string) string {
 	p := strings.TrimSuffix(dir, "/")
@@ -1330,6 +1371,9 @@ func showDirFor(libPath, dir string) string {
 			continue
 		}
 		_, isSeason := ParseSeasonDir(segs[i])
+		if !isSeason {
+			_, isSeason = seasonMarkerDir(segs[i])
+		}
 		_, _, isSpecial := SpecialSeasonDir(segs[i])
 		_, isBili := biliSeasonTitle(segs[i])
 		if !isSeason && !isSpecial && !isNumericDir(segs[i]) && !isBili {
@@ -1428,6 +1472,9 @@ func seasonMetaFor(showDir, filePath string) (int, string, bool) {
 		}
 		if isNumericDir(segs[i]) {
 			n, _ := strconv.Atoi(strings.TrimSpace(segs[i]))
+			return n, fmt.Sprintf("第 %d 季", n), true
+		}
+		if n, ok := seasonMarkerDir(segs[i]); ok {
 			return n, fmt.Sprintf("第 %d 季", n), true
 		}
 	}
