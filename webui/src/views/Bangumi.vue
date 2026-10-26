@@ -1,5 +1,6 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { api } from '../api.js'
 import AppIcon from '../components/AppIcon.vue'
 import AccountDialog from '../components/AccountDialog.vue'
@@ -7,8 +8,10 @@ import BangumiCard from '../components/BangumiCard.vue'
 import EmptyState from '../components/EmptyState.vue'
 import SkeletonGrid from '../components/SkeletonGrid.vue'
 import SmartImage from '../components/SmartImage.vue'
+import { bangumiCoverSource, saveMediaRequestDraft } from '../requestDraft.js'
 
 const PAGE_SIZE = 50
+const router = useRouter()
 
 const filters = [
   { value: 0, label: '全部' },
@@ -31,6 +34,11 @@ const loading = ref(true)
 const loadingMore = ref(false)
 const error = ref('')
 const accountOpen = ref(false)
+const choiceItem = ref(null)
+const choiceAnchor = ref(null)
+const choiceStyle = ref({})
+const choiceCompact = ref(false)
+const choicePrimary = ref(null)
 let requestSeq = 0
 
 const filterLabel = computed(() => filters.find((f) => f.value === activeFilter.value)?.label || '全部')
@@ -38,6 +46,22 @@ const accountName = computed(() => account.value?.nickname || account.value?.use
 const avatarLetter = computed(() => accountName.value.slice(0, 1).toUpperCase())
 const heroCovers = computed(() => items.value.filter((it) => it.cover_url).slice(0, 7))
 const shownCount = computed(() => items.value.length)
+const choiceTitle = computed(() => {
+  const item = choiceItem.value
+  return item?.name_cn || item?.name || `Bangumi #${item?.subject_id || ''}`
+})
+const choiceMeta = computed(() => {
+  const item = choiceItem.value
+  if (!item) return ''
+  return [
+    String(item.date || '').slice(0, 4),
+    Number(item.score) > 0 ? `★ ${Number(item.score).toFixed(1)}` : '',
+    Number(item.eps) > 0 ? `${Number(item.eps)} 集` : '',
+  ].filter(Boolean).join(' · ')
+})
+const choiceHref = computed(() => choiceItem.value?.subject_id
+  ? `https://bgm.tv/subject/${choiceItem.value.subject_id}`
+  : 'https://bgm.tv/anime')
 
 async function load({ append = false } = {}) {
   if (append && (loadingMore.value || !hasMore.value)) return
@@ -100,7 +124,95 @@ watch(activeFilter, () => load())
 watch(accountOpen, (open, wasOpen) => {
   if (wasOpen && !open) load()
 })
-onMounted(load)
+
+function positionChoice() {
+  if (!choiceAnchor.value) return
+  choiceCompact.value = window.innerWidth <= 720
+  if (choiceCompact.value) {
+    choiceStyle.value = {}
+    return
+  }
+
+  const rect = choiceAnchor.value.getBoundingClientRect()
+  const margin = 16
+  const gap = 12
+  const width = Math.min(352, window.innerWidth - margin * 2)
+  const estimatedHeight = 330
+  let left = rect.right + gap
+  if (left + width > window.innerWidth - margin) left = rect.left - width - gap
+  if (left < margin) {
+    left = Math.max(margin, Math.min(rect.left, window.innerWidth - width - margin))
+  }
+  const top = Math.max(margin, Math.min(rect.top, window.innerHeight - estimatedHeight - margin))
+  choiceStyle.value = {
+    left: `${left}px`,
+    top: `${top}px`,
+    width: `${width}px`,
+  }
+}
+
+function openChoice(item, anchor) {
+  choiceItem.value = item
+  choiceAnchor.value = anchor || null
+  positionChoice()
+  nextTick(() => choicePrimary.value?.focus())
+}
+
+function closeChoice() {
+  choiceItem.value = null
+  choiceAnchor.value = null
+  choiceStyle.value = {}
+}
+
+function handleChoiceKey(event) {
+  if (event.key === 'Escape' && choiceItem.value) closeChoice()
+}
+
+function handleChoiceResize() {
+  if (choiceItem.value) positionChoice()
+}
+
+function handleChoiceScroll() {
+  if (choiceItem.value) closeChoice()
+}
+
+function startRequest() {
+  const item = choiceItem.value
+  if (!item?.subject_id) return
+  const title = String(item.name_cn || item.name || '').trim().slice(0, 200)
+  if (!title) return
+  const original = item.name_cn && item.name !== item.name_cn
+    ? String(item.name || '').trim().slice(0, 200)
+    : ''
+  saveMediaRequestDraft({
+    provider: 'bangumi',
+    title,
+    original_title: original,
+    year: Number(String(item.date || '').slice(0, 4)) || 0,
+    cover: bangumiCoverSource(item.cover_url),
+    overview: String(item.summary || '').slice(0, 4000),
+    rating: Number(item.score) || 0,
+    episodes: Number(item.eps) || 0,
+    bgm_id: Number(item.subject_id),
+  })
+  closeChoice()
+  router.push({
+    path: '/requests',
+    query: { from: 'bangumi', bgm: String(item.subject_id), q: title },
+  })
+}
+
+onMounted(() => {
+  load()
+  window.addEventListener('keydown', handleChoiceKey)
+  window.addEventListener('resize', handleChoiceResize)
+  window.addEventListener('scroll', handleChoiceScroll, true)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', handleChoiceKey)
+  window.removeEventListener('resize', handleChoiceResize)
+  window.removeEventListener('scroll', handleChoiceScroll, true)
+})
 </script>
 
 <template>
@@ -264,6 +376,7 @@ onMounted(load)
           :key="item.subject_id"
           :item="item"
           :index="Math.min(i, 18)"
+          @uncollected="openChoice"
         />
       </div>
 
@@ -290,6 +403,74 @@ onMounted(load)
     </template>
 
     <AccountDialog v-model:open="accountOpen" />
+
+    <Teleport to="body">
+      <Transition name="choice">
+        <div v-if="choiceItem" class="choice-layer" @click.self="closeChoice">
+          <section
+            class="choice-pop"
+            :class="{ compact: choiceCompact }"
+            :style="choiceStyle"
+            role="dialog"
+            aria-modal="true"
+            :aria-label="`${choiceTitle} 的下一步`"
+          >
+            <button class="choice-close" type="button" aria-label="关闭" @click="closeChoice">
+              <AppIcon name="close" :size="17" />
+            </button>
+
+            <header class="choice-head">
+              <div class="choice-cover">
+                <SmartImage
+                  :src="choiceItem.cover_url"
+                  :alt="choiceTitle"
+                  :seed="choiceTitle"
+                  eager
+                />
+              </div>
+              <span class="choice-copy">
+                <span class="choice-kicker"><i></i> 媒体库未收录</span>
+                <strong>{{ choiceTitle }}</strong>
+                <small v-if="choiceMeta">{{ choiceMeta }}</small>
+              </span>
+            </header>
+
+            <div class="choice-actions">
+              <a
+                class="choice-action bangumi"
+                :href="choiceHref"
+                target="_blank"
+                rel="noopener noreferrer"
+                @click="closeChoice"
+              >
+                <span class="choice-icon"><AppIcon name="external" :size="18" /></span>
+                <span>
+                  <b>去 Bangumi TV</b>
+                  <small>查看条目、评分与讨论</small>
+                </span>
+                <AppIcon name="chevronRight" :size="16" class="choice-arrow" />
+              </a>
+
+              <button
+                ref="choicePrimary"
+                class="choice-action request"
+                type="button"
+                @click="startRequest"
+              >
+                <span class="choice-icon"><AppIcon name="inbox" :size="18" /></span>
+                <span>
+                  <b>去求片</b>
+                  <small>带上封面和资料，直接进入提交流程</small>
+                </span>
+                <AppIcon name="chevronRight" :size="16" class="choice-arrow" />
+              </button>
+            </div>
+
+            <p class="choice-foot">求片提交后，管理员会在待处理片墙里看到它。</p>
+          </section>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -583,6 +764,164 @@ onMounted(load)
 .load-more { display: flex; justify-content: center; margin-top: var(--sp-7); }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+.choice-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  background: rgba(3, 4, 7, 0.34);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+.choice-pop {
+  position: fixed;
+  padding: 16px;
+  overflow: auto;
+  max-height: calc(100dvh - 32px);
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 18px;
+  background:
+    radial-gradient(100% 100% at 100% 0%, rgba(240, 145, 168, 0.11), transparent 55%),
+    radial-gradient(90% 100% at 0% 100%, rgba(240, 169, 46, 0.1), transparent 60%),
+    rgba(13, 15, 20, 0.98);
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.64), 0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+  transform-origin: 18% 20%;
+  transition: opacity 180ms var(--ease-out), transform 180ms var(--ease-out);
+}
+.choice-close {
+  position: absolute;
+  right: 11px;
+  top: 11px;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  color: var(--text-3);
+  transition: color var(--t-fast), background var(--t-fast);
+}
+.choice-close:hover { color: var(--text-1); background: rgba(255, 255, 255, 0.08); }
+.choice-head {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding-right: 32px;
+  margin-bottom: 15px;
+}
+.choice-cover {
+  position: relative;
+  display: block;
+  width: 52px;
+  aspect-ratio: 2 / 3;
+  flex: none;
+  overflow: hidden;
+  border-radius: 8px;
+  border: 1px solid var(--line-2);
+  background: var(--bg-2);
+  box-shadow: var(--sh-2);
+}
+.choice-cover :deep(.smart-img) { position: absolute; inset: 0; }
+.choice-copy { display: flex; flex-direction: column; min-width: 0; }
+.choice-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 3px;
+  color: #f3b1c1;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+.choice-kicker i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #f091a8;
+  box-shadow: 0 0 9px rgba(240, 145, 168, 0.7);
+}
+.choice-copy strong {
+  overflow: hidden;
+  color: var(--text-1);
+  font-size: var(--fs-14);
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.choice-copy small {
+  margin-top: 2px;
+  color: var(--text-4);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+.choice-actions { display: grid; gap: 8px; }
+.choice-action {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid var(--line-1);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.025);
+  text-align: left;
+  transition: border-color var(--t-fast), background var(--t-fast), transform var(--t-fast);
+}
+.choice-action:hover {
+  transform: translateY(-1px);
+  border-color: var(--line-3);
+  background: rgba(255, 255, 255, 0.055);
+}
+.choice-action:focus-visible {
+  outline: none;
+  border-color: var(--brand);
+  box-shadow: 0 0 0 2px rgba(240, 169, 46, 0.2);
+}
+.choice-action > span:nth-child(2) { display: flex; flex-direction: column; min-width: 0; gap: 2px; }
+.choice-action b { color: var(--text-1); font-size: var(--fs-12); }
+.choice-action small {
+  overflow: hidden;
+  color: var(--text-4);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.choice-icon {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+}
+.choice-action.bangumi .choice-icon {
+  color: #f3b1c1;
+  background: rgba(240, 145, 168, 0.1);
+  border: 1px solid rgba(240, 145, 168, 0.2);
+}
+.choice-action.request .choice-icon {
+  color: var(--brand-2);
+  background: rgba(240, 169, 46, 0.1);
+  border: 1px solid rgba(240, 169, 46, 0.22);
+}
+.choice-arrow { color: var(--text-4); }
+.choice-foot {
+  margin: 12px 2px 0;
+  color: var(--text-4);
+  font-size: 10.5px;
+  line-height: 1.55;
+}
+.choice-pop.compact {
+  left: 12px !important;
+  right: 12px;
+  top: auto !important;
+  bottom: max(12px, env(safe-area-inset-bottom));
+  width: auto !important;
+  border-radius: var(--r-l);
+}
+.choice-enter-active, .choice-leave-active { transition: opacity 160ms var(--ease-out); }
+.choice-enter-from, .choice-leave-to { opacity: 0; }
+.choice-enter-from .choice-pop, .choice-leave-to .choice-pop { opacity: 0; transform: translateY(7px) scale(0.985); }
 
 @media (max-width: 900px) {
   .hero-inner { grid-template-columns: minmax(0, 1fr) auto; }

@@ -7,6 +7,7 @@ import RequestPosterCard from '../components/RequestPosterCard.vue'
 import SmartImage from '../components/SmartImage.vue'
 import { api } from '../api.js'
 import { me } from '../auth.js'
+import { takeMediaRequestDraft } from '../requestDraft.js'
 import { toast } from '../toast.js'
 
 const router = useRouter()
@@ -24,6 +25,7 @@ const submitting = ref(false)
 const confirmPanel = ref(null)
 const myRequests = ref([])
 const loadingMine = ref(false)
+const pendingBGMID = ref(Number(route.query.bgm) || 0)
 let timer = null
 let searchSeq = 0
 let mineTimer = null
@@ -33,6 +35,7 @@ let mineReload = false
 const isAdmin = computed(() => me.value?.role === 'admin')
 const biliHits = computed(() => results.value.filter((r) => r.provider === 'bilibili'))
 const bgmHits = computed(() => results.value.filter((r) => r.provider === 'bangumi'))
+const biliImportableCount = computed(() => biliHits.value.filter((r) => !r.in_library_item_id).length)
 const myPending = computed(() => myRequests.value.filter((r) => r.status === 'pending').length)
 const myDone = computed(() => myRequests.value.filter((r) => r.status === 'completed').length)
 const canSubmit = computed(() => selected.value && !selected.value.in_library_item_id && !submitting.value)
@@ -81,11 +84,24 @@ watch(() => route.query.q, (value) => {
   if (next !== q.value) q.value = next
 })
 
-onMounted(() => {
+onMounted(async () => {
   loadMine()
   mineTimer = setInterval(() => {
     if (!document.hidden) loadMine({ silent: true })
   }, 30000)
+
+  const seededBGMID = Number(route.query.bgm) || 0
+  if (seededBGMID) {
+    const draft = takeMediaRequestDraft(seededBGMID)
+    if (draft) {
+      selected.value = { ...draft, provider: 'bangumi' }
+      pendingBGMID.value = 0
+      q.value = draft.title
+      await nextTick()
+      confirmPanel.value?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }
+  }
+
   if ([...q.value.trim()].length >= 2) runSearch()
   if (window.matchMedia?.('(pointer: fine)').matches) nextTick(() => input.value?.focus())
 })
@@ -106,15 +122,43 @@ async function runSearch() {
     results.value = out.items || []
     warnings.value = out.warnings || []
     searched.value = true
+    await selectBGMSeed()
   } catch (e) {
     if (seq !== searchSeq) return
     results.value = []
     warnings.value = []
     searchError.value = e.message
     searched.value = true
+    await selectBGMSeed()
   } finally {
     if (seq === searchSeq) loading.value = false
   }
+}
+
+async function selectBGMSeed() {
+  const bgmID = pendingBGMID.value
+  if (!bgmID) return
+  pendingBGMID.value = 0
+  const match = bgmHits.value.find((hit) => Number(hit.bgm_id) === bgmID)
+  if (match) {
+    selected.value = { ...match }
+  } else {
+    const title = String(route.query.q || q.value || '').trim()
+    if (!title) return
+    selected.value = {
+      provider: 'bangumi',
+      title,
+      original_title: '',
+      year: 0,
+      cover: '',
+      overview: '',
+      episodes: 0,
+      rating: 0,
+      bgm_id: bgmID,
+    }
+  }
+  await nextTick()
+  confirmPanel.value?.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
 function onSearchEnter() {
@@ -129,6 +173,7 @@ async function pickHit(hit) {
     return
   }
   selected.value = { ...hit }
+  pendingBGMID.value = 0
   note.value = ''
   await nextTick()
   confirmPanel.value?.scrollIntoView({ behavior: 'smooth', block: 'center' })
@@ -147,6 +192,7 @@ async function pickManual() {
     episodes: 0,
     rating: 0,
   }
+  pendingBGMID.value = 0
   note.value = ''
   await nextTick()
   confirmPanel.value?.scrollIntoView({ behavior: 'smooth', block: 'center' })
@@ -244,7 +290,7 @@ function providerText(provider) {
           </router-link>
         </div>
 
-        <div class="hero-stats" aria-label="我的求片统计">
+        <div class="hero-stats" aria-label="我的求片与 B 站入库统计">
           <div class="stat">
             <span class="stat-n">{{ String(myPending).padStart(2, '0') }}</span>
             <span>待处理</span>
@@ -254,7 +300,12 @@ function providerText(provider) {
             <span class="stat-n">{{ String(myDone).padStart(2, '0') }}</span>
             <span>已处理</span>
           </div>
-          <span class="meta">MY REQUESTS</span>
+          <i></i>
+          <div class="stat" title="当前搜索结果中可直接进入入库流程的 B 站番剧">
+            <span class="stat-n bili">{{ String(biliImportableCount).padStart(2, '0') }}</span>
+            <span>B 站可入库</span>
+          </div>
+          <span class="meta">BILI + REQUESTS</span>
         </div>
       </div>
 
@@ -307,7 +358,10 @@ function providerText(provider) {
           <template v-if="biliHits.length">
             <div class="group-head">
               <span><AppIcon name="cloud" :size="15" /> B 站片库</span>
-              <small>可一键进入现有入库流程</small>
+              <small>
+                <b>{{ biliHits.length }}</b> 个结果 ·
+                <b>{{ biliImportableCount }}</b> 部可入库
+              </small>
             </div>
             <div class="result-grid">
               <button
@@ -528,6 +582,7 @@ function providerText(provider) {
   letter-spacing: -0.04em;
   color: var(--text-1);
 }
+.stat-n.bili { color: var(--brand-2); }
 .stat span:last-child { color: var(--text-4); font-size: var(--fs-11); }
 .meta {
   position: absolute;
@@ -659,7 +714,8 @@ function providerText(provider) {
   font-weight: 700;
 }
 .group-head span svg { color: var(--brand); }
-.group-head small { color: var(--text-4); font-size: var(--fs-11); }
+.group-head small { color: var(--text-4); font-size: var(--fs-11); font-variant-numeric: tabular-nums; }
+.group-head small b { color: var(--text-2); font-weight: 700; }
 .result-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(min(100%, 132px), 1fr));

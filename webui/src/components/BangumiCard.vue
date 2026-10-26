@@ -8,6 +8,7 @@ const props = defineProps({
   item: { type: Object, required: true },
   index: { type: Number, default: 0 },
 })
+const emit = defineEmits(['uncollected'])
 
 const labels = {
   1: { text: '想看', tone: 'wish' },
@@ -24,13 +25,11 @@ const original = computed(() => {
 })
 const year = computed(() => String(props.item.date || '').slice(0, 4))
 const local = computed(() => Number(props.item.local_item_id) > 0)
-const target = computed(() => local.value
-  ? `/item/${props.item.local_item_id}`
-  : `https://bgm.tv/subject/${props.item.subject_id}`)
-const tag = computed(() => local.value ? RouterLink : 'a')
+const target = computed(() => `/item/${props.item.local_item_id}`)
+const tag = computed(() => local.value ? RouterLink : 'button')
 const linkAttrs = computed(() => local.value
   ? { to: target.value }
-  : { href: target.value, target: '_blank', rel: 'noopener noreferrer' })
+  : { type: 'button' })
 
 const status = computed(() => labels[Number(props.item.collection_type)] || { text: '收藏', tone: 'wish' })
 const watched = computed(() => Math.max(0, Number(props.item.ep_status) || 0))
@@ -44,6 +43,10 @@ const progressText = computed(() => {
 })
 const score = computed(() => Number(props.item.score) > 0 ? Number(props.item.score).toFixed(1) : '')
 const meta = computed(() => [year.value, score.value ? `★ ${score.value}` : ''].filter(Boolean).join(' · '))
+
+function onClick(event) {
+  if (!local.value) emit('uncollected', props.item, event.currentTarget)
+}
 </script>
 
 <template>
@@ -53,6 +56,8 @@ const meta = computed(() => [year.value, score.value ? `★ ${score.value}` : ''
     class="bgm-card"
     :style="{ '--i': index }"
     :aria-label="`${title}，${progressText}${local ? '，媒体库可播放' : '，媒体库未收录'}`"
+    :aria-haspopup="local ? undefined : 'dialog'"
+    @click="onClick"
   >
     <div class="art">
       <SmartImage
@@ -94,6 +99,16 @@ const meta = computed(() => [year.value, score.value ? `★ ${score.value}` : ''
   display: block;
   color: var(--text-1);
   transition: transform var(--t-mid);
+}
+button.bgm-card {
+  width: 100%;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
 }
 .art {
   position: relative;
@@ -205,6 +220,10 @@ const meta = computed(() => [year.value, score.value ? `★ ${score.value}` : ''
 .bgm-card:hover .art { border-color: var(--line-3); box-shadow: var(--sh-3); }
 .bgm-card:hover .art :deep(img) { transform: scale(1.055); }
 .bgm-card:active { transform: translateY(-2px) scale(0.99); }
+.bgm-card:focus-visible .art {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 2px rgba(240, 169, 46, 0.55), var(--sh-3);
+}
 
 @media (max-width: 720px) {
   .status, .source {
