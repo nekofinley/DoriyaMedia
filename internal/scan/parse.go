@@ -67,6 +67,8 @@ var (
 	reBracketEp     = regexp.MustCompile(`[\[【]\s*(\d{1,4}(?:\.\d)?(?:v\d)?)\s*[\]】]`)
 	reDashEp        = regexp.MustCompile(`(?:^|[\s_])-[\s_]*(\d{1,4})(?:[\s_\-\[]|$)`)
 	rePureNum       = regexp.MustCompile(`^(\d{1,4})(?:v\d)?$`)
+	reParenEp       = regexp.MustCompile(`^[\(（]\s*(\d{1,4})\s*[\)）]$`)
+	reLeadEp        = regexp.MustCompile(`^(\d{1,4})\s*[-–_]\s*`)
 	reBracketEpOnly = regexp.MustCompile(`^\d{1,4}(?:\.\d)?(?:v\d)?$`)
 	reTrailingNum   = regexp.MustCompile(`(?:^|[\s\._\-])(\d{1,4})(?:v\d)?\s*$`)
 	reBracketGroups = regexp.MustCompile(`[\[【]([^\]】]*)[\]】]`)
@@ -266,6 +268,12 @@ func ParseName(filename string) Parsed {
 		return p
 	}
 
+	// "(10).mp4" — the show is the folder, the file carries only its number.
+	if m := reParenEp.FindStringSubmatch(base); m != nil {
+		applyNum(&p, m[1])
+		return p
+	}
+
 	// trailing bracketed number [01]
 	locs := reBracketEp.FindAllStringSubmatchIndex(base, -1)
 	if len(locs) > 0 {
@@ -298,6 +306,19 @@ func ParseName(filename string) Parsed {
 		}
 	}
 
+	// "01-13" / "025-25_mp4": a span, and its start is the episode.
+	if n, ok := rangeStart(base); ok {
+		p.Episode = n
+		p.IsEpisode = true
+		p.Kind = "episode"
+		loc := reEpRange.FindStringIndex(base)
+		p.Title = cleanTitle(base[:loc[0]])
+		if p.Title == "" {
+			p.Title = cleanTitle(original)
+		}
+		return p
+	}
+
 	// trailing bare number: "Black Clover 174"
 	if n, before, ok := trailingEpisode(base); ok {
 		p.Episode = n
@@ -308,6 +329,27 @@ func ParseName(filename string) Parsed {
 			p.Title = cleanTitle(original)
 		}
 		return p
+	}
+
+	// "005-HaruhiS2_05_2398psf_": the number leads, and the rest is the release's
+	// own bookkeeping. Nothing else in the name claims a number, so the prefix is
+	// the episode.
+	//
+	// The prefix is only an episode when real words follow it: "1080-v.mp4" is a
+	// resolution with a variant suffix, not episode 1080.
+	if m := reLeadEp.FindStringSubmatch(base); m != nil {
+		rest := base[len(m[0]):]
+		if n, err := strconv.Atoi(m[1]); err == nil && plausibleEpisode(n) &&
+			!reResolutionNum[n] && len([]rune(rest)) >= 2 && hasLatin(rest) {
+			p.Episode = n
+			p.IsEpisode = true
+			p.Kind = "episode"
+			p.Title = cleanTitle(base[len(m[0]):])
+			if p.Title == "" {
+				p.Title = cleanTitle(original)
+			}
+			return p
+		}
 	}
 
 	// bare number: "01.mkv" / "12v2.mkv" (episode inside a show folder)
@@ -340,7 +382,11 @@ func parseBracketed(base, original string) Parsed {
 	groups := reBracketGroups.FindAllStringSubmatch(base, -1)
 	rest := strings.TrimSpace(reBracketGroups.ReplaceAllString(base, " "))
 
-	for _, g := range groups {
+	// epIdx is the bracket the episode number came out of. The show name is the
+	// bracket before it, which is what tells "[Nekomoe kissaten][Kimi ga Shinu
+	// made Koi wo Shitai][12][1080p]" apart: the first bracket is the group.
+	epIdx := -1
+	for i, g := range groups {
 		val := strings.TrimSpace(g[1])
 		if reSeasonBracket.MatchString(val) {
 			continue
@@ -348,19 +394,23 @@ func parseBracketed(base, original string) Parsed {
 		if reBracketEpOnly.MatchString(val) {
 			if n, err := strconv.Atoi(strings.SplitN(val, "v", 2)[0]); err == nil && plausibleEpisode(n) {
 				p.Episode, p.IsEpisode, p.Kind = n, true, "episode"
+				epIdx = i
 				break
 			}
 		}
 		if n, ok := bracketEpisode(val); ok && plausibleEpisode(n) {
 			p.Episode, p.IsEpisode, p.Kind = n, true, "episode"
+			epIdx = i
 			break
 		}
 		if m := reCJKep.FindStringSubmatch(val); m != nil {
 			applyNum(&p, m[1])
+			epIdx = i
 			break
 		}
 		if n, ok := bracketRangeStart(val); ok && plausibleEpisode(n) {
 			p.Episode, p.IsEpisode, p.Kind = n, true, "episode"
+			epIdx = i
 			break
 		}
 	}
@@ -393,7 +443,7 @@ func parseBracketed(base, original string) Parsed {
 
 	title, have := titleCandidates(rest)
 	if have == 0 {
-		title = bracketShowTitle(groups)
+		title = bracketShowTitle(groups, epIdx)
 	}
 	if title == "" {
 		if m := reBraceBlock.FindString(original); m != "" {
@@ -466,11 +516,18 @@ func bracketRangeStart(val string) (int, bool) {
 
 var reTrailingRangeStart = regexp.MustCompile(`^(\d{1,4})\s*[-–~]\s*\D`)
 
-// bracketShowTitle answers with the first bracket that reads as a show name
-// rather than the group, a tag, a number or a cours marker.
-func bracketShowTitle(groups [][]string) string {
-	first := true
-	for _, g := range groups {
+// bracketShowTitle answers with the bracket that reads as a show name rather
+// than the group, a tag, a number or a cours marker.
+//
+// A release puts the show in front of the episode number — "[Group][Show][12]
+// [1080p]" — so the brackets are read outwards from the one the number came
+// from: the nearest readable bracket before it wins, and only then the ones
+// after. Position, not shape, is what separates "[Nekomoe kissaten]" from
+// "[Kimi ga Shinu made Koi wo Shitai]": both are pure ASCII, and only their
+// place in the run tells the group from the show.
+func bracketShowTitle(groups [][]string, epIdx int) string {
+	readable := make([]string, len(groups))
+	for i, g := range groups {
 		if len(g) < 2 {
 			continue
 		}
@@ -478,22 +535,41 @@ func bracketShowTitle(groups [][]string) string {
 		if val == "" || reBracketEpOnly.MatchString(val) || reSeasonBracket.MatchString(val) {
 			continue
 		}
-		// The group opens the run, but a cours marker may sit between it and the
-		// show: "【喵萌奶茶屋】★10月新番★[Show][01]".
-		if first {
-			first = false
-			if looksLikeGroup(val) {
-				continue
-			}
-		}
 		if _, ok := bracketEpisode(val); ok {
 			continue
 		}
-		if t, n := titleCandidates(val); t != "" && n > 0 && !reTechOnly.MatchString(t) {
-			return t
+		// A group is never the show, wherever it sits: "[VCB-Studio] [Ma10p_1080p]
+		// [01]" has no title at all, and calling the group one would file every
+		// release of that group under a single show.
+		if looksLikeGroup(val) {
+			continue
+		}
+		if t, n := titleCandidates(val); t != "" && n > 0 && !techOnlyTitle(t) {
+			readable[i] = t
 		}
 	}
-	return ""
+	if epIdx >= 0 {
+		for i := epIdx - 1; i >= 0; i-- {
+			if readable[i] != "" {
+				return readable[i]
+			}
+		}
+		for i := epIdx + 1; i < len(readable); i++ {
+			if readable[i] != "" {
+				return readable[i]
+			}
+		}
+		return ""
+	}
+	// No bracket carried the number: the longest readable bracket is the title,
+	// which is what a "[Group][Show][1080p]" movie layout looks like.
+	best := ""
+	for _, t := range readable {
+		if len([]rune(t)) > len([]rune(best)) {
+			best = t
+		}
+	}
+	return best
 }
 
 // looksLikeGroup reports whether a bracket is a release group rather than a
@@ -521,8 +597,39 @@ func hasLatin(s string) bool {
 	return false
 }
 
-// reTechOnly matches a string left with nothing but technical tokens.
-var reTechOnly = regexp.MustCompile(`^[\s\dA-Za-z\.\-]*$`)
+// techOnlyTitle reports whether a bracket holds release furniture — resolution,
+// codec, source, subtitle language, checksum — instead of a name. "[1080p]" and
+// "[JPSC]" are furniture, "[Kimi ga Shinu made Koi wo Shitai]" is a name, and
+// only the words in it can say which: a character-class test ("pure ASCII") sees
+// no difference, which is how an English show title became no title at all.
+func techOnlyTitle(s string) bool {
+	rest := cjkTokens.ReplaceAllString(qualityTokens.ReplaceAllString(s, " "), " ")
+	for _, f := range strings.Fields(rest) {
+		if isNameWord(f) {
+			return false
+		}
+	}
+	return true
+}
+
+// isNameWord reports whether one word of a bracket reads as part of a name.
+// Furniture is a word carrying digits (a resolution, a bit depth, a checksum) or
+// a short all-caps tag ("JPSC", "NCOP"); everything else is a name.
+func isNameWord(f string) bool {
+	f = strings.Trim(f, ".-_()[]{}!,'\"·:;")
+	if f == "" || strings.ContainsAny(f, "0123456789") {
+		return false
+	}
+	for _, r := range f {
+		if unicode.IsLower(r) || unicode.Is(unicode.Han, r) ||
+			unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r) ||
+			unicode.Is(unicode.Hangul, r) {
+			return true
+		}
+	}
+	// All-caps latin is a name only when it is too long to be a tag.
+	return len([]rune(f)) >= 6
+}
 
 func applySE(p *Parsed, m []string) {
 	s, _ := strconv.Atoi(m[1])
@@ -682,6 +789,11 @@ var reSubLanguageFrag = regexp.MustCompile(`(?i)\s+\b[achstk]\b$`)
 // taken out.
 var seasonWordNoise = regexp.MustCompile(`(?i)(?:\b(?:season|series|新番)\b|\d+(?:st|nd|rd|th)\b|\d+\s*月新番)`)
 
+// reTrailingTag matches a short language/codec/version tag at the very end of a
+// name ("gb", "CHS", "v2", "x265"), the way "[KissSub]Magia Record - Mahou Shoujo
+// 04 gb" ends in one.
+var reTrailingTag = regexp.MustCompile(`(?i)\s+(?:[a-z]{1,4}|v\d{1,2}|x26[45]|h\.?26[45]|hevc|avc|aac|flac|opus|mp4|mkv)$`)
+
 // trailingEpisode reads a name that ends in its episode number ("Black Clover
 // 174", "魔法★探险家 05 (CR 1920x1080)"), plus the text before it.
 func trailingEpisode(s string) (int, string, bool) {
@@ -694,6 +806,12 @@ func trailingEpisode(s string) (int, string, bool) {
 				trimmed = strings.TrimSpace(trimmed[:m[0]])
 				changed = true
 			}
+		}
+		// A language or codec tag written after the number ("… 04 gb") is not
+		// part of the name, and must not hide the number it follows.
+		if m := reTrailingTag.FindStringIndex(trimmed); m != nil && m[1] == len(trimmed) {
+			trimmed = strings.TrimSpace(trimmed[:m[0]])
+			changed = true
 		}
 		if !changed {
 			s = trimmed
@@ -724,6 +842,9 @@ func trailingEpisode(s string) (int, string, bool) {
 }
 
 var reResolution = regexp.MustCompile(`(?i)\d{3,4}\s*[x×]\s*\d{3,4}|\b(?:1080|720|2160|480|576)[pi]\b`)
+
+// reResolutionNum are the numbers that are a picture size, never an episode.
+var reResolutionNum = map[int]bool{480: true, 576: true, 720: true, 1080: true, 1440: true, 2160: true, 4320: true}
 
 func applyNum(p *Parsed, s string) {
 	f, err := strconv.ParseFloat(strings.TrimSuffix(strings.TrimSuffix(s, "v2"), "v3"), 64)
@@ -759,6 +880,111 @@ func IsCategoryDir(name string) bool {
 	n := strings.TrimSpace(name)
 	return reContainerDir.MatchString(n) ||
 		n == "剧场版" || n == "劇場版" || strings.EqualFold(n, "theatrical")
+}
+
+// reShowDirSeason matches the season a collection writes in a bracket of the
+// show folder itself: the "[S2]" of "[CLANNAD][S2]", plus the forms that carry a
+// note — "[S3@60FPS]", "[S2 S]", "[S1-4]", "[S2.5]".
+var reShowDirSeason = regexp.MustCompile(`(?i)^s(\d{1,2})(?:\.\d+)?(?:[\s@\-–~·_].*)?$`)
+
+// ParseShowDirName reads the folder convention that keeps one show's seasons in
+// sibling directories named after it: "[show][S2]". The show is the first
+// bracket, a later bracket carries the season, and whatever follows that bracket
+// names the season — "[中二病也要谈恋爱!][S2][恋!]" is show 中二病也要谈恋爱!,
+// season 2, named 恋!.
+//
+// "[S0]" is the show's theatrical film, not a zeroth season: the folder holds the
+// movie, and the caller files it under 剧场版.
+//
+// Returns zero values for any folder that is not this shape, so a release folder
+// ("[Group] Show [1080p]") is left to the normal name parser.
+func ParseShowDirName(name string) (title string, season int, seasonName string, movie bool) {
+	n := strings.TrimSpace(name)
+	if !strings.HasPrefix(n, "[") && !strings.HasPrefix(n, "【") {
+		return "", 0, "", false
+	}
+	// Text outside the brackets means this is a release folder, not a season
+	// marker: only the all-brackets shape belongs to this convention.
+	if strings.TrimSpace(reBracketGroups.ReplaceAllString(n, " ")) != "" {
+		return "", 0, "", false
+	}
+	groups := reBracketGroups.FindAllStringSubmatch(n, -1)
+	if len(groups) < 2 {
+		return "", 0, "", false
+	}
+	title = cleanTitle(groups[0][1])
+	if title == "" || reBracketEpOnly.MatchString(title) {
+		return "", 0, "", false
+	}
+
+	names := make([]string, 0, len(groups))
+	found := false
+	for _, g := range groups[1:] {
+		val := strings.TrimSpace(g[1])
+		if val == "" {
+			continue
+		}
+		if !found {
+			if m := reShowDirSeason.FindStringSubmatch(val); m != nil {
+				if v, err := strconv.Atoi(m[1]); err == nil {
+					season, found = v, true
+				}
+				continue
+			}
+			// A special collection ("[OVA]", "[剧场版]", "[SP]") is its own slot.
+			if disp, num, ok := SpecialSeasonDir(val); ok {
+				season, seasonName, found = num, disp, true
+				continue
+			}
+			// Nothing in front of the marker can name the season.
+			continue
+		}
+		// What follows the marker names the season ("恋!", "解").
+		names = append(names, strings.TrimSpace(strings.Trim(val, "-–—~· ")))
+	}
+	if !found {
+		return "", 0, "", false
+	}
+	if season == 0 {
+		// "[S0]" holds the film.
+		return title, 0, "", true
+	}
+	if seasonName == "" {
+		seasonName = strings.Join(nonEmpty(names), " · ")
+	}
+	return title, season, seasonName, false
+}
+
+func nonEmpty(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// seasonMarkerDir reports the season number a bracket-only folder name marks, so
+// a bare "[S2]" directory is a season folder like any other.
+func seasonMarkerDir(name string) (int, bool) {
+	v := strings.TrimSpace(name)
+	if !strings.HasPrefix(v, "[") && !strings.HasPrefix(v, "【") {
+		return 0, false
+	}
+	if strings.TrimSpace(reBracketGroups.ReplaceAllString(v, " ")) != "" {
+		return 0, false
+	}
+	groups := reBracketGroups.FindAllStringSubmatch(v, -1)
+	if len(groups) != 1 {
+		return 0, false
+	}
+	if m := reShowDirSeason.FindStringSubmatch(strings.TrimSpace(groups[0][1])); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+			return n, true
+		}
+	}
+	return 0, false
 }
 
 // ParseSeasonDir detects "Season 01" / "S01" / "第一季" / "第 2 季" folder names.
