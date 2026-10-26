@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaybackTransport",
+  "description": "One of the three S3 transport strategies. direct-dash and local-relay are outside this contract revision.",
+  "discriminator": {
+    "propertyName": "kind"
+  },
+  "oneOf": [
+    {
+      "$ref": "transport-direct-http.schema.json"
+    },
+    {
+      "$ref": "transport-server-proxy.schema.json"
+    },
+    {
+      "$ref": "transport-server-hls.schema.json"
+    }
+  ]
+}

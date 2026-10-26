@@ -95,7 +95,9 @@ func (s *Server) sendVerification(r *http.Request, u *models.User) error {
 		return errors.New("这个账号还没有邮箱地址")
 	}
 	token := auth.NewToken()
-	if err := s.Store.CreateAuthToken(token, u.ID, db.TokenVerifyEmail, time.Now().Add(verifyTokenTTL)); err != nil {
+	if err := s.Store.CreateAuthTokenForEmail(
+		token, u.ID, db.TokenVerifyEmail, u.Email, time.Now().Add(verifyTokenTTL),
+	); err != nil {
 		return err
 	}
 	link := fmt.Sprintf("%s/verify-email?token=%s", s.baseURLFor(r), token)
@@ -111,7 +113,9 @@ func (s *Server) sendPasswordReset(r *http.Request, u *models.User) error {
 		return errors.New("这个账号还没有邮箱地址")
 	}
 	token := auth.NewToken()
-	if err := s.Store.CreateAuthToken(token, u.ID, db.TokenResetPassword, time.Now().Add(resetTokenTTL)); err != nil {
+	if err := s.Store.CreateAuthTokenForEmail(
+		token, u.ID, db.TokenResetPassword, u.Email, time.Now().Add(resetTokenTTL),
+	); err != nil {
 		return err
 	}
 	link := fmt.Sprintf("%s/reset-password?token=%s", s.baseURLFor(r), token)
@@ -132,13 +136,13 @@ func (s *Server) handleVerifyEmail(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "缺少验证令牌")
 		return
 	}
-	userID, expires, err := s.Store.AuthTokenUserID(req.Token, db.TokenVerifyEmail)
-	if err != nil {
+	userID, err := s.Store.ConsumeEmailVerificationToken(req.Token, time.Now())
+	if errors.Is(err, db.ErrEmailVerificationTokenInvalid) {
 		fail(w, 400, "这个验证链接无效,或已经被使用过了")
 		return
 	}
-	if time.Now().After(expires) {
-		fail(w, 400, "验证链接已过期,请在登录页重新发送一封")
+	if err != nil {
+		fail(w, 500, "验证链接暂时无法处理,请稍后重试")
 		return
 	}
 	u, err := s.Store.UserByID(userID)
@@ -146,15 +150,6 @@ func (s *Server) handleVerifyEmail(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "这个验证链接无效,或已经被使用过了")
 		return
 	}
-	if u.Email == "" {
-		fail(w, 400, "账号上已经没有邮箱可验证了")
-		return
-	}
-	if err := s.Store.SetUserEmail(u.ID, u.Email, true); err != nil {
-		fail(w, 500, err.Error())
-		return
-	}
-	_ = s.Store.DeleteAuthToken(req.Token)
 
 	message := "邮箱验证成功,现在可以登录了"
 	switch {
@@ -273,18 +268,14 @@ func (s *Server) handleResetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hash, salt := auth.HashPassword(req.Password)
-	if err := s.Store.UpdateUserPassword(u.ID, hash, salt); err != nil {
-		fail(w, 500, err.Error())
-		return
-	}
-	// Following a link that was delivered to the address is itself proof of
-	// ownership, so a pending verification is settled here too.
-	if u.Email != "" && !u.EmailVerified {
-		_ = s.Store.SetUserEmail(u.ID, u.Email, true)
-	}
-	_ = s.Store.DeleteAuthTokens(u.ID, db.TokenResetPassword)
-	// Whoever had the account open with the old password is signed out.
-	if err := s.Store.DeleteUserSessions(u.ID, ""); err != nil {
+	if _, err := s.Store.RotateUserPassword(u.ID, hash, salt, time.Now(), db.PasswordRotationOptions{
+		ResetToken:         req.Token,
+		VerifyCurrentEmail: true,
+	}); err != nil {
+		if errors.Is(err, db.ErrPasswordResetTokenInvalid) || errors.Is(err, db.ErrUserNotFound) {
+			fail(w, 400, "这个重置链接无效,或已经被使用过了")
+			return
+		}
 		fail(w, 500, err.Error())
 		return
 	}

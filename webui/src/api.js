@@ -1,13 +1,15 @@
 // Minimal API client with cookie auth.
 export class ApiError extends Error {
-  constructor(status, message) {
+  constructor(status, message, code = '', details = null) {
     super(message)
     this.status = status
+    this.code = code
+    this.details = details
   }
 }
 
-async function request(method, url, body) {
-  const opts = { method, credentials: 'include', headers: {} }
+async function request(method, url, body, options = {}) {
+  const opts = { method, credentials: 'include', headers: { ...(options.headers || {}) } }
   if (body !== undefined) {
     opts.headers['Content-Type'] = 'application/json'
     opts.body = JSON.stringify(body)
@@ -17,15 +19,22 @@ async function request(method, url, body) {
   let data = null
   try { data = text ? JSON.parse(text) : null } catch { data = text }
   if (!resp.ok) {
-    const msg = data && data.error ? data.error : `HTTP ${resp.status}`
-    throw new ApiError(resp.status, msg)
+    const payload = data && data.error
+    const message = typeof payload === 'string'
+      ? payload
+      : payload && typeof payload.message === 'string'
+        ? payload.message
+        : `HTTP ${resp.status}`
+    const code = payload && typeof payload.code === 'string' ? payload.code : ''
+    const details = payload && payload.details && typeof payload.details === 'object' ? payload.details : null
+    throw new ApiError(resp.status, message, code, details)
   }
   return data
 }
 
 export const api = {
   get: (url) => request('GET', url),
-  post: (url, body) => request('POST', url, body ?? {}),
+  post: (url, body, options) => request('POST', url, body ?? {}, options),
   put: (url, body) => request('PUT', url, body),
   del: (url) => request('DELETE', url),
 }

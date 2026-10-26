@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeviceRevocation",
+  "description": "Successful single-device revocation. Repeating DELETE for an already revoked device is idempotent and returns the original revocation time.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "device_id",
+    "state",
+    "revoked_at"
+  ],
+  "properties": {
+    "device_id": {
+      "type": "string",
+      "pattern": "^dev_[A-Za-z0-9_-]{8,96}$"
+    },
+    "state": {
+      "const": "revoked"
+    },
+    "revoked_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

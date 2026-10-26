@@ -1,8 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -44,6 +46,14 @@ type Server struct {
 	loginLimiter    *attemptLimiter
 	registerLimiter *attemptLimiter
 	mailLimiter     *attemptLimiter
+	// Device-auth limits are separate so a polling client cannot exhaust the
+	// login or mail budgets. Fresh instances use New; nil remains permissive for
+	// small zero-value Server tests.
+	deviceAuthStartLimiter    *attemptLimiter
+	deviceAuthTokenLimiter    *attemptLimiter
+	deviceAuthRefreshLimiter  *attemptLimiter
+	deviceAuthLookupLimiter   *attemptLimiter
+	deviceAuthDecisionLimiter *attemptLimiter
 
 	// SubtitleAudits holds the per-library "which BDRip episodes have no
 	// subtitles" audits and their last results. See subaudit.go.
@@ -75,15 +85,39 @@ func New(store *db.Store, cfg *config.Config, scanner *scan.Scanner, meta *metad
 		loginLimiter:    newAttemptLimiter(10, 5*time.Minute),
 		registerLimiter: newAttemptLimiter(5, time.Hour),
 		mailLimiter:     newAttemptLimiter(5, time.Hour),
+		// A native client polls every five seconds. Token/refresh allowances
+		// leave room for retries while lookup and decision operations are much
+		// stricter because they require an interactive Web session.
+		deviceAuthStartLimiter:    newAttemptLimiter(20, 10*time.Minute),
+		deviceAuthTokenLimiter:    newAttemptLimiter(60, time.Minute),
+		deviceAuthRefreshLimiter:  newAttemptLimiter(20, time.Minute),
+		deviceAuthLookupLimiter:   newAttemptLimiter(30, time.Minute),
+		deviceAuthDecisionLimiter: newAttemptLimiter(10, time.Minute),
 	}
 }
 
 // ---------- helpers ----------
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	_ = writeJSONResponse(w, status, v)
+}
+
+func writeJSONResponse(w http.ResponseWriter, status int, v any) error {
+	var body bytes.Buffer
+	if err := json.NewEncoder(&body).Encode(v); err != nil {
+		return err
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	payload := body.Bytes()
+	n, err := w.Write(payload)
+	if err != nil {
+		return err
+	}
+	if n != len(payload) {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 func fail(w http.ResponseWriter, status int, msg string) {
@@ -126,10 +160,21 @@ func (s *Server) currentUser(r *http.Request) *models.User {
 	}
 	// A session that outlived a "禁用" would keep working, so the account state
 	// is re-checked on every request rather than only at sign-in.
-	if !u.CanLogin() {
+	if !s.userAllowedForNativeClient(u) {
 		return nil
 	}
 	return u
+}
+
+// userAllowedForNativeClient is the shared live-account gate for both Web
+// sessions and device access. An unverified address only blocks while mail
+// verification is actually required; legacy accounts without an address keep
+// their previous behavior.
+func (s *Server) userAllowedForNativeClient(u *models.User) bool {
+	if u == nil || !u.CanLogin() {
+		return false
+	}
+	return !(s.Cfg != nil && s.Cfg.EmailVerificationRequired() && u.EmailPending())
 }
 
 type authedHandler func(w http.ResponseWriter, r *http.Request, user *models.User)
@@ -224,6 +269,36 @@ func pathID(r *http.Request) (int64, bool) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
+	// API v1 discovery stays public even while every feature flag is disabled.
+	mux.HandleFunc("GET /api/v1/meta", s.handleV1Meta)
+
+	// Device authentication. Each handler checks both client_v1_enabled and
+	// device_auth_enabled before touching credentials or storage.
+	mux.HandleFunc("POST /api/v1/auth/device/authorizations", s.handleV1DeviceAuthorizationStart)
+	mux.HandleFunc("GET /api/v1/auth/device/authorizations/lookup", s.handleV1DeviceAuthorizationLookup)
+	mux.HandleFunc("GET /api/v1/auth/device/authorizations/{id}", s.handleV1DeviceAuthorizationStatus)
+	mux.HandleFunc("POST /api/v1/auth/device/authorizations/{id}/decision", s.handleV1DeviceAuthorizationDecision)
+	mux.HandleFunc("POST /api/v1/auth/device/token", s.handleV1DeviceToken)
+	mux.HandleFunc("POST /api/v1/auth/refresh", s.handleV1DeviceRefresh)
+	mux.HandleFunc("POST /api/v1/auth/logout", s.requireV1DeviceAccess(s.handleV1DeviceLogout))
+	mux.HandleFunc("GET /api/v1/devices", s.requireV1DeviceAccess(s.handleV1DeviceList))
+	mux.HandleFunc("DELETE /api/v1/devices/{id}", s.requireV1DeviceAccess(s.handleV1DeviceDelete))
+
+	// Playback tickets and capability-addressed media. The media-session routes
+	// intentionally do not accept a Bearer token: the high-entropy path
+	// capability is the media credential and is redacted by the log middleware.
+	mux.HandleFunc("POST /api/v1/playback/tickets", s.requireV1DeviceAccess(s.handleV1PlaybackTicketCreate))
+	mux.HandleFunc("GET /api/v1/playback/tickets/{id}", s.requireV1DeviceAccess(s.handleV1PlaybackTicketStatus))
+	mux.HandleFunc("POST /api/v1/playback/tickets/{id}/refresh", s.requireV1DeviceAccess(s.handleV1PlaybackTicketRefresh))
+	mux.HandleFunc("GET /api/v1/playback/media-sessions/{id}/stream", s.handleV1PlaybackMediaStream)
+	mux.HandleFunc("HEAD /api/v1/playback/media-sessions/{id}/stream", s.handleV1PlaybackMediaStream)
+	mux.HandleFunc("GET /api/v1/playback/media-sessions/{id}/index.m3u8", s.handleV1ServerHLSPlaylist)
+	mux.HandleFunc("GET /api/v1/playback/media-sessions/{media}/subtitle-sessions/{sub}", s.handleV1PlaybackHLSSubtitle)
+	mux.HandleFunc("HEAD /api/v1/playback/media-sessions/{media}/subtitle-sessions/{sub}", s.handleV1PlaybackHLSSubtitle)
+	mux.HandleFunc("GET /api/v1/playback/media-sessions/{id}/{segment}", s.handleV1ServerHLSSegment)
+	mux.HandleFunc("GET /api/v1/playback/subtitle-sessions/{id}/subtitle.vtt", s.handleV1PlaybackSubtitle)
+	mux.HandleFunc("HEAD /api/v1/playback/subtitle-sessions/{id}/subtitle.vtt", s.handleV1PlaybackSubtitle)
+
 	// auth / setup
 	mux.HandleFunc("POST /api/setup", s.handleSetup)
 	mux.HandleFunc("POST /api/auth/register", s.handleRegister)
@@ -251,6 +326,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/admin/users/{id}/password", s.requireAdmin(s.handleSetUserPassword))
 	mux.HandleFunc("POST /api/admin/users/{id}/revoke", s.requireAdmin(s.handleRevokeUserSessions))
 	mux.HandleFunc("POST /api/admin/mail/test", s.requireAdmin(s.handleMailTest))
+	mux.HandleFunc("GET /api/admin/client-devices", s.requireAdmin(s.handleAdminListClientDevices))
+	mux.HandleFunc("PUT /api/admin/client-devices/{id}/features", s.requireAdmin(s.handleAdminUpdateClientDeviceFeatures))
 
 	// system
 	mux.HandleFunc("GET /api/system/info", s.requireAuth(s.handleSystemInfo))
@@ -351,7 +428,23 @@ func logMiddleware(next http.Handler) http.Handler {
 		start := time.Now()
 		next.ServeHTTP(w, r)
 		if strings.HasPrefix(r.URL.Path, "/api/") {
-			log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
+			log.Printf("%s %s %s", r.Method, redactAPILogPath(r.URL.Path),
+				time.Since(start).Round(time.Millisecond))
 		}
 	})
+}
+
+func redactAPILogPath(path string) string {
+	parts := strings.Split(path, "/")
+	for i, part := range parts {
+		switch {
+		case strings.HasPrefix(part, "ms_"):
+			parts[i] = "ms_redacted"
+		case strings.HasPrefix(part, "ss_"):
+			parts[i] = "ss_redacted"
+		case strings.HasPrefix(part, "pt_"):
+			parts[i] = "pt_redacted"
+		}
+	}
+	return strings.Join(parts, "/")
 }

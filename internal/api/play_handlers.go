@@ -41,6 +41,22 @@ const sigTTL = 12 * time.Hour
 // past this.
 const resumeMinSeconds = 30.0
 
+// failExternal keeps source, probe, subtitle, and danmaku failures out of the
+// response body. Those errors can contain signed URLs, ffprobe stderr, paths,
+// or upstream response text; only a fixed client message is safe to expose.
+func failExternal(w http.ResponseWriter, status int, message, operation string, err error) {
+	log.Printf("%s: %s", operation, media.SafeMediaLogError(err))
+	fail(w, status, message)
+}
+
+// isPlainHTTPURL reports whether a direct link would downgrade an HTTPS
+// page to cleartext. The TLS state comes from the request itself, not from
+// X-Forwarded-Proto, which is untrusted unless the deployment config says
+// otherwise.
+func isPlainHTTPURL(raw string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(raw)), "http://")
+}
+
 // ---------- /api/play/{id} ----------
 
 func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request, user *models.User) {
@@ -62,7 +78,7 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request, user *models
 func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.MediaFile) {
 	drv, err := s.Engine.DriverFor(file)
 	if err != nil {
-		fail(w, 500, "存储源错误: "+err.Error())
+		failExternal(w, 500, "存储源不可用", "play driver lookup", err)
 		return
 	}
 	// 清晰度 is a playback-time choice, not a library setting: the player sends
@@ -87,8 +103,8 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 	if perr != nil {
 		// The source itself refused to hand out a playable stream (a membership
 		// episode, a region lock). There is nothing to probe and nothing to play,
-		// so the reason is the answer rather than a spinner.
-		fail(w, 502, perr.Error())
+		// so report the failure without exposing the source's error text.
+		failExternal(w, 502, "媒体探测失败", "play probe", perr)
 		return
 	}
 	if probe == nil {
@@ -854,7 +870,7 @@ func (s *Server) subFormatFor(ctx context.Context, drv source.Driver, sub *model
 	if v, ok := subFormatCache.Load(sub.ID); ok {
 		return v.(string), true
 	}
-	rc, err := drv.Open(ctx, sub.Path)
+	rc, err := openSourceRead(ctx, drv, sub.Path)
 	if err != nil {
 		return sub.Format, sub.Convertible
 	}
@@ -871,6 +887,10 @@ func (s *Server) subFormatFor(ctx context.Context, drv source.Driver, sub *model
 // ---------- /api/stream/{id} ----------
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+	telemetry := newPlaybackTelemetry(w, "legacy-stream", "legacy", r)
+	defer telemetry.finish()
+	w = telemetry
+
 	id, ok := pathID(r)
 	if !ok {
 		fail(w, 400, "bad id")
@@ -883,7 +903,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	drv, err := s.Engine.DriverFor(file)
 	if err != nil {
-		fail(w, 500, "存储源错误: "+err.Error())
+		failExternal(w, 500, "存储源不可用", "stream driver lookup", err)
 		return
 	}
 
@@ -894,12 +914,21 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	if !proxy && drv.HasDirect() {
 		raw, hdrs, err := drv.DirectURL(ctx, file.Path)
 		if err == nil && raw != "" && len(hdrs) == 0 {
-			w.Header().Set("Cache-Control", "no-store")
-			http.Redirect(w, r, raw, http.StatusFound)
-			return
+			if r.TLS != nil && isPlainHTTPURL(raw) {
+				// Do not send an HTTP Location from an HTTPS page. Fall through
+				// to the server-side proxy below so playback can still continue.
+				log.Printf("direct url rejected for HTTPS file %d: plain HTTP link; falling back to proxy", file.ID)
+			} else {
+				w.Header().Set("Cache-Control", "no-store")
+				w.Header().Set("Location", raw)
+				w.Header().Set("Content-Length", "0")
+				w.WriteHeader(http.StatusFound)
+				return
+			}
 		}
 		if err != nil {
-			log.Printf("direct url failed for file %d: %v, falling back to proxy", file.ID, err)
+			log.Printf("direct url failed for file %d: %s, falling back to proxy",
+				file.ID, media.SafeMediaLogError(err))
 		}
 	}
 
@@ -911,30 +940,107 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	target, headers, err := drv.ProbeURL(ctx, file.Path)
 	if err != nil {
-		fail(w, 502, "获取源地址失败: "+err.Error())
+		failExternal(w, 502, "无法获取媒体源", "stream probe url", err)
 		return
 	}
-	proxyRemoteVia(w, r, target, headers, sourceHTTPClient(drv))
+	client, err := sourceStreamHTTPClient(ctx, target, headers, drv)
+	if err != nil {
+		failExternal(w, 502, "无法获取媒体源", "stream secure client", err)
+		return
+	}
+	defer client.CloseIdleConnections()
+	proxyRemoteVia(w, r, target, headers, client)
 }
 
-// sourceHTTPClient is the client to fetch a source's bytes with: the shared
-// streaming client, unless the source reaches the network through a proxy of
-// its own (a bilibili source abroad), in which case its bytes must leave the
-// same way its API calls do.
-func sourceHTTPClient(drv source.Driver) *http.Client {
+// sourceStreamHTTPClient applies the same DNS/IP, redirect, and private-origin
+// policy as the v1 media proxy. A source-specific proxy is bridged to loopback
+// because the secure dial policy only accepts an administrator-controlled
+// local bridge, never an arbitrary proxy endpoint supplied by request data.
+func sourceStreamHTTPClient(
+	ctx context.Context,
+	target string,
+	headers map[string]string,
+	drv source.Driver,
+) (*http.Client, error) {
+	proxyRaw := ""
 	pd, ok := drv.(source.ProxiedDriver)
-	if !ok || pd.ProxySpec() == "" {
-		return proxyClient
+	if ok && strings.TrimSpace(pd.ProxySpec()) != "" {
+		spec, err := netproxy.Parse(pd.ProxySpec())
+		if err != nil {
+			return nil, err
+		}
+		bridge, err := netproxy.BridgeFor(spec)
+		if err != nil {
+			return nil, err
+		}
+		proxyRaw = bridge.URL()
 	}
-	spec, err := netproxy.Parse(pd.ProxySpec())
+	return v1PlaybackProxyClientForDriver(ctx, target, proxyRaw, headers, drv)
+}
+
+// openSourceRead is the only server path for reading source bytes outside the
+// FFmpeg child. A driver's own Open method may use the source package's general
+// HTTP client, which does not pin DNS/IP or enforce the v1 private-origin policy;
+// URLDriver in particular accepts any .strm target. Resolve through ProbeURL and
+// fetch HTTP(S) targets with the same guarded client as v1 media and subtitles.
+func openSourceRead(
+	ctx context.Context,
+	drv source.Driver,
+	path string,
+) (io.ReadCloser, error) {
+	if drv == nil {
+		return nil, fmt.Errorf("source driver is unavailable")
+	}
+	target, headers, err := drv.ProbeURL(ctx, path)
 	if err != nil {
-		return proxyClient
+		return nil, err
 	}
-	c, err := netproxy.NewClient(spec, 0)
+	u, err := url.Parse(target)
 	if err != nil {
-		return proxyClient
+		return nil, err
 	}
-	return c
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return drv.Open(ctx, path)
+	}
+	client, err := sourceStreamHTTPClient(ctx, target, headers, drv)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		client.CloseIdleConnections()
+		return nil, err
+	}
+	for name, value := range headers {
+		req.Header.Set(name, value)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		client.CloseIdleConnections()
+		return nil, err
+	}
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		_ = resp.Body.Close()
+		client.CloseIdleConnections()
+		return nil, fmt.Errorf("source read returned status %d", resp.StatusCode)
+	}
+	return &sourceReadCloser{ReadCloser: resp.Body, client: client}, nil
+}
+
+type sourceReadCloser struct {
+	io.ReadCloser
+	client *http.Client
+	once   sync.Once
+}
+
+func (r *sourceReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	r.once.Do(func() {
+		if r.client != nil {
+			r.client.CloseIdleConnections()
+		}
+	})
+	return err
 }
 
 // proxyRemote and the range handling live in proxy_range.go.
@@ -942,6 +1048,12 @@ func sourceHTTPClient(drv source.Driver) *http.Client {
 // ---------- /api/hls/{id}/... ----------
 
 func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
+	telemetry := newPlaybackTelemetry(
+		w, models.PlaybackTransportServerHLS, "legacy", r)
+	telemetry.setAsset(legacyHLSAsset(r))
+	defer telemetry.finish()
+	w = telemetry
+
 	id, ok := pathID(r)
 	if !ok {
 		fail(w, 400, "bad id")
@@ -954,7 +1066,7 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 	}
 	drv, err := s.Engine.DriverFor(file)
 	if err != nil {
-		fail(w, 500, "存储源错误: "+err.Error())
+		failExternal(w, 500, "存储源不可用", "hls driver lookup", err)
 		return
 	}
 	// The playlist, its init segment and every media segment carry the rung they
@@ -1040,11 +1152,13 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 	if rest == "" || strings.HasPrefix(rest, "index") || strings.HasPrefix(rest, "playlist") {
 		probe, err := s.Engine.EnsureProbe(ctx, file, drv)
 		if err != nil {
-			fail(w, 500, "媒体探测失败: "+err.Error())
+			setPlaybackFailureStage(w, playbackFailureStageSource)
+			failExternal(w, 500, "媒体探测失败", "hls probe", err)
 			return
 		}
 		duration := probe.Duration()
 		if duration <= 0 {
+			setPlaybackFailureStage(w, playbackFailureStageSource)
 			fail(w, 500, "无法确定媒体时长,无法生成 HLS")
 			return
 		}
@@ -1062,12 +1176,14 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 
 	segIndex, err := parseSegID(strings.TrimSuffix(rest, ".ts"))
 	if err != nil {
+		setPlaybackFailureStage(w, playbackFailureStageRequest)
 		fail(w, 404, "未知 HLS 资源")
 		return
 	}
 	probe, err := s.Engine.EnsureProbe(ctx, file, drv)
 	if err != nil {
-		fail(w, 500, "媒体探测失败: "+err.Error())
+		setPlaybackFailureStage(w, playbackFailureStageSource)
+		failExternal(w, 500, "媒体探测失败", "hls segment probe", err)
 		return
 	}
 
@@ -1099,7 +1215,8 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	written, err := s.Engine.Segment(ctx, file, drv, start, segLen, mode, audioMode, audioOrdinal, videoIndex, s.Cfg.Playback.TranscodeHeight, w)
 	if err != nil {
-		log.Printf("hls segment %d/%d @%.0fs failed: %v", file.ID, segIndex, start, err)
+		log.Printf("hls segment %d/%d @%.0fs failed: %s",
+			file.ID, segIndex, start, media.SafeMediaLogError(err))
 		// Nothing reached the client yet, so the status is still ours to choose.
 		// A real error makes the player retry the segment; answering 200 with an
 		// empty body looks like a corrupt segment and can stop playback for good.
@@ -1108,6 +1225,32 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "分片生成失败,请重试", http.StatusBadGateway)
 		}
 	}
+}
+
+func legacyHLSAsset(r *http.Request) string {
+	if r == nil {
+		return playbackAssetStream
+	}
+	rest := r.PathValue("rest")
+	switch {
+	case rest == "master.m3u8",
+		strings.HasPrefix(rest, "subs/"):
+		return playbackAssetSubtitle
+	case rest == "byterange.m3u8",
+		rest == "",
+		strings.HasPrefix(rest, "index"),
+		strings.HasPrefix(rest, "playlist"):
+		return playbackAssetPlaylist
+	case rest == "init.mp4":
+		return playbackAssetSegment
+	}
+	if _, ok := media.ParseSessionSegment(rest); ok {
+		return playbackAssetSegment
+	}
+	if _, err := parseSegID(strings.TrimSuffix(rest, ".ts")); err == nil {
+		return playbackAssetSegment
+	}
+	return playbackAssetStream
 }
 
 // ---------- /api/hls/{id}/... served from a packaging session ----------
@@ -1227,30 +1370,34 @@ func sessionOriginQuery(multi bool, window media.PackWindow) string {
 func (s *Server) serveByteRangeHLS(w http.ResponseWriter, r *http.Request, ctx context.Context,
 	file *models.MediaFile, drv source.Driver) {
 
-	rc, err := drv.Open(ctx, file.Path)
+	rc, err := openSourceRead(ctx, drv, file.Path)
 	if err != nil {
-		fail(w, 502, "读取源失败: "+err.Error())
+		failExternal(w, 502, "读取媒体源失败", "byte-range source open", err)
 		return
 	}
 	defer rc.Close()
 	ra, seekable := rc.(io.ReaderAt)
 	seeker, canSeek := rc.(io.Seeker)
 	if !seekable || !canSeek {
+		setPlaybackFailureStage(w, playbackFailureStageSource)
 		fail(w, 409, "字节范围直取需要可随机读取的源(当前源只能顺序读取)")
 		return
 	}
 	size, err := seeker.Seek(0, io.SeekEnd)
 	if err != nil {
-		fail(w, 500, "读取源大小失败: "+err.Error())
+		setPlaybackFailureStage(w, playbackFailureStageSource)
+		failExternal(w, 500, "读取媒体源大小失败", "byte-range source size", err)
 		return
 	}
 	if _, err := seeker.Seek(0, io.SeekStart); err != nil {
-		fail(w, 500, "读取源失败: "+err.Error())
+		setPlaybackFailureStage(w, playbackFailureStageSource)
+		failExternal(w, 500, "读取媒体源失败", "byte-range source rewind", err)
 		return
 	}
 	idx, err := media.ParseFragmentedMP4(ra, size)
 	if err != nil {
-		fail(w, 409, "该文件不能按字节范围直取: "+err.Error())
+		setPlaybackFailureStage(w, playbackFailureStageSource)
+		failExternal(w, 409, "该文件不能按字节范围直取", "byte-range MP4 parse", err)
 		return
 	}
 
@@ -1263,7 +1410,7 @@ func (s *Server) serveByteRangeHLS(w http.ResponseWriter, r *http.Request, ctx c
 	}
 	pl, err := idx.ByteRangePlaylist(uri)
 	if err != nil {
-		fail(w, 500, err.Error())
+		failExternal(w, 500, "播放列表生成失败", "byte-range playlist", err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
@@ -1284,12 +1431,14 @@ func (s *Server) serveBurnHLS(w http.ResponseWriter, r *http.Request, ctx contex
 
 	sub, err := s.Store.SubtitleByID(subID)
 	if err != nil || sub.FileID != file.ID {
+		setPlaybackFailureStage(w, playbackFailureStageRequest)
 		fail(w, 404, "字幕不存在")
 		return
 	}
 	probe, err := s.Engine.EnsureProbe(ctx, file, drv)
 	if err != nil {
-		fail(w, 500, "媒体探测失败: "+err.Error())
+		setPlaybackFailureStage(w, playbackFailureStageSource)
+		failExternal(w, 500, "媒体探测失败", "burn HLS probe", err)
 		return
 	}
 
@@ -1298,7 +1447,7 @@ func (s *Server) serveBurnHLS(w http.ResponseWriter, r *http.Request, ctx contex
 	if !burnIsBitmap(sub) {
 		data, ext, err := s.burnSubtitleFile(ctx, file, drv, sub)
 		if err != nil {
-			fail(w, 502, "字幕读取失败: "+err.Error())
+			failExternal(w, 502, "字幕读取失败", "burn subtitle read", err)
 			return
 		}
 		// The child runs with the session directory as its working directory, so a
@@ -1340,7 +1489,7 @@ func (s *Server) burnSubtitleFile(ctx context.Context, file *models.MediaFile, d
 		}
 		return data, "vtt", nil
 	}
-	rc, err := drv.Open(ctx, sub.Path)
+	rc, err := openSourceRead(ctx, drv, sub.Path)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1388,7 +1537,7 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 	// Re-resolved here so a link the source refused is replaced (see resolveTarget).
 	inputs, err := s.Engine.SegmentInputs(ctx, file, drv, "")
 	if err != nil {
-		fail(w, 502, "获取源地址失败: "+err.Error())
+		failExternal(w, 502, "无法获取媒体源", "session inputs", err)
 		return
 	}
 	// The driver's declared shape, not the number of links a particular resolution
@@ -1606,8 +1755,9 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 			return nil
 		})
 		if err != nil {
-			log.Printf("hls playlist for file %d failed: %v", file.ID, err)
-			fail(w, 502, err.Error())
+			log.Printf("hls playlist for file %d failed: %s",
+				file.ID, media.SafeMediaLogError(err))
+			fail(w, 502, "播放列表生成失败")
 		}
 
 	case rest == "init.mp4":
@@ -1630,12 +1780,13 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 			return nil
 		})
 		if err != nil {
-			fail(w, 502, err.Error())
+			fail(w, 502, "初始化分片生成失败")
 		}
 
 	default:
 		idx, ok := media.ParseSessionSegment(rest)
 		if !ok {
+			setPlaybackFailureStage(w, playbackFailureStageRequest)
 			fail(w, 404, "未知 HLS 资源")
 			return
 		}
@@ -1658,8 +1809,9 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 			s.Engine.CloseStreamSessions(file.ID, mode, audioOrdinal, videoIndex, height, variant, nil)
 			next, err := ensureAt(inputs, idx)
 			if err != nil {
-				log.Printf("hls session for file %d failed to start at segment %d: %v", file.ID, idx, err)
-				fail(w, 502, "打包会话启动失败: "+err.Error())
+				log.Printf("hls session for file %d failed to start at segment %d: %s",
+					file.ID, idx, media.SafeMediaLogError(err))
+				fail(w, 502, "打包会话启动失败")
 				return
 			}
 			sess = next
@@ -1685,7 +1837,8 @@ func (s *Server) serveHLSSubtitles(w http.ResponseWriter, r *http.Request, ctx c
 
 	probe, err := s.Engine.EnsureProbe(ctx, file, drv)
 	if err != nil {
-		fail(w, 500, "媒体探测失败: "+err.Error())
+		setPlaybackFailureStage(w, playbackFailureStageSource)
+		failExternal(w, 500, "媒体探测失败", "HLS subtitle probe", err)
 		return
 	}
 	servable := make([]models.Subtitle, 0, 4)
@@ -1732,6 +1885,7 @@ func (s *Server) serveHLSSubtitles(w http.ResponseWriter, r *http.Request, ctx c
 
 	if rest == "master.m3u8" {
 		if len(servable) == 0 {
+			setPlaybackFailureStage(w, playbackFailureStageRequest)
 			fail(w, 404, "该文件没有可用字幕")
 			return
 		}
@@ -1765,6 +1919,7 @@ func (s *Server) serveHLSSubtitles(w http.ResponseWriter, r *http.Request, ctx c
 	// subs/<id>.m3u8: one WebVTT document covering the whole file.
 	subID, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimPrefix(rest, "subs/"), ".m3u8"), 10, 64)
 	if err != nil {
+		setPlaybackFailureStage(w, playbackFailureStageRequest)
 		fail(w, 404, "未知字幕")
 		return
 	}
@@ -1776,6 +1931,7 @@ func (s *Server) serveHLSSubtitles(w http.ResponseWriter, r *http.Request, ctx c
 		}
 	}
 	if target == nil {
+		setPlaybackFailureStage(w, playbackFailureStageRequest)
 		fail(w, 404, "字幕不存在或无法转换")
 		return
 	}
@@ -1808,7 +1964,7 @@ func escapeM3U8(s string) string {
 // Session.ShiftSegment); the init segment carries no timestamps.
 func (s *Server) serveSessionFile(w http.ResponseWriter, r *http.Request, ctx context.Context, sess *media.Session, path string, shift bool) {
 	if err := sess.WaitForFile(ctx, path, 45*time.Second); err != nil {
-		log.Printf("hls session %s: %v", filepath.Base(path), err)
+		log.Printf("hls session %s: %s", filepath.Base(path), media.SafeMediaLogError(err))
 		w.Header().Set("Retry-After", "2")
 		http.Error(w, "分片尚未就绪,请重试", http.StatusBadGateway)
 		return
@@ -1821,13 +1977,13 @@ func (s *Server) serveSessionFile(w http.ResponseWriter, r *http.Request, ctx co
 	if !shift {
 		f, err := os.Open(path)
 		if err != nil {
-			fail(w, 502, "读取分片失败: "+err.Error())
+			failExternal(w, 502, "读取分片失败", "session file open", err)
 			return
 		}
 		defer f.Close()
 		fi, err := f.Stat()
 		if err != nil {
-			fail(w, 502, "读取分片失败: "+err.Error())
+			failExternal(w, 502, "读取分片失败", "session file stat", err)
 			return
 		}
 		http.ServeContent(w, r, filepath.Base(path), fi.ModTime(), f)
@@ -1836,7 +1992,7 @@ func (s *Server) serveSessionFile(w http.ResponseWriter, r *http.Request, ctx co
 
 	data, err := os.ReadFile(path)
 	if err != nil {
-		fail(w, 502, "读取分片失败: "+err.Error())
+		failExternal(w, 502, "读取分片失败", "session file read", err)
 		return
 	}
 	data = sess.ShiftSegment(data)
@@ -1846,6 +2002,12 @@ func (s *Server) serveSessionFile(w http.ResponseWriter, r *http.Request, ctx co
 // ---------- /api/subs/{id}/{sub}.vtt ----------
 
 func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
+	telemetry := newPlaybackTelemetry(
+		w, models.PlaybackTransportServerHLS, "legacy", r)
+	telemetry.setAsset(playbackAssetSubtitle)
+	defer telemetry.finish()
+	w = telemetry
+
 	fileID, ok := pathID(r)
 	if !ok {
 		fail(w, 400, "bad id")
@@ -1868,7 +2030,7 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	}
 	drv, err := s.Engine.DriverFor(file)
 	if err != nil {
-		fail(w, 500, err.Error())
+		failExternal(w, 500, "存储源不可用", "subtitle driver lookup", err)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
@@ -1878,7 +2040,7 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	if sub.Embedded {
 		data, err = s.Engine.ExtractEmbeddedSubtitle(ctx, file, drv, sub.StreamIdx)
 		if err != nil {
-			fail(w, 500, "字幕提取失败: "+err.Error())
+			failExternal(w, 500, "字幕提取失败", "embedded subtitle extract", err)
 			return
 		}
 	} else if ss, ok := drv.(source.SubtitleSource); ok {
@@ -1886,27 +2048,27 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		// bytes in the format it listed them with.
 		rc, err := ss.OpenSubtitle(ctx, file.Path, sub.Path)
 		if err != nil {
-			fail(w, 502, "字幕读取失败: "+err.Error())
+			failExternal(w, 502, "字幕读取失败", "source subtitle open", err)
 			return
 		}
 		defer rc.Close()
 		raw, err := io.ReadAll(io.LimitReader(rc, 8<<20))
 		if err != nil {
-			fail(w, 502, "字幕读取失败: "+err.Error())
+			failExternal(w, 502, "字幕读取失败", "source subtitle read", err)
 			return
 		}
 		format, _ := s.subFormatFor(ctx, drv, sub)
 		data = media.ToVTT(format, raw)
 	} else {
-		rc, err := drv.Open(ctx, sub.Path)
+		rc, err := openSourceRead(ctx, drv, sub.Path)
 		if err != nil {
-			fail(w, 502, "字幕读取失败: "+err.Error())
+			failExternal(w, 502, "字幕读取失败", "subtitle file open", err)
 			return
 		}
 		defer rc.Close()
 		raw, err := io.ReadAll(io.LimitReader(rc, 8<<20))
 		if err != nil {
-			fail(w, 502, "字幕读取失败: "+err.Error())
+			failExternal(w, 502, "字幕读取失败", "subtitle file read", err)
 			return
 		}
 		format, _ := s.subFormatFor(ctx, drv, sub)
@@ -1952,7 +2114,7 @@ func (s *Server) handleDanmaku(w http.ResponseWriter, r *http.Request) {
 	}
 	drv, err := s.Engine.DriverFor(file)
 	if err != nil {
-		fail(w, 500, err.Error())
+		failExternal(w, 500, "存储源不可用", "danmaku driver lookup", err)
 		return
 	}
 	dm, ok := drv.(source.Danmaku)
@@ -1965,7 +2127,7 @@ func (s *Server) handleDanmaku(w http.ResponseWriter, r *http.Request) {
 
 	comments, err := dm.Comments(ctx, file.Path)
 	if err != nil {
-		fail(w, 502, "弹幕获取失败: "+err.Error())
+		failExternal(w, 502, "弹幕获取失败", "danmaku comments", err)
 		return
 	}
 	// An episode's comments do not change while it is being watched, and the

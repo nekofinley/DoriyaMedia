@@ -1,0 +1,22 @@
+{
+  "devices": [
+    {
+      "id": "dev_example_windows_0001",
+      "name": "Example Windows Desktop",
+      "platform": "windows",
+      "client_version": "0.1.0",
+      "created_at": "2026-10-26T10:00:00Z",
+      "last_seen_at": "2026-10-26T10:15:00Z",
+      "revoked_at": null
+    },
+    {
+      "id": "dev_example_android_0002",
+      "name": "Example Android Phone",
+      "platform": "android",
+      "client_version": "0.1.0",
+      "created_at": "2026-10-25T09:00:00Z",
+      "last_seen_at": "2026-10-25T09:30:00Z",
+      "revoked_at": "2026-10-25T09:45:00Z"
+    }
+  ]
+}

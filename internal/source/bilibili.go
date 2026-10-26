@@ -128,7 +128,7 @@ func NewBilibili(cookie string, codec string, proxy string, playableOnly bool) (
 	if err != nil {
 		return nil, fmt.Errorf("bilibili: 代理无法使用: %w", err)
 	}
-	d.proxySpec, d.client = spec, c
+	d.proxySpec, d.client = spec, newSourceHTTPClient(c)
 	return d, nil
 }
 

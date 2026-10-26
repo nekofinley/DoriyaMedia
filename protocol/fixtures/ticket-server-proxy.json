@@ -1,0 +1,47 @@
+{
+  "ticket_id": "pt_example_server_proxy",
+  "state": "consuming",
+  "contract_version": 1,
+  "expires_at": "2026-10-26T12:05:00Z",
+  "transport": {
+    "kind": "server-proxy",
+    "media_session": {
+      "idle_expires_at": "2026-10-26T12:20:00Z",
+      "absolute_expires_at": "2026-10-26T18:05:00Z"
+    },
+    "streams": [
+      {
+        "role": "muxed",
+        "url": "https://media.example/api/v1/playback/media-sessions/ms_example_proxy_not_a_real_capability/stream",
+        "mime": "video/mp4",
+        "headers": {},
+        "range": true
+      }
+    ],
+    "subtitles": [
+      {
+        "id": "sub_51",
+        "language": "jpn",
+        "label": "日本語",
+        "format": "vtt",
+        "url": "https://media.example/api/v1/playback/subtitle-sessions/ss_example_proxy_subtitle_credential/subtitle.vtt",
+        "default": true,
+        "forced": false
+      }
+    ]
+  },
+  "media": {
+    "container": "mp4",
+    "duration": 1440.0,
+    "video": {
+      "codec": "h264",
+      "width": 1920,
+      "height": 1080,
+      "bit_depth": 8
+    },
+    "audio": []
+  },
+  "remaining_transports": [
+    "server-hls"
+  ]
+}

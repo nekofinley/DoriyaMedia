@@ -1,0 +1,1600 @@
+openapi: 3.1.0
+info:
+  title: DoriyaMedia Native Client Contract
+  version: 1.4.0
+  license:
+    name: Proprietary
+    identifier: LicenseRef-DoriyaMedia-Proprietary
+  description: |
+    Contract version 1 for DoriyaMedia Android and Windows clients.
+
+    S1 specifies the public GET /api/v1/meta endpoint and the shared stable
+    error envelope. S2 specifies the OAuth-like device authorization, PKCE
+    S256, rotating token, and device-management contract.
+    S3 specifies playback ticket creation, safe ticket status, one-time
+    transport issuance, capability-addressed server-proxy and server-HLS media
+    endpoints, and the S3.5 subtitle grant chain.
+
+    The S2 device-auth and device-management endpoints are implemented.
+    S3 is a contract freeze: runtime availability is advertised through
+    playback_ticket_enabled, direct_http_enabled, server_proxy_v1_enabled,
+    and server_hls_v1_enabled. direct-dash and local-relay are not part of S3.
+
+    Server-HLS playlist and segment URLs are GET-only media-session
+    capabilities. They accept no query parameters and no Bearer or Cookie
+    credential. HEAD is not supported and returns 405 with Allow: GET.
+
+    Text subtitles are delivered as WebVTT by an independent ss_ capability.
+    For server-HLS the controlled rendition URL also contains the issuing ms_
+    media capability; both sessions are reauthorized on every GET or HEAD.
+    S3 does not expose a query-driven HLS master or subtitle-selection path.
+
+    Existing /api routes are intentionally not part of this OpenAPI document.
+servers:
+  - url: /
+    description: Deployment-relative base URL; clients use the configured server origin.
+x-contract-version: 1
+x-playback-ticket-semantics:
+  states:
+    - probing
+    - ready
+    - consuming
+    - unsupported
+    - failed
+    - expired
+    - revoked
+    - exhausted
+  issuance: Create and refresh may deliver a transport description exactly once while entering consuming.
+  status: GET returns a closed status projection without transport, streams, URLs, or media-session capabilities.
+  refresh:
+    allowed_states:
+      - ready
+      - consuming
+    state_gate_before_source_access: required
+    source_probe: forbidden
+    one_transport_description_per_successful_response: true
+    concurrent_claim: exactly_one_winner
+    client_single_flight_required: true
+    probing:
+      status: 409
+      code: invalid_request
+      action: status
+    terminal:
+      states:
+        - unsupported
+        - failed
+        - expired
+        - exhausted
+      status: 410
+      code: ticket_expired
+      action: request_new_ticket
+    revoked:
+      status: 403
+      code: forbidden
+      action: reauthorize
+  preferredTransports: Client preferences may reorder eligible transports but cannot add eligibility or force a disabled transport.
+  directURL: A direct URL cannot be revoked after delivery. source_expires_at is reserved for a known source expiry but is not populated by the current S3 server; clients must not depend on it.
+x-media-session-capability:
+  location: path
+  parameter: id
+  logRedaction: required
+  rule: The ms_ capability is accepted only as the path parameter, never in a query, cookie, Authorization header, or separate body field.
+x-playback-subtitle-semantics:
+  grant: Ticket probing snapshots only subtitle ids belonging to the ticket file.
+  issuance: Subtitle descriptions and ss_ URLs appear only in a one-time consuming response.
+  status: Safe GET ticket status never contains subtitle descriptions, URLs, or capabilities.
+  capability_prefix: ss_
+  location: path
+  log_redaction: required
+  query_parameters: forbidden
+  text_format: vtt
+  bitmap_format: pgs
+  bitmap_url: forbidden
+  server_hls:
+    omission: pgs is omitted from the S3 server-HLS list
+    authorization: both the same ms_ media session and the ss_ subtitle session are required
+    url_suffix: /subtitle-sessions/ss_....vtt under the ms_ media-session path
+x-server-hls-media-session:
+  accepted_authentication: path-capability-only
+  bearer_authentication: none
+  cookie_authentication: none
+  query_parameters: forbidden
+  client_query_overrides:
+    status: 400
+    code: invalid_request
+    parameters:
+      - m
+      - a
+      - burn
+      - q
+      - start
+      - ss
+      - is
+  methods:
+    playlist: GET
+    segment: GET
+    head_status: 405
+  cache_control: "private, no-store"
+  reauthorize_each_request: true
+  touch_idle_expiry_each_request: true
+  playlist:
+    path_suffix: /index.m3u8
+    content_type: application/vnd.apple.mpegurl
+    segment_uri_suffix: .ts
+    segment_uri_query: forbidden
+  segment:
+    path_parameter: segment
+    name_pattern: '^[0-9]+\.ts$'
+    content_type: video/mp2t
+  source_credentials_in_response: forbidden
+  stable_errors:
+    "400":
+      - invalid_request
+    "403":
+      - forbidden
+      - transport_disabled
+    "404":
+      - feature_disabled
+      - invalid_request
+      - media_session_not_found
+      - ticket_not_found
+    "405":
+      - invalid_request
+    "410":
+      - media_session_expired
+      - ticket_expired
+    "415":
+      - unsupported_media
+    "500":
+      - internal_error
+    "502":
+      - source_unavailable
+x-auth-isolation:
+  rule: Device access tokens and browser Web sessions are separate credential domains.
+  deviceAccessToken: bearerAuth
+  browserWebSession: webSessionCookie
+  notes:
+    - The device authorization start, status, token, and refresh endpoints are public.
+    - The lookup and decision endpoints accept webSessionCookie or the existing
+      Web bearer session, but never a native-device bearer token.
+    - Logout, device management, and playback ticket control operations accept only bearerAuth.
+    - The server-proxy media endpoint accepts no bearer or cookie credential. Its only credential is the high-entropy media-session path capability.
+    - Neither credential domain may be substituted for the other.
+x-device-token-lifetimes:
+  access_token_seconds: 900
+  refresh_sliding_seconds: 2592000
+  refresh_family_absolute_seconds: 15552000
+  refresh_expires_in_rule: The returned value is dynamic and never exceeds the remaining sliding-window or family-absolute lifetime.
+x-device-authorization-security:
+  lookup_cache_control: no-store
+  csrf_field: csrf_token
+  csrf_ttl_seconds: 300
+  csrf_rotates_on_pending_lookup: true
+  decision_origin: exact-scheme-and-host
+  csrf_header: X-CSRF-Token
+  fetch_site:
+    header: Sec-Fetch-Site
+    required: false
+    allowed: same-origin
+  csrf_failure:
+    status: 403
+    code: forbidden
+    action: reload_authorization
+  consumed_decision_replay:
+    status: 409
+    code: authorization_consumed
+x-email-verification-gate:
+  condition: required-by-config-and-nonempty-unverified-email
+  empty_email_exempt: true
+  lookup_decision_status: 401
+  lookup_decision_code: unauthenticated
+  token_exchange_status: 403
+  token_exchange_code: forbidden
+  device_bearer_status: 403
+  device_bearer_code: forbidden
+  refresh_status: 401
+  refresh_code: refresh_token_invalid
+  refresh_family_revoked: true
+  new_stable_error_code_required: false
+tags:
+  - name: meta
+    description: Contract and capability discovery.
+  - name: device-auth
+    description: Public device authorization and browser-session approval operations.
+  - name: devices
+    description: Device access token management of native-client installations.
+  - name: playback
+    description: Device-authenticated playback ticket control operations.
+  - name: media
+    description: Capability-addressed media-session data operations.
+paths:
+  /api/v1/meta:
+    get:
+      operationId: getClientMetadata
+      tags:
+        - meta
+      summary: Get native-client contract metadata
+      description: |
+        Returns the exact contract version, server version, minimum supported
+        Windows and Android client versions, and the fixed feature flag set.
+        Feature flags describe current runtime capability and are false by
+        default until a feature is enabled for the deployment or device.
+      security: []
+      responses:
+        "200":
+          description: Contract metadata.
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/meta.schema.json
+        "429":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+  /api/v1/auth/device/authorizations:
+    post:
+      operationId: startDeviceAuthorization
+      tags:
+        - device-auth
+      summary: Start a device authorization
+      description: |
+        Public endpoint. The client submits its display metadata and a PKCE
+        S256 challenge. The device code and user code are generated by the
+        server. The response is returned once and must not be cached.
+
+        Cookies and bearer tokens are not authentication inputs for this
+        operation.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./schemas/device-authorization-start-request.schema.json
+      responses:
+        "201":
+          description: Device authorization created; device_code is returned only once.
+          headers:
+            Cache-Control:
+              description: The response contains a one-time device code.
+              schema:
+                type: string
+                const: "no-store"
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/device-authorization-start.schema.json
+        "400":
+          $ref: "#/components/responses/StableError"
+        "429":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+  /api/v1/auth/device/authorizations/{id}:
+    get:
+      operationId: getDeviceAuthorizationStatus
+      tags:
+        - device-auth
+      summary: Get public device authorization status
+      description: |
+        Public status endpoint addressed by the high-entropy public
+        authorization_id. It returns only state and expiry. It never returns
+        the device code, user code, tokens, user identity, IP address, or other
+        credentials.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: High-entropy public authorization_id.
+          schema:
+            type: string
+            pattern: "^dva_[A-Za-z0-9_-]{22,96}$"
+      responses:
+        "200":
+          description: Current public authorization state.
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/device-authorization-status.schema.json
+        "404":
+          $ref: "#/components/responses/StableError"
+        "429":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+  /api/v1/auth/device/authorizations/lookup:
+    get:
+      operationId: lookupDeviceAuthorization
+      tags:
+        - device-auth
+      summary: Look up a device authorization in the browser
+      description: |
+        Web UI endpoint used by the signed-in approval page. It accepts only
+        a Web session, supplied by either webSessionCookie or webBearerAuth.
+        A native device access token in bearerAuth is never accepted here.
+
+        The response is Cache-Control no-store. While state is pending, every
+        successful lookup returns a new one-time csrf_token and invalidates the
+        previously issued token. Non-pending responses omit csrf_token. The
+        token expires after five minutes, no later than the authorization, and
+        is accepted only by the decision endpoint's X-CSRF-Token header.
+
+        If required email verification is pending for a non-empty address, an
+        otherwise valid Web session is treated as unauthenticated and the
+        endpoint returns HTTP 401 unauthenticated.
+      security:
+        - webSessionCookie: []
+        - webBearerAuth: []
+      parameters:
+        - name: user_code
+          in: query
+          required: true
+          description: Short user code shown on the native client.
+          schema:
+            type: string
+            pattern: "^[0-9A-HJKMNP-TV-Z]{5}-[0-9A-HJKMNP-TV-Z]{5}$"
+      responses:
+        "200":
+          description: Safe authorization metadata for the approval page.
+          headers:
+            Cache-Control:
+              description: Authorization lookup responses must never be cached.
+              schema:
+                type: string
+                const: "no-store"
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/device-authorization-lookup.schema.json
+        "401":
+          $ref: "#/components/responses/StableError"
+        "403":
+          $ref: "#/components/responses/StableError"
+        "404":
+          $ref: "#/components/responses/StableError"
+        "429":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+  /api/v1/auth/device/authorizations/{id}/decision:
+    post:
+      operationId: decideDeviceAuthorization
+      tags:
+        - device-auth
+      summary: Approve or deny a device authorization
+      description: |
+        Web UI endpoint used only by the signed-in approval page. The request
+        uses approve or deny, and the resulting state is authorized or denied.
+        It accepts a Web session supplied by webSessionCookie or webBearerAuth.
+        Device access tokens are explicitly rejected.
+
+        Origin is required and must exactly match the request's effective
+        scheme and Host, with no userinfo, path, query, or fragment.
+        X-CSRF-Token is required and must be the current pending-lookup token.
+        Sec-Fetch-Site may be omitted; when present it must be same-origin.
+
+        Missing, malformed, incorrect, expired, or lookup-rotated CSRF tokens
+        return HTTP 403 with error.code forbidden and
+        error.details.action=reload_authorization. A repeated decision after a
+        successful decision is instead HTTP 409 authorization_consumed because
+        the authorization itself is already terminal.
+
+        If required email verification is pending for a non-empty address, an
+        otherwise valid Web session is treated as unauthenticated and the
+        endpoint returns HTTP 401 unauthenticated.
+      security:
+        - webSessionCookie: []
+        - webBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: High-entropy public authorization_id.
+          schema:
+            type: string
+            pattern: "^dva_[A-Za-z0-9_-]{22,96}$"
+        - name: Origin
+          in: header
+          required: true
+          description: |
+            Exact request origin. Its scheme and host must match the request's
+            effective scheme and Host; userinfo, path, query, and fragment are
+            forbidden.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 2048
+            format: uri
+        - name: X-CSRF-Token
+          in: header
+          required: true
+          description: |
+            Current one-time token returned by a pending lookup. It is consumed
+            by a successful decision and replaced by every new pending lookup.
+          schema:
+            type: string
+            minLength: 32
+            maxLength: 512
+            pattern: "^csrf_[A-Za-z0-9_-]+$"
+        - name: Sec-Fetch-Site
+          in: header
+          required: false
+          description: Optional browser fetch metadata; when supplied it must be same-origin. The field may be omitted by non-browser Web clients.
+          schema:
+            type: string
+            enum:
+              - same-origin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./schemas/device-authorization-decision-request.schema.json
+      responses:
+        "200":
+          description: Terminal browser decision.
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/device-authorization-decision.schema.json
+        "400":
+          $ref: "#/components/responses/StableError"
+        "401":
+          $ref: "#/components/responses/StableError"
+        "403":
+          $ref: "#/components/responses/StableError"
+        "404":
+          $ref: "#/components/responses/StableError"
+        "409":
+          $ref: "#/components/responses/StableError"
+        "429":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+  /api/v1/auth/device/token:
+    post:
+      operationId: pollDeviceToken
+      tags:
+        - device-auth
+      summary: Poll or exchange a device authorization
+      description: |
+        Public endpoint. The native client polls with device_code and
+        code_verifier. A pending authorization returns 202, not an error.
+        A denied, expired, or consumed authorization uses stable error codes.
+        Successful exchange consumes the authorization and returns one rotating
+        access/refresh token pair.
+
+        If email verification is required and the approving account has a
+        non-empty, unverified email address, exchange returns HTTP 403 forbidden
+        and creates neither a device nor a token. An empty email address is
+        exempt from this gate.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./schemas/device-token-request.schema.json
+      responses:
+        "200":
+          description: Device authorization exchanged for a token pair.
+          headers:
+            Cache-Control:
+              description: The response contains bearer credentials.
+              schema:
+                type: string
+                const: "no-store"
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/auth-token-pair.schema.json
+        "202":
+          description: Authorization is still pending; poll after retry_after_seconds.
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/device-token-pending.schema.json
+        "400":
+          $ref: "#/components/responses/StableError"
+        "403":
+          $ref: "#/components/responses/StableError"
+        "409":
+          $ref: "#/components/responses/StableError"
+        "410":
+          $ref: "#/components/responses/StableError"
+        "429":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+  /api/v1/auth/refresh:
+    post:
+      operationId: refreshDeviceTokens
+      tags:
+        - device-auth
+      summary: Rotate a device refresh token
+      description: |
+        Public endpoint. The refresh token is accepted only in the JSON body.
+        A successful refresh atomically rotates both access and refresh tokens.
+        Reusing an old refresh token returns refresh_reuse_detected and revokes
+        the token family.
+
+        Each refresh starts a new 30-day sliding window, but the token family
+        has an absolute 180-day lifetime from its initial issuance. Therefore
+        refresh_expires_in is variable: it is 2592000 or less and approaches
+        zero as the family deadline is reached.
+
+        If email verification is required and the account has a non-empty,
+        unverified email address, refresh returns HTTP 401
+        refresh_token_invalid and revokes the family. The same response is used
+        for other unavailable refresh credentials to avoid account enumeration.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./schemas/refresh-token-request.schema.json
+      responses:
+        "200":
+          description: New token pair after rotation.
+          headers:
+            Cache-Control:
+              description: The response contains bearer credentials.
+              schema:
+                type: string
+                const: "no-store"
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/auth-token-pair.schema.json
+        "401":
+          $ref: "#/components/responses/StableError"
+        "409":
+          $ref: "#/components/responses/StableError"
+        "429":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+  /api/v1/auth/logout:
+    post:
+      operationId: logoutDevice
+      tags:
+        - device-auth
+      summary: Revoke the current device token family
+      description: |
+        Device Bearer endpoint. Revoking the current access token also revokes
+        its refresh token family. The browser webSessionCookie is not accepted
+        as a substitute for bearerAuth. If required email verification is
+        pending for a non-empty address, the request returns HTTP 403 forbidden.
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: The current device token family is revoked.
+        "401":
+          $ref: "#/components/responses/StableError"
+        "403":
+          $ref: "#/components/responses/StableError"
+        "429":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+  /api/v1/devices:
+    get:
+      operationId: listDevices
+      tags:
+        - devices
+      summary: List native-client devices
+      description: |
+        Device Bearer endpoint. Returns only safe device metadata for devices
+        owned by the authenticated user. Responses never include access tokens,
+        refresh tokens, token hashes, raw IP addresses, cookies, or credentials.
+        The browser webSessionCookie is not accepted. If required email
+        verification is pending for a non-empty address, the request returns
+        HTTP 403 forbidden.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Device list.
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/device-list.schema.json
+        "401":
+          $ref: "#/components/responses/StableError"
+        "403":
+          $ref: "#/components/responses/StableError"
+        "429":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+  /api/v1/devices/{id}:
+    delete:
+      operationId: revokeDevice
+      tags:
+        - devices
+      summary: Revoke one native-client device
+      description: |
+        Device Bearer endpoint. Revokes the named device and its token family.
+        Unknown and cross-user device IDs both return device_not_found without
+        disclosing whether the ID exists. Repeating DELETE for an already
+        revoked device is idempotent. The browser webSessionCookie is not
+        accepted. If required email verification is pending for a non-empty
+        address, the request returns HTTP 403 forbidden.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Public device ID.
+          schema:
+            type: string
+            pattern: "^dev_[A-Za-z0-9_-]{8,96}$"
+      responses:
+        "200":
+          description: Device revocation result.
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/device-revocation.schema.json
+        "401":
+          $ref: "#/components/responses/StableError"
+        "403":
+          $ref: "#/components/responses/StableError"
+        "404":
+          $ref: "#/components/responses/StableError"
+        "429":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+  /api/v1/playback/tickets:
+    post:
+      operationId: createPlaybackTicket
+      tags:
+        - playback
+      summary: Create a playback ticket
+      description: |
+        Device Bearer endpoint. Creates a five-minute playback decision ticket
+        for file_id and the authenticated device. device_id is a consistency
+        check only; the access token remains the identity source.
+
+        The server evaluates user/file authorization, source safety, current
+        feature flags, and the client's capability declaration. preferred_transports
+        can reorder only transports that remain eligible. The request cannot
+        supply a source URL, source headers, mode, burn option, or force switch.
+
+        A response that enters state consuming contains a transport description
+        exactly once and must be treated as non-cacheable. A probing result uses
+        HTTP 202; clients then poll GET and use refresh when ready.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./schemas/playback-ticket-create-request.schema.json
+      responses:
+        "201":
+          description: Ticket created and, when applicable, one-time transport description issued.
+          headers:
+            Location:
+              description: Relative location of the safe ticket-status endpoint.
+              schema:
+                type: string
+                pattern: "^/api/v1/playback/tickets/pt_[A-Za-z0-9_-]{8,96}$"
+            Cache-Control:
+              description: The response can contain a one-time media description.
+              schema:
+                type: string
+                const: "no-store"
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/playback-ticket-issuance.schema.json
+        "202":
+          description: Ticket created and probing; poll the Location URL until ready.
+          headers:
+            Location:
+              description: Relative location of the safe ticket-status endpoint.
+              schema:
+                type: string
+                pattern: "^/api/v1/playback/tickets/pt_[A-Za-z0-9_-]{8,96}$"
+            Retry-After:
+              description: Suggested polling delay in seconds.
+              schema:
+                type: integer
+                minimum: 1
+                maximum: 30
+            Cache-Control:
+              schema:
+                type: string
+                const: "no-store"
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/playback-ticket.schema.json
+        "400":
+          $ref: "#/components/responses/StableError"
+        "401":
+          $ref: "#/components/responses/StableError"
+        "403":
+          $ref: "#/components/responses/StableError"
+        "404":
+          $ref: "#/components/responses/StableError"
+        "408":
+          description: The client canceled the playback request before completion.
+          $ref: "#/components/responses/StableError"
+        "409":
+          $ref: "#/components/responses/StableError"
+        "429":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        "504":
+          description: The server could not finish the playback operation before its deadline; details.action is retry.
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+  /api/v1/playback/tickets/{id}:
+    get:
+      operationId: getPlaybackTicketStatus
+      tags:
+        - playback
+      summary: Get safe playback ticket status
+      description: |
+        Device Bearer endpoint. Returns only the ticket state, expiry, media
+        summary, and remaining eligible transports. It never returns a direct
+        source URL, source header, media-session capability, stream description,
+        or other issuance secret. GET does not probe, consume, or refresh.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PlaybackTicketId"
+      responses:
+        "200":
+          description: Safe ticket-status projection.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: "no-store"
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/playback-ticket.schema.json
+        "401":
+          $ref: "#/components/responses/StableError"
+        "403":
+          $ref: "#/components/responses/StableError"
+        "404":
+          $ref: "#/components/responses/StableError"
+        "408":
+          description: The client canceled the playback request before completion.
+          $ref: "#/components/responses/StableError"
+        "410":
+          $ref: "#/components/responses/StableError"
+        "429":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        "504":
+          description: The server could not finish the playback operation before its deadline; details.action is retry.
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+  /api/v1/playback/tickets/{id}/refresh:
+    post:
+      operationId: refreshPlaybackTicket
+      tags:
+        - playback
+      summary: Advance a playback ticket and issue the next transport once
+      description: |
+        Device Bearer endpoint. The server first reads the ticket and applies a
+        pure local state gate. Terminal tickets are rejected before file,
+        Driver, Engine, or source access. Only ready and consuming tickets may
+        advance. A probing ticket returns 409 invalid_request with
+        details.action=status; clients must poll GET and retry refresh only
+        after the state becomes ready. A refresh that loses a concurrent claim
+        returns 409 invalid_request with details.action=retry. unsupported,
+        failed, expired, and exhausted return 410 ticket_expired with
+        details.action=request_new_ticket. revoked returns 403 forbidden with
+        details.action=reauthorize.
+
+        Refresh never probes the source and never reconstructs a transport
+        description. It uses the immutable media summary and candidate plan
+        stored by ticket creation, applies current server feature gates, and
+        performs a conditional claim of the next transport. A successful
+        response releases exactly one transport description. A candidate is
+        recorded as attempted at most once; if the selected candidate cannot be
+        minted, the server may atomically advance through stored fallbacks
+        before producing that one description. Exactly one concurrent request
+        can win a claim; clients must serialize refresh requests (single-flight).
+        GET never rebuilds or reissues a transport.
+
+        The operation accepts no JSON request body: file, device, capabilities,
+        preferred transports, source URL, headers, mode, burn, and force are
+        immutable. A successful consuming response uses Cache-Control no-store.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PlaybackTicketId"
+      responses:
+        "200":
+          description: One-time next transport description while entering consuming.
+          headers:
+            Cache-Control:
+              description: The response can contain a one-time media description.
+              schema:
+                type: string
+                const: "no-store"
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/playback-ticket-issuance.schema.json
+        "401":
+          $ref: "#/components/responses/StableError"
+        "403":
+          description: The ticket is revoked; details.action is reauthorize.
+          $ref: "#/components/responses/StableError"
+        "404":
+          $ref: "#/components/responses/StableError"
+        "408":
+          description: The client canceled the playback request before completion.
+          $ref: "#/components/responses/StableError"
+        "409":
+          description: The ticket is probing (details.action=status) or another refresh won the conditional claim (details.action=retry).
+          $ref: "#/components/responses/StableError"
+        "410":
+          description: Terminal unsupported, failed, expired, or exhausted ticket; details.action is request_new_ticket.
+          $ref: "#/components/responses/StableError"
+        "429":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        "504":
+          description: The server could not finish the playback operation before its deadline; details.action is retry.
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+  /api/v1/playback/media-sessions/{id}/stream:
+    get:
+      operationId: getPlaybackMediaStream
+      tags:
+        - media
+      summary: Read server-proxy media bytes
+      description: |
+        Capability-addressed server-proxy media endpoint. The high-entropy ms_
+        value is supplied only as the path parameter. No device Bearer token,
+        Web Cookie, access token, or query credential is accepted.
+
+        Access logs and telemetry must replace the path capability with a fixed
+        redaction token before recording the request path. Source credentials
+        remain server-side.
+      security: []
+      x-media-session-capability:
+        location: path
+        parameter: id
+        log_redaction: true
+      parameters:
+        - $ref: "#/components/parameters/MediaSessionId"
+        - $ref: "#/components/parameters/Range"
+        - $ref: "#/components/parameters/IfRange"
+      responses:
+        "200":
+          $ref: "#/components/responses/ServerProxyStream"
+        "206":
+          $ref: "#/components/responses/ServerProxyPartialContent"
+        "403":
+          $ref: "#/components/responses/StableError"
+        "404":
+          $ref: "#/components/responses/StableError"
+        "410":
+          $ref: "#/components/responses/StableError"
+        "416":
+          description: Requested byte range is not satisfiable.
+          headers:
+            Content-Range:
+              description: Unsatisfied range in bytes */length form.
+              schema:
+                type: string
+                pattern: "^bytes \\*/[0-9]+$"
+            Cache-Control:
+              schema:
+                type: string
+                const: "no-store"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "429":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+    head:
+      operationId: headPlaybackMediaStream
+      tags:
+        - media
+      summary: Inspect server-proxy media headers
+      description: |
+        Capability-addressed HEAD operation for the same server-proxy resource.
+        It has identical authorization, range, and logging-redaction rules as
+        GET and returns no response body.
+      security: []
+      x-media-session-capability:
+        location: path
+        parameter: id
+        log_redaction: true
+      parameters:
+        - $ref: "#/components/parameters/MediaSessionId"
+        - $ref: "#/components/parameters/Range"
+        - $ref: "#/components/parameters/IfRange"
+      responses:
+        "200":
+          description: Media metadata without a response body.
+          headers:
+            Content-Type:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: integer
+                minimum: 0
+            Accept-Ranges:
+              schema:
+                type: string
+                const: bytes
+            Cache-Control:
+              schema:
+                type: string
+                const: "private, no-store"
+        "206":
+          description: Partial-media metadata without a response body.
+          headers:
+            Content-Type:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: integer
+                minimum: 0
+            Content-Range:
+              schema:
+                type: string
+                pattern: "^bytes [0-9]+-[0-9]+/[0-9]+$"
+            Accept-Ranges:
+              schema:
+                type: string
+                const: bytes
+            Cache-Control:
+              schema:
+                type: string
+                const: "private, no-store"
+        "403":
+          description: Transport disabled or media session revoked; no HEAD body.
+        "404":
+          description: Media session not found; no HEAD body.
+        "410":
+          description: Media session expired; no HEAD body.
+        "416":
+          description: Range not satisfiable; no HEAD body.
+          headers:
+            Content-Range:
+              schema:
+                type: string
+                pattern: "^bytes \\*/[0-9]+$"
+        "429":
+          description: Rate limited; no HEAD body.
+        "500":
+          description: Internal error; no HEAD body.
+        default:
+          description: Unexpected error; no HEAD body.
+  /api/v1/playback/media-sessions/{id}/index.m3u8:
+    get:
+      operationId: getPlaybackHLSPlaylist
+      tags:
+        - media
+      summary: Read the server-HLS media playlist
+      description: |
+        Capability-addressed server-HLS playlist. The high-entropy ms_ value
+        is the only credential and is supplied only as the path parameter.
+        Device Bearer tokens, Web Cookies, and query credentials are not
+        accepted as authentication. Logs, metrics, traces, and diagnostics
+        must replace the path capability with a fixed redaction token.
+
+        Only GET is supported. HEAD returns 405 with Allow: GET and does not
+        return playlist bytes. Any query string, including m, a, burn, q,
+        start, ss, or is, is rejected with 400 invalid_request. The server
+        reauthorizes the media session and applies its idle-expiry touch on
+        every request. All success and error responses use
+        Cache-Control: private, no-store.
+
+        The response is an HLS VOD media playlist. Its segment URIs are under
+        the same capability path, terminate in .ts, and contain no query
+        string. Source URLs, source headers, tokens, and session internals
+        never appear in the playlist.
+      security: []
+      x-media-session-capability:
+        location: path
+        parameter: id
+        log_redaction: true
+      x-query-parameters: forbidden
+      x-http-method-policy:
+        allowed:
+          - GET
+        HEAD: 405
+        HEAD_allow: GET
+      parameters:
+        - $ref: "#/components/parameters/MediaSessionId"
+      responses:
+        "200":
+          $ref: "#/components/responses/ServerHLSPlaylist"
+        "400":
+          $ref: "#/components/responses/StableError"
+        "403":
+          $ref: "#/components/responses/StableError"
+        "404":
+          $ref: "#/components/responses/StableError"
+        "410":
+          $ref: "#/components/responses/StableError"
+        "415":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        "502":
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+  /api/v1/playback/media-sessions/{id}/{segment}:
+    get:
+      operationId: getPlaybackHLSSegment
+      tags:
+        - media
+      summary: Read one server-HLS MPEG-TS segment
+      description: |
+        Capability-addressed server-HLS segment. The high-entropy ms_ path
+        capability is the only credential. Device Bearer tokens, Web Cookies,
+        and query credentials are not accepted as authentication. The segment
+        name must be a non-negative decimal integer followed by .ts, matching
+        a segment URI emitted by the playlist endpoint.
+
+        Only GET is supported. HEAD returns 405 with Allow: GET and does not
+        return segment bytes. Any query string is rejected with 400
+        invalid_request; clients cannot override mode, audio, burn, quality,
+        start, seek, or subtitle selection. The server reauthorizes the same
+        media session and applies its idle-expiry touch on every request. All
+        success and error responses use Cache-Control: private, no-store.
+
+        Segment bytes are MPEG-TS. Source URLs, source headers, tokens, and
+        session internals never appear in the response.
+      security: []
+      x-media-session-capability:
+        location: path
+        parameter: id
+        log_redaction: true
+      x-query-parameters: forbidden
+      x-http-method-policy:
+        allowed:
+          - GET
+        HEAD: 405
+        HEAD_allow: GET
+      parameters:
+        - $ref: "#/components/parameters/MediaSessionId"
+        - $ref: "#/components/parameters/HLSSegment"
+      responses:
+        "200":
+          $ref: "#/components/responses/ServerHLSSegment"
+        "400":
+          $ref: "#/components/responses/StableError"
+        "403":
+          $ref: "#/components/responses/StableError"
+        "404":
+          $ref: "#/components/responses/StableError"
+        "410":
+          $ref: "#/components/responses/StableError"
+        "415":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        "502":
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+  /api/v1/playback/subtitle-sessions/{id}/subtitle.vtt:
+    get:
+      operationId: getPlaybackSubtitle
+      tags:
+        - media
+      summary: Read one authorized text subtitle as WebVTT
+      description: |
+        Capability-addressed subtitle endpoint. The ss_ value is an
+        independent short-lived session bound to the ticket, user, device,
+        file, purpose, transport, subtitle id, and start_seconds snapshot.
+        The route accepts only GET and HEAD, no Bearer/Cookie credential, and
+        no query string. Every request rechecks account, device, ticket
+        revocation, and both idle and absolute expiry.
+
+        Text formats are converted to WebVTT. The response may only be issued
+        for a subtitle id already snapshotted in the ticket grant. PGS is
+        descriptive and never receives a URL. Source paths, URLs, headers, and
+        backend errors never appear in the response or logs.
+      security: []
+      x-playback-subtitle-capability:
+        location: path
+        parameter: id
+        log_redaction: true
+      x-query-parameters: forbidden
+      parameters:
+        - $ref: "#/components/parameters/SubtitleSessionId"
+      responses:
+        "200":
+          description: WebVTT subtitle bytes, or headers only for HEAD.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: "private, no-store"
+            X-Content-Type-Options:
+              schema:
+                type: string
+                const: nosniff
+          content:
+            text/vtt:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/StableError"
+        "403":
+          $ref: "#/components/responses/StableError"
+        "404":
+          $ref: "#/components/responses/StableError"
+        "410":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        "502":
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+    head:
+      operationId: headPlaybackSubtitle
+      tags:
+        - media
+      summary: Inspect one authorized text subtitle
+      description: |
+        HEAD has the same binding, expiry, query-rejection, and logging
+        redaction rules as GET and returns no subtitle bytes.
+      security: []
+      x-playback-subtitle-capability:
+        location: path
+        parameter: id
+        log_redaction: true
+      x-query-parameters: forbidden
+      parameters:
+        - $ref: "#/components/parameters/SubtitleSessionId"
+      responses:
+        "200":
+          description: WebVTT metadata without a response body.
+        "400":
+          description: Query parameters were supplied; no HEAD body.
+        "403":
+          description: Session or transport is revoked; no HEAD body.
+        "404":
+          description: Capability was not found; no HEAD body.
+        "410":
+          description: Session expired; no HEAD body.
+        "500":
+          description: Internal error; no HEAD body.
+        "502":
+          description: Subtitle source unavailable; no HEAD body.
+        default:
+          description: Unexpected error; no HEAD body.
+  /api/v1/playback/media-sessions/{id}/subtitle-sessions/{subtitle}:
+    get:
+      operationId: getPlaybackHLSSubtitle
+      tags:
+        - media
+      summary: Read a server-HLS authorized subtitle rendition
+      description: |
+        Server-HLS subtitle rendition. This path requires both the same ms_
+        media-session capability that issued the server-HLS transport and its
+        independent ss_ subtitle capability. Either session being revoked or
+        expired fails closed. Only GET and HEAD are accepted and query strings
+        are forbidden, so start, track, burn, mode, and quality cannot be
+        overridden.
+
+        The media and subtitle sessions must agree on ticket, user, device,
+        and file. PGS is omitted from the S3 server-HLS issuance list.
+      security: []
+      x-media-session-capability:
+        location: path
+        parameter: id
+        log_redaction: true
+      x-playback-subtitle-capability:
+        location: path
+        parameter: subtitle
+        log_redaction: true
+      x-query-parameters: forbidden
+      parameters:
+        - $ref: "#/components/parameters/MediaSessionId"
+        - $ref: "#/components/parameters/HLSSubtitleSessionFile"
+      responses:
+        "200":
+          description: WebVTT subtitle bytes, or headers only for HEAD.
+          content:
+            text/vtt:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/StableError"
+        "403":
+          $ref: "#/components/responses/StableError"
+        "404":
+          $ref: "#/components/responses/StableError"
+        "410":
+          $ref: "#/components/responses/StableError"
+        "500":
+          $ref: "#/components/responses/StableError"
+        "502":
+          $ref: "#/components/responses/StableError"
+        default:
+          $ref: "#/components/responses/StableError"
+    head:
+      operationId: headPlaybackHLSSubtitle
+      tags:
+        - media
+      summary: Inspect a server-HLS authorized subtitle rendition
+      description: |
+        HEAD requires the same two capabilities and returns no response body.
+      security: []
+      x-media-session-capability:
+        location: path
+        parameter: id
+        log_redaction: true
+      x-playback-subtitle-capability:
+        location: path
+        parameter: subtitle
+        log_redaction: true
+      x-query-parameters: forbidden
+      parameters:
+        - $ref: "#/components/parameters/MediaSessionId"
+        - $ref: "#/components/parameters/HLSSubtitleSessionFile"
+      responses:
+        "200":
+          description: WebVTT metadata without a response body.
+        "400":
+          description: Query parameters were supplied; no HEAD body.
+        "403":
+          description: Session or transport is revoked; no HEAD body.
+        "404":
+          description: Capability was not found; no HEAD body.
+        "410":
+          description: Session expired; no HEAD body.
+        "500":
+          description: Internal error; no HEAD body.
+        "502":
+          description: Subtitle source unavailable; no HEAD body.
+        default:
+          description: Unexpected error; no HEAD body.
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: DoriyaDeviceAccessToken
+      description: |
+        Native-client device access token obtained from
+        POST /api/v1/auth/device/token or POST /api/v1/auth/refresh. It is
+        accepted by logout, device-management, and playback ticket control
+        operations. It is never accepted by Web-session lookup/decision or by
+        capability-addressed media-session data endpoints.
+    webSessionCookie:
+      type: apiKey
+      in: cookie
+      name: doriyamedia_token
+      description: |
+        Existing browser Web session cookie. It is accepted only by the device
+        authorization lookup and decision operations. It is never returned to
+        native clients and never accepted as a substitute for bearerAuth.
+    webBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: DoriyaWebSessionToken
+      description: |
+        Existing browser/Web API bearer session token. It is accepted only by
+        the device authorization lookup and decision operations. Native device
+        access tokens (bearerAuth) cannot substitute for this Web credential.
+  schemas:
+    MetaResponse:
+      $ref: ./schemas/meta.schema.json
+    ErrorEnvelope:
+      $ref: ./schemas/error.schema.json
+    DevicePlatform:
+      $ref: ./schemas/device-platform.schema.json
+    DeviceAuthorizationState:
+      $ref: ./schemas/device-authorization-state.schema.json
+    DeviceAuthorizationStartRequest:
+      $ref: ./schemas/device-authorization-start-request.schema.json
+    DeviceAuthorizationStart:
+      $ref: ./schemas/device-authorization-start.schema.json
+    DeviceAuthorizationStatus:
+      $ref: ./schemas/device-authorization-status.schema.json
+    DeviceAuthorizationLookup:
+      $ref: ./schemas/device-authorization-lookup.schema.json
+    DeviceAuthorizationDecisionRequest:
+      $ref: ./schemas/device-authorization-decision-request.schema.json
+    DeviceAuthorizationDecision:
+      $ref: ./schemas/device-authorization-decision.schema.json
+    DeviceTokenRequest:
+      $ref: ./schemas/device-token-request.schema.json
+    DeviceTokenPending:
+      $ref: ./schemas/device-token-pending.schema.json
+    DeviceTokenPair:
+      $ref: ./schemas/auth-token-pair.schema.json
+    RefreshTokenRequest:
+      $ref: ./schemas/refresh-token-request.schema.json
+    NativeDevice:
+      $ref: ./schemas/device.schema.json
+    DeviceList:
+      $ref: ./schemas/device-list.schema.json
+    DeviceRevocation:
+      $ref: ./schemas/device-revocation.schema.json
+    AuthenticatedUser:
+      $ref: ./schemas/auth-user.schema.json
+    PlaybackTicketState:
+      $ref: ./schemas/playback-ticket-state.schema.json
+    PlaybackTransportKind:
+      $ref: ./schemas/playback-transport-kind.schema.json
+    PlaybackClientCapabilities:
+      $ref: ./schemas/playback-client-capabilities.schema.json
+    PlaybackTicketCreateRequest:
+      $ref: ./schemas/playback-ticket-create-request.schema.json
+    PlaybackTicket:
+      $ref: ./schemas/playback-ticket.schema.json
+    PlaybackTicketIssuance:
+      $ref: ./schemas/playback-ticket-issuance.schema.json
+    PlaybackTransport:
+      $ref: ./schemas/transport.schema.json
+    PlaybackMediaSummary:
+      $ref: ./schemas/media.schema.json
+    PlaybackStream:
+      $ref: ./schemas/stream.schema.json
+    PlaybackStreamHeaders:
+      $ref: ./schemas/stream-headers.schema.json
+    MediaSession:
+      $ref: ./schemas/media-session.schema.json
+    PlaybackSubtitle:
+      $ref: ./schemas/subtitle.schema.json
+  parameters:
+    PlaybackTicketId:
+      name: id
+      in: path
+      required: true
+      description: Public high-entropy playback ticket identifier.
+      schema:
+        type: string
+        pattern: "^pt_[A-Za-z0-9_-]{8,96}$"
+    MediaSessionId:
+      name: id
+      in: path
+      required: true
+      description: |
+        High-entropy media-session capability. This value is a bearer capability
+        in the path and must be redacted from access logs and telemetry.
+      schema:
+        type: string
+        pattern: "^ms_[A-Za-z0-9_-]{22,96}$"
+    SubtitleSessionId:
+      name: id
+      in: path
+      required: true
+      description: |
+        Independent high-entropy ss_ subtitle-session capability. This value
+        is a bearer capability in the path and must be redacted from access
+        logs and telemetry.
+      schema:
+        type: string
+        pattern: "^ss_[A-Za-z0-9_-]{22,96}$"
+    HLSSubtitleSessionFile:
+      name: subtitle
+      in: path
+      required: true
+      description: |
+        WebVTT file name containing the independent ss_ subtitle capability.
+        It is always used together with the issuing ms_ media capability.
+      schema:
+        type: string
+        pattern: "^ss_[A-Za-z0-9_-]{22,96}\\.vtt$"
+    HLSSegment:
+      name: segment
+      in: path
+      required: true
+      description: |
+        Segment name emitted by the server-HLS playlist. Leading zeroes are
+        accepted by the server, but clients must use playlist URIs verbatim.
+      schema:
+        type: string
+        pattern: '^[0-9]+\.ts$'
+    Range:
+      name: Range
+      in: header
+      required: false
+      description: A single forward byte range. Multipart, suffix, and multi-range requests are not part of S3.
+      schema:
+        type: string
+        pattern: "^bytes=[0-9]+-[0-9]*$"
+    IfRange:
+      name: If-Range
+      in: header
+      required: false
+      description: Validator for a conditional single-range request.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 256
+        pattern: "^[^\\r\\n\\x00]+$"
+  responses:
+    StableError:
+      description: Stable error envelope. Clients branch on error.code, never on error.message.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    ServerProxyStream:
+      description: Full server-proxy media response. Source credentials never appear in the response.
+      headers:
+        Content-Type:
+          schema:
+            type: string
+        Content-Length:
+          schema:
+            type: integer
+            minimum: 0
+        Accept-Ranges:
+          schema:
+            type: string
+            const: bytes
+        Cache-Control:
+          schema:
+            type: string
+            const: "private, no-store"
+      content:
+        application/octet-stream:
+          schema:
+            type: string
+            format: binary
+        video/mp4:
+          schema:
+            type: string
+            format: binary
+        video/x-matroska:
+          schema:
+            type: string
+            format: binary
+        audio/mp4:
+          schema:
+            type: string
+            format: binary
+    ServerProxyPartialContent:
+      description: Single-range server-proxy media response.
+      headers:
+        Content-Type:
+          schema:
+            type: string
+        Content-Length:
+          schema:
+            type: integer
+            minimum: 0
+        Content-Range:
+          schema:
+            type: string
+            pattern: "^bytes [0-9]+-[0-9]+/[0-9]+$"
+        Accept-Ranges:
+          schema:
+            type: string
+            const: bytes
+        Cache-Control:
+          schema:
+            type: string
+            const: "private, no-store"
+      content:
+        application/octet-stream:
+          schema:
+            type: string
+            format: binary
+        video/mp4:
+          schema:
+            type: string
+            format: binary
+        video/x-matroska:
+          schema:
+            type: string
+            format: binary
+        audio/mp4:
+          schema:
+            type: string
+            format: binary
+    ServerHLSPlaylist:
+      description: |
+        Server-HLS VOD media playlist. Segment URIs are capability-addressed
+        paths under the same media session, end in .ts, and contain no query.
+      headers:
+        Content-Type:
+          schema:
+            type: string
+            const: application/vnd.apple.mpegurl
+        Content-Length:
+          schema:
+            type: integer
+            minimum: 0
+        Cache-Control:
+          schema:
+            type: string
+            const: "private, no-store"
+        X-Content-Type-Options:
+          schema:
+            type: string
+            const: nosniff
+      content:
+        application/vnd.apple.mpegurl:
+          schema:
+            type: string
+            minLength: 1
+            description: UTF-8 HLS media playlist text.
+          example: |
+            #EXTM3U
+            #EXT-X-VERSION:3
+            #EXT-X-TARGETDURATION:4
+            #EXT-X-MEDIA-SEQUENCE:0
+            #EXT-X-PLAYLIST-TYPE:VOD
+            #EXT-X-INDEPENDENT-SEGMENTS
+            #EXTINF:4.000,
+            /api/v1/playback/media-sessions/ms_example_hls_not_a_real_capability/0.ts
+            #EXTINF:4.000,
+            /api/v1/playback/media-sessions/ms_example_hls_not_a_real_capability/1.ts
+            #EXT-X-ENDLIST
+    ServerHLSSegment:
+      description: One MPEG-TS segment bound to the same server-HLS media session.
+      headers:
+        Content-Type:
+          schema:
+            type: string
+            const: video/mp2t
+        Cache-Control:
+          schema:
+            type: string
+            const: "private, no-store"
+        X-Content-Type-Options:
+          schema:
+            type: string
+            const: nosniff
+      content:
+        video/mp2t:
+          schema:
+            type: string
+            format: binary

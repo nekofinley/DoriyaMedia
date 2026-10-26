@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeviceAuthorizationStatus",
+  "description": "Public status body for one device authorization identified by its high-entropy authorization_id. It deliberately contains no device code, tokens, user identity, IP address, or credential.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "state",
+    "expires_at"
+  ],
+  "properties": {
+    "state": {
+      "$ref": "device-authorization-state.schema.json"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

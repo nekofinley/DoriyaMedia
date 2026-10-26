@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaybackSubtitle",
+  "description": "A subtitle track exposed by a one-time playback issuance. The stable id is bound to the ticket's immutable subtitle grant. Text is delivered as WebVTT through an ss_ capability; bitmap PGS is descriptive only in S3 and has no URL.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "language",
+    "label",
+    "format",
+    "default",
+    "forced"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^sub_[0-9]+$"
+    },
+    "language": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 32,
+      "pattern": "^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$"
+    },
+    "label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "format": {
+      "type": "string",
+      "enum": [
+        "vtt",
+        "srt",
+        "ass",
+        "pgs"
+      ]
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "minLength": 8,
+      "maxLength": 4096,
+      "pattern": "^https://[^\\s?#]+/api/v1/playback/(?:subtitle-sessions/ss_[A-Za-z0-9_-]{22,96}/subtitle\\.vtt|media-sessions/ms_[A-Za-z0-9_-]{22,96}/subtitle-sessions/ss_[A-Za-z0-9_-]{22,96}\\.vtt)$"
+    },
+    "default": {
+      "type": "boolean"
+    },
+    "forced": {
+      "type": "boolean"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "format": {
+            "const": "pgs"
+          }
+        },
+        "required": [
+          "format"
+        ]
+      },
+      "then": {
+        "properties": {
+          "url": false
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "url"
+        ]
+      },
+      "then": {
+        "properties": {
+          "format": {
+            "const": "vtt"
+          }
+        }
+      }
+    }
+  ]
+}

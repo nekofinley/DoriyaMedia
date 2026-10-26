@@ -35,7 +35,8 @@ func RetryWithFreshLink(ctx context.Context, e *Engine, file *models.MediaFile, 
 	if rerr != nil {
 		return err
 	}
-	log.Printf("hls session for file %d failed, retrying with a fresh source link: %v", file.ID, err)
+	log.Printf("hls session for file %d failed (%s), retrying with a fresh source link",
+		file.ID, safeMediaLogError(err))
 	if err2 := attempt(fresh); err2 != nil {
 		return err2
 	}

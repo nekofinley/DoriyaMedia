@@ -1,0 +1,60 @@
+{
+  "ticket_id": "pt_example_server_hls",
+  "state": "consuming",
+  "contract_version": 1,
+  "expires_at": "2026-10-26T12:05:00Z",
+  "transport": {
+    "kind": "server-hls",
+    "media_session": {
+      "idle_expires_at": "2026-10-26T12:20:00Z",
+      "absolute_expires_at": "2026-10-26T18:05:00Z"
+    },
+    "streams": [
+      {
+        "role": "muxed",
+        "url": "https://media.example/api/v1/playback/media-sessions/ms_example_hls_not_a_real_capability/index.m3u8",
+        "mime": "application/vnd.apple.mpegurl",
+        "headers": {},
+        "range": false
+      }
+    ],
+    "subtitles": [
+      {
+        "id": "sub_41",
+        "language": "zh-Hans",
+        "label": "简体中文",
+        "format": "vtt",
+        "url": "https://media.example/api/v1/playback/media-sessions/ms_example_hls_not_a_real_capability/subtitle-sessions/ss_example_hls_subtitle_credential.vtt",
+        "default": true,
+        "forced": false
+      },
+      {
+        "id": "sub_42",
+        "language": "en",
+        "label": "English",
+        "format": "vtt",
+        "url": "https://media.example/api/v1/playback/media-sessions/ms_example_hls_not_a_real_capability/subtitle-sessions/ss_example_hls_subtitle_english.vtt",
+        "default": false,
+        "forced": false
+      }
+    ]
+  },
+  "media": {
+    "container": "mkv",
+    "duration": 1440.0,
+    "video": {
+      "codec": "h264",
+      "width": 1920,
+      "height": 1080,
+      "bit_depth": 8
+    },
+    "audio": [
+      {
+        "codec": "eac3",
+        "channels": 6,
+        "language": "jpn"
+      }
+    ]
+  },
+  "remaining_transports": []
+}

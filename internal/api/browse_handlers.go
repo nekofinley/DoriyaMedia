@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"doriyamedia/internal/media"
 	"doriyamedia/internal/models"
 	"doriyamedia/internal/scan"
 	"doriyamedia/internal/source"
@@ -88,8 +89,8 @@ func (s *Server) handleBrowsePlay(w http.ResponseWriter, r *http.Request, user *
 	}
 	file, err := s.ensureBrowseFile(r.Context(), id, p)
 	if err != nil {
-		log.Printf("browse play ensure failed: %v", err)
-		fail(w, 500, err.Error())
+		log.Printf("browse play ensure failed: %s", media.SafeMediaLogError(err))
+		fail(w, 500, "媒体准备失败")
 		return
 	}
 	s.playFile(w, r, file)

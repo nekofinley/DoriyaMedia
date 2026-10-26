@@ -137,11 +137,11 @@ type BGMTV struct {
 }
 
 type Playback struct {
-	ForceMode       string  `json:"force_mode"` // auto | direct | proxy | remux
-	SegmentSeconds  float64 `json:"segment_seconds"`
+	ForceMode      string  `json:"force_mode"` // auto | direct | proxy | remux
+	SegmentSeconds float64 `json:"segment_seconds"`
 	// TranscodeHeight now only bounds a burned-in subtitle's output: the one
 	// remaining path that re-encodes video. Ordinary playback never re-encodes.
-	TranscodeHeight int     `json:"transcode_height"`
+	TranscodeHeight int `json:"transcode_height"`
 
 	// ProbeSizeMB / ProbeAnalyzeSec bound how much of the source ffprobe pulls
 	// before playback can be decided. The historical fixed 50MB/20s values cost
@@ -179,23 +179,38 @@ type Playback struct {
 	// budget, and nothing partial survives a restart. 0 turns the cache off, and
 	// then a session's output is deleted as soon as it ends.
 	HLSCacheMB int `json:"hls_cache_mb"`
+}
 
+// ClientFeatures gates the native-client API. Every flag defaults to false so
+// an existing config file starts with no new client surface enabled.
+type ClientFeatures struct {
+	V1Enabled             bool `json:"v1_enabled"`
+	DeviceAuthEnabled     bool `json:"device_auth_enabled"`
+	PlaybackTicketEnabled bool `json:"playback_ticket_enabled"`
+	DirectHTTPEnabled     bool `json:"direct_http_enabled"`
+	ServerProxyV1Enabled  bool `json:"server_proxy_v1_enabled"`
+	ServerHLSV1Enabled    bool `json:"server_hls_v1_enabled"`
+	DirectDASHEnabled     bool `json:"direct_dash_enabled"`
+	LocalRelayEnabled     bool `json:"local_relay_enabled"`
+	NativePlayerEnabled   bool `json:"native_player_enabled"`
+	LibMPVFallbackEnabled bool `json:"libmpv_fallback_enabled"`
 }
 
 type Config struct {
-	Port            int       `json:"port"`
-	DataDir         string    `json:"data_dir"`
-	Secret          string    `json:"secret"`
-	FFmpeg          string    `json:"ffmpeg"`
-	FFProbe         string    `json:"ffprobe"`
-	TMDB            TMDB      `json:"tmdb"`
-	BGM             BGMTV     `json:"bgm"`
-	Playback        Playback  `json:"playback"`
-	Users           Users     `json:"users"`
-	SMTP            SMTP      `json:"smtp"`
-	Turnstile       Turnstile `json:"turnstile"`
-	ScanConcurrency int       `json:"scan_concurrency"`
-	DevWebDir       string    `json:"dev_web_dir"`
+	Port            int            `json:"port"`
+	DataDir         string         `json:"data_dir"`
+	Secret          string         `json:"secret"`
+	FFmpeg          string         `json:"ffmpeg"`
+	FFProbe         string         `json:"ffprobe"`
+	TMDB            TMDB           `json:"tmdb"`
+	BGM             BGMTV          `json:"bgm"`
+	Playback        Playback       `json:"playback"`
+	Users           Users          `json:"users"`
+	SMTP            SMTP           `json:"smtp"`
+	Turnstile       Turnstile      `json:"turnstile"`
+	ScanConcurrency int            `json:"scan_concurrency"`
+	DevWebDir       string         `json:"dev_web_dir"`
+	Client          ClientFeatures `json:"client"`
 }
 
 // RegistrationAllowed reports whether visitors may create their own account,

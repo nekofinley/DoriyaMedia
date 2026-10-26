@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MediaSession",
+  "description": "Server media session expiry metadata. The high-entropy capability itself exists only as the {id} path parameter of media-session URLs and must be redacted from logs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "idle_expires_at",
+    "absolute_expires_at"
+  ],
+  "properties": {
+    "idle_expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "absolute_expires_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

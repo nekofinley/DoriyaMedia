@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeviceAuthorizationStartResponse",
+  "description": "Response returned once when a device authorization starts. device_code is a secret and must never be logged, persisted in plaintext by the server, or shown to the user.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "authorization_id",
+    "device_code",
+    "user_code",
+    "verification_uri",
+    "verification_uri_complete",
+    "expires_in",
+    "interval"
+  ],
+  "properties": {
+    "authorization_id": {
+      "type": "string",
+      "pattern": "^dva_[A-Za-z0-9_-]{22,96}$",
+      "description": "High-entropy public identifier used for status polling. It is not a credential."
+    },
+    "device_code": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9._~-]+$",
+      "description": "One-time secret returned only by this response."
+    },
+    "user_code": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{5}-[0-9A-HJKMNP-TV-Z]{5}$",
+      "description": "Short human-entered code with ambiguous characters removed."
+    },
+    "verification_uri": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https?://[^\\s?#]+$",
+      "description": "Stable browser authorization entry point without credentials or query parameters. Production deployments must use https; http is reserved for loopback development."
+    },
+    "verification_uri_complete": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https?://[^\\s?#]+/device\\?code=[0-9A-HJKMNP-TV-Z]{5}-[0-9A-HJKMNP-TV-Z]{5}$",
+      "description": "Browser entry point with the user code in the code query parameter. It must not contain credentials, fragments, or additional query parameters."
+    },
+    "expires_in": {
+      "const": 600
+    },
+    "interval": {
+      "const": 5
+    }
+  }
+}

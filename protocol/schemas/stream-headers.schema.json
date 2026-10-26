@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StreamRequestHeaders",
+  "description": "Exact header whitelist for direct client playback. Unlisted headers, including Authorization, Cookie, and proxy credentials, are forbidden.",
+  "type": "object",
+  "propertyNames": {
+    "enum": [
+      "Referer",
+      "Origin",
+      "User-Agent",
+      "Accept",
+      "Accept-Language"
+    ]
+  },
+  "additionalProperties": false,
+  "maxProperties": 5,
+  "properties": {
+    "Referer": {
+      "type": "string",
+      "format": "uri",
+      "minLength": 8,
+      "maxLength": 2048,
+      "pattern": "^[^\\r\\n\\x00]+$"
+    },
+    "Origin": {
+      "type": "string",
+      "format": "uri",
+      "minLength": 8,
+      "maxLength": 512,
+      "pattern": "^https?://[^\\s/?#]+$"
+    },
+    "User-Agent": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[^\\r\\n\\x00]+$"
+    },
+    "Accept": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[^\\r\\n\\x00]+$"
+    },
+    "Accept-Language": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\r\\n\\x00]+$"
+    }
+  }
+}

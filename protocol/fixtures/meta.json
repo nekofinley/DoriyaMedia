@@ -1,0 +1,20 @@
+{
+  "contract_version": 1,
+  "server_version": "dev",
+  "minimum_client_versions": {
+    "windows": "0.1.0",
+    "android": "0.1.0"
+  },
+  "features": {
+    "client_v1_enabled": false,
+    "device_auth_enabled": false,
+    "playback_ticket_enabled": false,
+    "direct_http_enabled": false,
+    "server_proxy_v1_enabled": false,
+    "server_hls_v1_enabled": false,
+    "direct_dash_enabled": false,
+    "local_relay_enabled": false,
+    "native_player_enabled": false,
+    "libmpv_fallback_enabled": false
+  }
+}

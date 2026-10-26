@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "The playback ticket is still being prepared; poll its status before retrying refresh.",
+    "details": {
+      "action": "status",
+      "state": "probing"
+    }
+  }
+}

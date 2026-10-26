@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NativeDevice",
+  "description": "Safe public metadata for one native-client installation. Token values, token hashes, IP addresses, and credentials are never part of this object.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "name",
+    "platform",
+    "client_version",
+    "created_at",
+    "last_seen_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^dev_[A-Za-z0-9_-]{8,96}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[^\\r\\n\\t]+$"
+    },
+    "platform": {
+      "$ref": "device-platform.schema.json"
+    },
+    "client_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]*$"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "last_seen_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "revoked_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "authorization_id": "dva_example_pending_00000001",
+  "device_name": "Example Windows Desktop",
+  "platform": "windows",
+  "client_version": "0.1.0",
+  "state": "pending",
+  "expires_at": "2026-10-26T10:10:00Z",
+  "csrf_token": "csrf_example_not_a_real_pending_0001"
+}

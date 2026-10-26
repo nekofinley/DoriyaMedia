@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "media_session_not_found",
+    "message": "The media session was not found.",
+    "details": {
+      "action": "request_new_ticket"
+    }
+  }
+}

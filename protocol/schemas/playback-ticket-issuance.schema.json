@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaybackTicketIssuance",
+  "description": "One-time create or successful refresh response. Create may legally return a terminal unsupported or failed issuance; terminal refresh failures use the stable error envelope instead. Only state consuming may carry a transport description. A transport description is delivered once and must not be reconstructed by GET.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ticket_id",
+    "state",
+    "contract_version",
+    "expires_at",
+    "remaining_transports"
+  ],
+  "properties": {
+    "ticket_id": {
+      "type": "string",
+      "pattern": "^pt_[A-Za-z0-9_-]{8,96}$"
+    },
+    "state": {
+      "$ref": "playback-ticket-state.schema.json"
+    },
+    "contract_version": {
+      "const": 1
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "transport": {
+      "$ref": "transport.schema.json"
+    },
+    "media": {
+      "$ref": "media.schema.json"
+    },
+    "remaining_transports": {
+      "type": "array",
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "playback-transport-kind.schema.json"
+      }
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "failure_code": {
+      "type": "string",
+      "enum": [
+        "source_unavailable",
+        "unsupported_media"
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "probing"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "media": false,
+          "remaining_transports": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "unsupported"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "required": [
+          "failure_code"
+        ],
+        "properties": {
+          "failure_code": {
+            "const": "unsupported_media"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "failed"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "required": [
+          "failure_code"
+        ],
+        "properties": {
+          "failure_code": {
+            "const": "source_unavailable"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "ready"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "required": [
+          "media"
+        ],
+        "properties": {
+          "media": true,
+          "remaining_transports": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "consuming"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "required": [
+          "transport",
+          "media"
+        ],
+        "properties": {
+          "media": true,
+          "transport": true
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "not": {
+              "const": "consuming"
+            }
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "transport": false
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "unsupported",
+              "failed",
+              "expired",
+              "revoked",
+              "exhausted"
+            ]
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": true,
+          "remaining_transports": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "exhausted"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "required": [
+          "media"
+        ],
+        "properties": {
+          "media": true
+        }
+      }
+    }
+  ]
+}

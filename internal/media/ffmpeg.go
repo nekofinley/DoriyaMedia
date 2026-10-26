@@ -13,12 +13,24 @@ import (
 // FFMpeg wraps the ffmpeg binary.
 type FFMpeg struct {
 	Path string
+	// egress is the process-wide set of administrator-trusted LAN origins.
+	// Every remote input still gets its own ephemeral controlled proxy.
+	egress *egressTrust
 }
 
 func (f *FFMpeg) RunStream(ctx context.Context, args []string, out io.Writer) error {
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
+	args, controller, err := secureFFmpegArgs(
+		args, egressTrustFromContext(cctx, f.egress))
+	if err != nil {
+		return err
+	}
+	if controller != nil {
+		defer controller.Close()
+	}
 	cmd := exec.CommandContext(cctx, f.Path, args...)
+	cmd.Env = secureMediaEnv(controller.DefaultProxyURL())
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err

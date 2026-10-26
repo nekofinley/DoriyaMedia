@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "authorization_denied",
+    "message": "The device authorization was denied.",
+    "details": {
+      "action": "start_new_authorization"
+    }
+  }
+}

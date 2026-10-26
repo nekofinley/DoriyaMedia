@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "ticket_not_found",
+    "message": "The playback ticket was not found.",
+    "details": {
+      "action": "request_new_ticket"
+    }
+  }
+}

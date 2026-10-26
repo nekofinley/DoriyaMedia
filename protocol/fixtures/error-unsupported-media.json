@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": "unsupported_media",
+    "message": "This client cannot play the selected media.",
+    "details": {
+      "container": "mkv",
+      "video_codec": "av1",
+      "reason": "codec_not_supported"
+    }
+  }
+}

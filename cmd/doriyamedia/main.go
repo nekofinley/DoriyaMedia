@@ -87,6 +87,7 @@ func main() {
 	}
 	srv.Site = siteStore
 	srv.BangumiSync.Start()
+	api.StartMaintenance(store)
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
 	if os.Getenv("DORIYAMEDIA_LOCAL") == "1" {

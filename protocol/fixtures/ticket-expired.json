@@ -1,0 +1,8 @@
+{
+  "ticket_id": "pt_example_expired",
+  "state": "expired",
+  "contract_version": 1,
+  "expires_at": "2026-10-26T11:55:00Z",
+  "remaining_transports": [],
+  "message": "This playback ticket has expired."
+}

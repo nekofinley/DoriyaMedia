@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeviceTokenPending",
+  "description": "HTTP 202 polling response while a device authorization is still pending. Pending is not an error and clients poll no faster than retry_after_seconds.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "state",
+    "retry_after_seconds",
+    "expires_at"
+  ],
+  "properties": {
+    "state": {
+      "const": "pending"
+    },
+    "retry_after_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 30
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

@@ -23,6 +23,9 @@ type Store struct {
 
 var (
 	ErrBangumiJobLeaseLost = errors.New("bangumi sync job lease lost")
+	// ErrAuthStateChanged means a credential was verified against an account
+	// snapshot that changed before its dependent session could be committed.
+	ErrAuthStateChanged = errors.New("authentication state changed")
 )
 
 // legacyDBName is the database file used before the DoriyaMedia rename.
@@ -89,6 +92,7 @@ func (s *Store) migrate() error {
 			name TEXT UNIQUE NOT NULL,
 			pass_hash TEXT NOT NULL,
 			salt TEXT NOT NULL,
+			auth_epoch INTEGER NOT NULL DEFAULT 1,
 			role TEXT NOT NULL DEFAULT 'user',
 			status TEXT NOT NULL DEFAULT 'active',
 			email TEXT NOT NULL DEFAULT '',
@@ -99,6 +103,7 @@ func (s *Store) migrate() error {
 		`CREATE TABLE IF NOT EXISTS sessions (
 			token TEXT PRIMARY KEY,
 			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			auth_epoch INTEGER NOT NULL DEFAULT 0,
 			expires_at TIMESTAMP NOT NULL
 		)`,
 		// One-shot tokens mailed to a user: kind 'verify' proves an address,
@@ -109,10 +114,17 @@ func (s *Store) migrate() error {
 			token TEXT PRIMARY KEY,
 			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 			kind TEXT NOT NULL,
+			issued_email TEXT NOT NULL DEFAULT '',
 			expires_at TIMESTAMP NOT NULL,
 			created_at TIMESTAMP NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id, kind)`,
+		// A completed backfill marker distinguishes legacy zero values from a
+		// deliberately stale epoch written after the upgrade.
+		`CREATE TABLE IF NOT EXISTS auth_epoch_migrations (
+			name TEXT PRIMARY KEY,
+			completed_at TIMESTAMP NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS sources (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT NOT NULL,
@@ -264,10 +276,29 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_bangumi_sync_file
 			ON bangumi_sync_jobs(user_id, file_id)`,
 	}
+	stmts = append(stmts, deviceAuthMigrationStatements...)
+	stmts = append(stmts, deviceFeatureMigrationStatements...)
+	stmts = append(stmts, playbackMigrationStatements...)
+	stmts = append(stmts, playbackSubtitleMigrationStatements...)
 	for _, stmt := range stmts {
 		if _, err := s.DB.Exec(stmt); err != nil {
 			return fmt.Errorf("migrate: %w", err)
 		}
+	}
+	if err := s.migrateDeviceAuthorizationPublicID(); err != nil {
+		return err
+	}
+	if err := s.MigrateDeviceAuthSecurityColumns(); err != nil {
+		return err
+	}
+	if err := s.MigratePlaybackClientCapabilities(); err != nil {
+		return err
+	}
+	if err := s.MigratePlaybackSubtitleGrants(); err != nil {
+		return err
+	}
+	if err := s.MigratePlaybackTransportClaims(); err != nil {
+		return err
 	}
 	if err := s.migrateBangumiSyncJobs(); err != nil {
 		return err
@@ -566,6 +597,7 @@ func (s *Store) rebuildBangumiSyncJobs() error {
 // their own account locked out behind a mailbox it never had.
 func (s *Store) migrateUsers() error {
 	cols := []struct{ name, ddl string }{
+		{"auth_epoch", `ALTER TABLE users ADD COLUMN auth_epoch INTEGER NOT NULL DEFAULT 1`},
 		{"status", `ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`},
 		{"last_login_at", `ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP`},
 		{"email", `ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''`},
@@ -576,7 +608,11 @@ func (s *Store) migrateUsers() error {
 			return err
 		}
 	}
-	return nil
+	if err := s.addColumn("auth_tokens", "issued_email",
+		`ALTER TABLE auth_tokens ADD COLUMN issued_email TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	return s.migrateAuthEpochColumns()
 }
 
 // migrateItemSourceTypes adds the column the UI badges read and fills it for
@@ -808,6 +844,31 @@ func (s *Store) UserByName(name string) (*models.User, error) {
 	return scanUser(s.DB.QueryRow(`SELECT `+userCols+` FROM users WHERE name = ? COLLATE NOCASE`, name))
 }
 
+// UserAuthStateByName returns the user and auth epoch from the same read.
+// Login verifies the password against this snapshot, then uses the epoch to
+// make session creation fail if the credentials were rotated in between.
+func (s *Store) UserAuthStateByName(name string) (*models.User, int64, error) {
+	u := &models.User{}
+	var (
+		last     sql.NullTime
+		verified int
+		epoch    int64
+	)
+	err := s.DB.QueryRow(`SELECT `+userCols+`, auth_epoch FROM users
+		WHERE name = ? COLLATE NOCASE`, name).
+		Scan(&u.ID, &u.Name, &u.PassHash, &u.Salt, &u.Role, &u.Status,
+			&u.Email, &verified, &u.CreatedAt, &last, &epoch)
+	if err != nil {
+		return nil, 0, err
+	}
+	u.EmailVerified = verified != 0
+	if last.Valid {
+		t := last.Time
+		u.LastLogin = &t
+	}
+	return u, epoch, nil
+}
+
 // UserByLogin finds the account behind a sign-in form or a "forgot password"
 // box, where the person may type either their name or their address.
 func (s *Store) UserByLogin(nameOrEmail string) (*models.User, error) {
@@ -855,8 +916,11 @@ func (s *Store) UpdateUserStatus(id int64, status string) error {
 	return err
 }
 
+// UpdateUserPassword is the legacy entry point for a password rotation. It now
+// delegates to the full atomic revocation path rather than updating only the
+// credential columns.
 func (s *Store) UpdateUserPassword(id int64, hash, salt string) error {
-	_, err := s.DB.Exec(`UPDATE users SET pass_hash = ?, salt = ? WHERE id = ?`, hash, salt, id)
+	_, err := s.RotateUserPassword(id, hash, salt, time.Now(), PasswordRotationOptions{})
 	return err
 }
 
@@ -867,11 +931,46 @@ func (s *Store) TouchLastLogin(id int64, t time.Time) error {
 
 // SetUserEmail stores an address and whether it has been proven. Changing the
 // address clears the flag unless the caller explicitly vouches for it (an admin
-// marking an account verified, or a completed verification link).
+// marking an account verified, or a completed verification link). A changed or
+// cleared address also invalidates every outstanding password-reset link.
 func (s *Store) SetUserEmail(id int64, email string, verified bool) error {
-	_, err := s.DB.Exec(`UPDATE users SET email = ?, email_verified = ? WHERE id = ?`,
-		email, boolToInt(verified), id)
-	return err
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Take SQLite's writer reservation before reading the old address so a
+	// concurrent reset-token issuance cannot slip between the comparison and
+	// the update.
+	res, err := tx.Exec(`UPDATE users SET auth_epoch = auth_epoch WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return ErrUserNotFound
+	}
+	var oldEmail string
+	if err := tx.QueryRow(`SELECT email FROM users WHERE id = ?`, id).
+		Scan(&oldEmail); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE users SET email = ?, email_verified = ? WHERE id = ?`,
+		email, boolToInt(verified), id); err != nil {
+		return err
+	}
+	if oldEmail != email {
+		if _, err := tx.Exec(`DELETE FROM auth_tokens
+			WHERE user_id = ? AND kind IN (?, ?)`,
+			id, TokenVerifyEmail, TokenResetPassword); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ---------- one-shot auth tokens ----------
@@ -883,20 +982,69 @@ const (
 	TokenResetPassword = "reset"
 )
 
-// CreateAuthToken issues token, replacing any outstanding one of the same kind
-// for that user. Returning the old link useless is the point: a mailbox full of
-// half-used links should not be a set of live keys.
+// CreateAuthToken issues a token bound to the account's email at the moment it
+// is created. It remains as the compatibility entry point for callers that do
+// not already hold an email snapshot.
 func (s *Store) CreateAuthToken(token string, userID int64, kind string, expires time.Time) error {
+	return s.createAuthToken(token, userID, kind, nil, expires)
+}
+
+// CreateAuthTokenForEmail atomically verifies that expectedEmail is still the
+// account's current address before issuing a token. A concurrent email change
+// either wins first (and this returns ErrAuthStateChanged) or happens after and
+// invalidates any outstanding reset token.
+func (s *Store) CreateAuthTokenForEmail(
+	token string,
+	userID int64,
+	kind string,
+	expectedEmail string,
+	expires time.Time,
+) error {
+	return s.createAuthToken(token, userID, kind, &expectedEmail, expires)
+}
+
+func (s *Store) createAuthToken(
+	token string,
+	userID int64,
+	kind string,
+	expectedEmail *string,
+	expires time.Time,
+) error {
 	tx, err := s.DB.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+
+	// Reserve the writer before reading the account snapshot. This makes token
+	// issuance and SetUserEmail serialize instead of both passing their checks
+	// against an old read.
+	res, err := tx.Exec(`UPDATE users SET auth_epoch = auth_epoch WHERE id = ?`, userID)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return ErrUserNotFound
+	}
+	var currentEmail string
+	if err := tx.QueryRow(`SELECT email FROM users WHERE id = ?`, userID).
+		Scan(&currentEmail); err != nil {
+		return err
+	}
+	if expectedEmail != nil && currentEmail != *expectedEmail {
+		return ErrAuthStateChanged
+	}
 	if _, err := tx.Exec(`DELETE FROM auth_tokens WHERE user_id = ? AND kind = ?`, userID, kind); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`INSERT INTO auth_tokens (token, user_id, kind, expires_at, created_at) VALUES (?,?,?,?,?)`,
-		token, userID, kind, expires, time.Now()); err != nil {
+	if _, err := tx.Exec(`INSERT INTO auth_tokens
+		(token, user_id, kind, issued_email, expires_at, created_at)
+		VALUES (?,?,?,?,?,?)`,
+		token, userID, kind, currentEmail, expires, time.Now()); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -910,6 +1058,73 @@ func (s *Store) AuthTokenUserID(token, kind string) (int64, time.Time, error) {
 	err := s.DB.QueryRow(`SELECT user_id, expires_at FROM auth_tokens WHERE token = ? AND kind = ?`, token, kind).
 		Scan(&userID, &expires)
 	return userID, expires, err
+}
+
+// ConsumeEmailVerificationToken atomically verifies that the token was issued
+// for the account's current, non-empty email before marking it verified and
+// deleting the token. Legacy unbound tokens fail closed.
+func (s *Store) ConsumeEmailVerificationToken(token string, now time.Time) (int64, error) {
+	var userID int64
+	err := s.DB.QueryRow(`SELECT user_id FROM auth_tokens
+		WHERE token = ? AND kind = ?`, token, TokenVerifyEmail).Scan(&userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrEmailVerificationTokenInvalid
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	// Serialize with SetUserEmail and token issuance before re-reading the
+	// token/email binding.
+	res, err := tx.Exec(`UPDATE users SET auth_epoch = auth_epoch WHERE id = ?`, userID)
+	if err != nil {
+		return 0, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if affected != 1 {
+		return 0, ErrEmailVerificationTokenInvalid
+	}
+
+	res, err = tx.Exec(`DELETE FROM auth_tokens
+		WHERE token = ? AND user_id = ? AND kind = ? AND expires_at > ?
+			AND issued_email <> ''
+			AND issued_email = (SELECT email FROM users WHERE id = ?)`,
+		token, userID, TokenVerifyEmail, now.UTC(), userID)
+	if err != nil {
+		return 0, err
+	}
+	affected, err = res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if affected != 1 {
+		return 0, ErrEmailVerificationTokenInvalid
+	}
+	res, err = tx.Exec(`UPDATE users SET email_verified = 1
+		WHERE id = ? AND email <> ''`, userID)
+	if err != nil {
+		return 0, err
+	}
+	affected, err = res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if affected != 1 {
+		return 0, ErrEmailVerificationTokenInvalid
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return userID, nil
 }
 
 func (s *Store) DeleteAuthToken(token string) error {
@@ -972,13 +1187,46 @@ func (s *Store) PruneSessions() error {
 // ---------- sessions ----------
 
 func (s *Store) CreateSession(token string, userID int64, expires time.Time) error {
-	_, err := s.DB.Exec(`INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?,?)`, token, userID, expires)
-	return err
+	return s.createSessionAtCurrentEpoch(token, userID, 0, expires)
+}
+
+// CreateSessionIfAuthCurrent binds a session to the epoch that authenticated
+// the request. The INSERT and its account check are one SQLite statement, so a
+// password rotation or account-state change either commits first and makes the
+// insert a no-op, or commits after and revokes the new session in its own
+// transaction.
+func (s *Store) CreateSessionIfAuthCurrent(token string, userID, expectedEpoch int64, expires time.Time) error {
+	return s.createSessionAtCurrentEpoch(token, userID, expectedEpoch, expires)
+}
+
+func (s *Store) createSessionAtCurrentEpoch(token string, userID, expectedEpoch int64, expires time.Time) error {
+	query := `INSERT INTO sessions (token, user_id, auth_epoch, expires_at)
+		SELECT ?, u.id, u.auth_epoch, ?
+		FROM users u WHERE u.id = ? AND u.status = ?`
+	args := []any{token, expires, userID, models.StatusActive}
+	if expectedEpoch > 0 {
+		query += ` AND u.auth_epoch = ?`
+		args = append(args, expectedEpoch)
+	}
+	res, err := s.DB.Exec(query, args...)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return ErrAuthStateChanged
+	}
+	return nil
 }
 
 func (s *Store) SessionByToken(token string) (*models.Session, error) {
 	sess := &models.Session{}
-	err := s.DB.QueryRow(`SELECT token, user_id, expires_at FROM sessions WHERE token = ?`, token).
+	err := s.DB.QueryRow(`SELECT s.token, s.user_id, s.expires_at
+		FROM sessions s JOIN users u ON u.id = s.user_id
+		WHERE s.token = ? AND s.auth_epoch = u.auth_epoch`, token).
 		Scan(&sess.Token, &sess.UserID, &sess.ExpiresAt)
 	if err != nil {
 		return nil, err

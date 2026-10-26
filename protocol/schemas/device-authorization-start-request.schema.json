@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeviceAuthorizationStartRequest",
+  "description": "Public request that starts an OAuth-like device authorization. The client sends a PKCE S256 challenge and never sends a code verifier here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "device_name",
+    "platform",
+    "client_version",
+    "code_challenge",
+    "code_challenge_method"
+  ],
+  "properties": {
+    "device_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[^\\r\\n\\t]+$"
+    },
+    "platform": {
+      "$ref": "device-platform.schema.json"
+    },
+    "client_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]*$"
+    },
+    "code_challenge": {
+      "type": "string",
+      "minLength": 43,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "description": "Base64url-encoded SHA-256 PKCE challenge without padding."
+    },
+    "code_challenge_method": {
+      "const": "S256"
+    }
+  }
+}

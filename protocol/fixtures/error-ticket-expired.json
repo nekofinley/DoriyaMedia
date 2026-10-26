@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": "ticket_expired",
+    "message": "The playback ticket has expired.",
+    "details": {
+      "state": "expired",
+      "ticket_id": "pt_example_expired",
+      "action": "request_new_ticket"
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "authorization_id": "dva_example_pending_00000001",
+  "device_code": "example_device_code_not_a_real_credential_0001",
+  "user_code": "EXAM2-PQR22",
+  "verification_uri": "https://auth.example/device",
+  "verification_uri_complete": "https://auth.example/device?code=EXAM2-PQR22",
+  "expires_in": 600,
+  "interval": 5
+}

@@ -1,0 +1,63 @@
+{
+  "ticket_id": "pt_example_direct_http",
+  "state": "consuming",
+  "contract_version": 1,
+  "expires_at": "2026-10-26T12:05:00Z",
+  "transport": {
+    "kind": "direct-http",
+    "streams": [
+      {
+        "role": "muxed",
+        "url": "https://source.example/library/example.mp4",
+        "mime": "video/mp4",
+        "headers": {
+          "Referer": "https://player.example/watch/example",
+          "Origin": "https://player.example",
+          "User-Agent": "DoriyaMedia/0.1",
+          "Accept": "*/*"
+        },
+        "range": true
+      }
+    ],
+    "subtitles": [
+      {
+        "id": "sub_61",
+        "language": "zh-Hans",
+        "label": "简体中文",
+        "format": "vtt",
+        "url": "https://media.example/api/v1/playback/subtitle-sessions/ss_example_direct_subtitle_credential/subtitle.vtt",
+        "default": true,
+        "forced": false
+      },
+      {
+        "id": "sub_62",
+        "language": "jpn",
+        "label": "日本語 PGS",
+        "format": "pgs",
+        "default": false,
+        "forced": false
+      }
+    ]
+  },
+  "media": {
+    "container": "mp4",
+    "duration": 1440.0,
+    "video": {
+      "codec": "h264",
+      "width": 1920,
+      "height": 1080,
+      "bit_depth": 8
+    },
+    "audio": [
+      {
+        "codec": "aac",
+        "channels": 2,
+        "language": "jpn"
+      }
+    ]
+  },
+  "remaining_transports": [
+    "server-proxy",
+    "server-hls"
+  ]
+}

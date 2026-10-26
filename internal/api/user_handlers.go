@@ -1,6 +1,8 @@
 package api
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -11,6 +13,7 @@ import (
 
 	"doriyamedia/internal/auth"
 	"doriyamedia/internal/config"
+	"doriyamedia/internal/db"
 	"doriyamedia/internal/models"
 )
 
@@ -248,13 +251,9 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 	hash, salt := auth.HashPassword(req.New)
-	if err := s.Store.UpdateUserPassword(user.ID, hash, salt); err != nil {
-		fail(w, 500, err.Error())
-		return
-	}
-	// A changed password should end sessions opened with the old one; the caller
-	// keeps the session it is using right now.
-	if err := s.Store.DeleteUserSessions(user.ID, sessionToken(r)); err != nil {
+	if _, err := s.Store.RotateUserPassword(user.ID, hash, salt, time.Now(), db.PasswordRotationOptions{
+		PreserveSessionToken: sessionToken(r),
+	}); err != nil {
 		fail(w, 500, err.Error())
 		return
 	}
@@ -372,30 +371,28 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request, actor 
 		return
 	}
 
-	role, status := target.Role, target.Status
+	var update db.AdminUserUpdate
+	update.ActorID = actor.ID
+	update.UserID = target.ID
+	var role, status string
+	role, status = target.Role, target.Status
 	if req.Role != nil {
 		role = normalizeRole(*req.Role)
+		update.Role = &role
 	}
 	if req.Status != nil {
 		status = normalizeStatus(*req.Status)
+		update.Status = &status
 	}
 
 	// Disabling yourself would take the panel away mid-session and cannot be
 	// undone from where you are standing. Stepping down from admin is allowed
-	// though — as long as someone else can still administer the server, which
-	// demotesLastAdmin checks below.
+	// though, as long as someone else can still administer the server.
 	if target.ID == actor.ID {
 		if req.Status != nil && status != target.Status {
 			fail(w, 400, "不能禁用自己的账号")
 			return
 		}
-	}
-	if blocked, err := s.demotesLastAdmin(target, role, status); err != nil {
-		fail(w, 500, err.Error())
-		return
-	} else if blocked {
-		fail(w, 400, "至少要保留一个可用的管理员账号")
-		return
 	}
 
 	if req.Name != nil {
@@ -404,54 +401,17 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request, actor 
 			fail(w, 400, err.Error())
 			return
 		}
-		if name != target.Name {
-			taken, err := s.Store.NameTaken(name, target.ID)
-			if err != nil {
-				fail(w, 500, err.Error())
-				return
-			}
-			if taken {
-				fail(w, 409, "这个用户名已被使用")
-				return
-			}
-			if err := s.Store.RenameUser(target.ID, name); err != nil {
-				fail(w, 500, err.Error())
-				return
-			}
-			target.Name = name
-		}
-	}
-	if role != target.Role {
-		if err := s.Store.UpdateUserRole(target.ID, role); err != nil {
-			fail(w, 500, err.Error())
-			return
-		}
-		target.Role = role
-	}
-	if status != target.Status {
-		if err := s.Store.UpdateUserStatus(target.ID, status); err != nil {
-			fail(w, 500, err.Error())
-			return
-		}
-		target.Status = status
-		// A blocked account should not keep watching on a session it already
-		// holds, otherwise "禁用" would only take effect at the next sign-in.
-		if status != models.StatusActive {
-			if err := s.Store.DeleteUserSessions(target.ID, ""); err != nil {
-				fail(w, 500, err.Error())
-				return
-			}
-		}
+		update.Name = &name
 	}
 	// An admin can correct an address or vouch for one by hand, which is the way
 	// out for someone whose mail never arrived.
 	if req.Email != nil || req.EmailVerified != nil {
-		email := target.Email
 		if req.Email != nil {
 			// An empty address is allowed here: it removes the record and with
 			// it any pending verification.
+			email := ""
 			if strings.TrimSpace(*req.Email) == "" {
-				email = ""
+				update.Email = &email
 			} else {
 				normalized, err := normalizeEmail(*req.Email)
 				if err != nil {
@@ -459,39 +419,18 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request, actor 
 					return
 				}
 				email = normalized
-			}
-			if email != "" && email != target.Email {
-				used, err := s.Store.EmailTaken(email, target.ID)
-				if err != nil {
-					fail(w, 500, err.Error())
-					return
-				}
-				if used {
-					fail(w, 409, "这个邮箱已被其他账号使用")
-					return
-				}
+				update.Email = &email
 			}
 		}
-		verified := target.EmailVerified
-		// A new address has proven nothing by itself.
-		if email != target.Email {
-			verified = false
-		}
-		if req.EmailVerified != nil {
-			verified = *req.EmailVerified
-		}
-		if email == "" {
-			verified = false
-		}
-		if email != target.Email || verified != target.EmailVerified {
-			if err := s.Store.SetUserEmail(target.ID, email, verified); err != nil {
-				fail(w, 500, err.Error())
-				return
-			}
-			target.Email, target.EmailVerified = email, verified
-		}
+		update.EmailVerified = req.EmailVerified
 	}
-	writeJSON(w, 200, map[string]any{"user": target})
+
+	updated, err := s.Store.UpdateUserAdmin(update, time.Now())
+	if err != nil {
+		failAdminUserMutation(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"user": updated})
 }
 
 // handleDeleteUser removes an account along with its sessions and playback
@@ -511,15 +450,8 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request, actor 
 		fail(w, 400, "不能删除当前登录的账号")
 		return
 	}
-	if blocked, err := s.demotesLastAdmin(target, models.RoleUser, models.StatusDisabled); err != nil {
-		fail(w, 500, err.Error())
-		return
-	} else if blocked {
-		fail(w, 400, "至少要保留一个可用的管理员账号")
-		return
-	}
-	if err := s.Store.DeleteUser(target.ID); err != nil {
-		fail(w, 500, err.Error())
+	if err := s.Store.DeleteUserAdmin(actor.ID, target.ID, time.Now()); err != nil {
+		failAdminUserMutation(w, err)
 		return
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
@@ -550,17 +482,13 @@ func (s *Server) handleSetUserPassword(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 	hash, salt := auth.HashPassword(req.Password)
-	if err := s.Store.UpdateUserPassword(target.ID, hash, salt); err != nil {
-		fail(w, 500, err.Error())
-		return
-	}
-	// Resetting your own password keeps this session; resetting someone else's
-	// ends all of theirs.
-	exclude := ""
+	preserve := ""
 	if target.ID == actor.ID {
-		exclude = sessionToken(r)
+		preserve = sessionToken(r)
 	}
-	if err := s.Store.DeleteUserSessions(target.ID, exclude); err != nil {
+	if _, err := s.Store.RotateUserPassword(target.ID, hash, salt, time.Now(), db.PasswordRotationOptions{
+		PreserveSessionToken: preserve,
+	}); err != nil {
 		fail(w, 500, err.Error())
 		return
 	}
@@ -582,27 +510,30 @@ func (s *Server) handleRevokeUserSessions(w http.ResponseWriter, r *http.Request
 	if id == actor.ID {
 		exclude = sessionToken(r)
 	}
-	if err := s.Store.DeleteUserSessions(id, exclude); err != nil {
+	if _, err := s.Store.RevokeUserSessionsAndDevices(id, exclude, time.Now()); err != nil {
 		fail(w, 500, err.Error())
 		return
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
-// demotesLastAdmin reports whether a change would leave the server with no
-// usable admin account. Only an account that currently *is* an active admin
-// matters, and only when the change stops it from being one — that is the one
-// mistake an admin cannot repair from inside the panel.
-func (s *Server) demotesLastAdmin(target *models.User, role, status string) (bool, error) {
-	if !(target.Role == models.RoleAdmin && target.Status == models.StatusActive) {
-		return false, nil
+func failAdminUserMutation(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, sql.ErrNoRows), errors.Is(err, db.ErrUserNotFound):
+		fail(w, 404, "用户不存在")
+	case errors.Is(err, db.ErrAdminActorUnavailable):
+		fail(w, 403, "需要管理员权限")
+	case errors.Is(err, db.ErrAdminCannotChangeOwnState):
+		fail(w, 400, "不能禁用自己的账号")
+	case errors.Is(err, db.ErrAdminCannotDeleteSelf):
+		fail(w, 400, "不能删除当前登录的账号")
+	case errors.Is(err, db.ErrLastActiveAdmin):
+		fail(w, 400, "至少要保留一个可用的管理员账号")
+	case errors.Is(err, db.ErrUserNameTaken):
+		fail(w, 409, "这个用户名已被使用")
+	case errors.Is(err, db.ErrUserEmailTaken):
+		fail(w, 409, "这个邮箱已被其他账号使用")
+	default:
+		fail(w, 500, err.Error())
 	}
-	if role == models.RoleAdmin && status == models.StatusActive {
-		return false, nil
-	}
-	n, err := s.Store.ActiveAdminCount()
-	if err != nil {
-		return false, err
-	}
-	return n <= 1, nil
 }

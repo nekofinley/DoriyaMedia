@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "source_unavailable",
+    "message": "The media source is temporarily unavailable.",
+    "details": {
+      "source_host": "source.example",
+      "retryable": true
+    }
+  }
+}

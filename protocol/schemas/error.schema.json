@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ErrorEnvelope",
+  "description": "Stable API error envelope. Clients branch on error.code; error.message is display text and must not be parsed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "error"
+  ],
+  "properties": {
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "client_upgrade_required",
+            "device_revoked",
+            "ticket_expired",
+            "ticket_not_found",
+            "unsupported_media",
+            "source_unavailable",
+            "transport_disabled",
+            "media_session_not_found",
+            "media_session_expired",
+            "rate_limited",
+            "authorization_denied",
+            "authorization_expired",
+            "authorization_consumed",
+            "authorization_not_found",
+            "invalid_grant",
+            "refresh_token_invalid",
+            "refresh_reuse_detected",
+            "device_not_found",
+            "invalid_request",
+            "unauthenticated",
+            "forbidden",
+            "feature_disabled",
+            "internal_error"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "details": {
+          "type": "object",
+          "description": "Machine-readable context that must never contain credentials, cookies, tokens, complete source URLs, or query signatures.",
+          "additionalProperties": true
+        }
+      }
+    }
+  }
+}

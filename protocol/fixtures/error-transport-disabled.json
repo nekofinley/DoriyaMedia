@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "transport_disabled",
+    "message": "The requested playback transport is disabled.",
+    "details": {
+      "transport": "server-proxy",
+      "action": "request_new_ticket"
+    }
+  }
+}

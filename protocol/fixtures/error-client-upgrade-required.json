@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": "client_upgrade_required",
+    "message": "This client version is no longer supported.",
+    "details": {
+      "platform": "windows",
+      "current_version": "0.0.9",
+      "minimum_version": "0.1.0"
+    }
+  }
+}

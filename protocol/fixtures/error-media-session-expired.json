@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "media_session_expired",
+    "message": "The media session has expired.",
+    "details": {
+      "action": "request_new_ticket"
+    }
+  }
+}

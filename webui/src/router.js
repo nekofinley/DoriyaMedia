@@ -9,6 +9,10 @@ const routes = [
   // reset link has no session, and does not need the site chrome around a form.
   { path: '/verify-email', component: () => import('./views/VerifyEmail.vue'), meta: { public: true, chrome: false, title: '验证邮箱' } },
   { path: '/reset-password', component: () => import('./views/ResetPassword.vue'), meta: { public: true, chrome: false, title: '重设密码' } },
+  // The native client opens this in the system browser. It stays behind the
+  // normal Web session guard; the guard's redirect query brings the user back
+  // to the full /device?code=... URL after signing in.
+  { path: '/device', component: () => import('./views/DeviceAuthorize.vue'), meta: { chrome: false, title: '设备授权' } },
   { path: '/', component: () => import('./views/Home.vue'), meta: { title: '首页', overlay: true } },
   { path: '/bangumi', component: () => import('./views/Bangumi.vue'), meta: { title: '追番' } },
   { path: '/requests', component: () => import('./views/Requests.vue'), meta: { title: '求片' } },

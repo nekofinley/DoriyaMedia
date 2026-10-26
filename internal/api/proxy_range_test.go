@@ -1,8 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -10,6 +12,12 @@ import (
 	"testing"
 	"time"
 )
+
+type legacyProxyRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f legacyProxyRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
 
 func TestParseRequestRange(t *testing.T) {
 	cases := []struct {
@@ -195,5 +203,165 @@ func TestProxyHeadFallsBackToRangeProbe(t *testing.T) {
 	}
 	if rec.Body.Len() != 0 {
 		t.Errorf("a HEAD must not carry a body, got %d bytes", rec.Body.Len())
+	}
+}
+
+func TestLegacyProxyRequestFailuresDoNotLeakSensitiveURLs(t *testing.T) {
+	const (
+		queryCanary = "legacy-query-canary-7a31"
+		authCanary  = "legacy-auth-canary-93c5"
+	)
+
+	t.Run("request construction", func(t *testing.T) {
+		logs := captureLegacyProxyLogs(t)
+		target := "http://media.example.test/%zz/private/clip.mp4?token=" + queryCanary
+		req := httptest.NewRequest(http.MethodGet, "/api/stream/1?proxy=1", nil)
+		rec := httptest.NewRecorder()
+
+		proxyRemoteVia(rec, req, target,
+			map[string]string{"Authorization": "Bearer " + authCanary}, nil)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500; body=%q", rec.Code, rec.Body.String())
+		}
+		assertLegacyProxyNoSensitiveLeak(t, rec, logs, target, queryCanary, authCanary)
+		if got := logs.String(); !strings.Contains(got, "event=request_build_failed") {
+			t.Errorf("construction failure log omits fixed event: %q", got)
+		}
+	})
+
+	t.Run("transport failure", func(t *testing.T) {
+		logs := captureLegacyProxyLogs(t)
+		target := "https://media.example.test/private/clip.mp4?token=" + queryCanary
+		req := httptest.NewRequest(http.MethodGet, "/api/stream/1?proxy=1", nil)
+		rec := httptest.NewRecorder()
+		client := &http.Client{Transport: legacyProxyRoundTripFunc(func(upstream *http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("dial failed for %s with %s",
+				upstream.URL.String(), upstream.Header.Get("Authorization"))
+		})}
+
+		proxyRemoteVia(rec, req, target,
+			map[string]string{"Authorization": "Bearer " + authCanary}, client)
+
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+		}
+		assertLegacyProxyNoSensitiveLeak(t, rec, logs, target, queryCanary, authCanary)
+		gotLogs := logs.String()
+		if !strings.Contains(gotLogs, `host="media.example.test"`) {
+			t.Errorf("transport failure log omits sanitized host: %q", gotLogs)
+		}
+		if !strings.Contains(gotLogs, "event=request_failed") {
+			t.Errorf("transport failure log omits fixed event: %q", gotLogs)
+		}
+	})
+}
+
+func TestLegacyProxyRangeLogsUseWhitelistedFields(t *testing.T) {
+	const (
+		queryCanary = "legacy-range-query-canary-4d82"
+		authCanary  = "legacy-range-auth-canary-b6e9"
+	)
+	target := "https://media.example.test/private/clip.mp4?token=" + queryCanary
+	headers := map[string]string{"Authorization": "Bearer " + authCanary}
+
+	t.Run("ignored range without length", func(t *testing.T) {
+		logs := captureLegacyProxyLogs(t)
+		client := &http.Client{Transport: legacyProxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{"Content-Type": {"video/mp4"}},
+				Body:       io.NopCloser(strings.NewReader("media")),
+			}, nil
+		})}
+		req := httptest.NewRequest(http.MethodGet, "/api/stream/1?proxy=1", nil)
+		req.Header.Set("Range", "bytes=10-19")
+		rec := httptest.NewRecorder()
+
+		proxyRemoteVia(rec, req, target, headers, client)
+
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+		}
+		assertLegacyProxyNoSensitiveLeak(t, rec, logs, target, queryCanary, authCanary)
+		assertLegacyProxyRangeLog(t, logs.String(), "ignored_range_no_length", http.StatusOK)
+	})
+
+	t.Run("unusable partial content", func(t *testing.T) {
+		logs := captureLegacyProxyLogs(t)
+		client := &http.Client{Transport: legacyProxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusPartialContent,
+				Status:     "206 Partial Content",
+				Header: http.Header{
+					"Content-Range": {"bytes unusable"},
+					"Content-Type":  {"video/mp4"},
+				},
+				Body: io.NopCloser(strings.NewReader("junk")),
+			}, nil
+		})}
+		req := httptest.NewRequest(http.MethodGet, "/api/stream/1?proxy=1", nil)
+		req.Header.Set("Range", "bytes=0-3")
+		rec := httptest.NewRecorder()
+
+		proxyRemoteVia(rec, req, target, headers, client)
+
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+		}
+		assertLegacyProxyNoSensitiveLeak(t, rec, logs, target, queryCanary, authCanary)
+		assertLegacyProxyRangeLog(t, logs.String(), "unusable_content_range", http.StatusPartialContent)
+	})
+}
+
+func captureLegacyProxyLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var output bytes.Buffer
+	oldWriter, oldFlags, oldPrefix := log.Writer(), log.Flags(), log.Prefix()
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(oldWriter)
+		log.SetFlags(oldFlags)
+		log.SetPrefix(oldPrefix)
+	})
+	return &output
+}
+
+func assertLegacyProxyNoSensitiveLeak(t *testing.T, rec *httptest.ResponseRecorder, logs *bytes.Buffer, target, queryCanary, authCanary string) {
+	t.Helper()
+	for name, value := range map[string]string{
+		"response body":    rec.Body.String(),
+		"response headers": fmt.Sprint(rec.Header()),
+		"logs":             logs.String(),
+	} {
+		for _, secret := range []string{
+			target,
+			queryCanary,
+			authCanary,
+			"/private/clip.mp4",
+			"?token=",
+			"Authorization",
+		} {
+			if strings.Contains(value, secret) {
+				t.Errorf("%s leaked %q: %q", name, secret, value)
+			}
+		}
+	}
+}
+
+func assertLegacyProxyRangeLog(t *testing.T, got, event string, status int) {
+	t.Helper()
+	for _, want := range []string{
+		"event=" + event,
+		"transport=legacy_proxy",
+		`host="media.example.test"`,
+		fmt.Sprintf("status=%d", status),
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("range failure log omits %q: %q", want, got)
+		}
 	}
 }

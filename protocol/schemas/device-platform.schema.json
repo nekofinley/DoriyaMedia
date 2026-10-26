@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DevicePlatform",
+  "description": "Native-client platform allowed to use the device authorization flow.",
+  "type": "string",
+  "enum": [
+    "windows",
+    "android"
+  ]
+}

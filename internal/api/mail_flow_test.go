@@ -305,6 +305,41 @@ func TestPasswordResetFlow(t *testing.T) {
 	}
 }
 
+func TestPasswordResetLinkInvalidAfterEmailChange(t *testing.T) {
+	srv, ts := newTestServer(t)
+	base := ts.URL
+	admin := setupAdmin(t, base)
+	fake := configureSMTP(t, srv)
+
+	code, body := call(t, admin, "PUT", base+"/api/admin/users/1", map[string]any{
+		"email": "before@example.com", "email_verified": true,
+	})
+	if code != 200 {
+		t.Fatalf("set original email: code %d body %v", code, body)
+	}
+	if code, body := call(t, browser(t), "POST", base+"/api/auth/forgot-password",
+		map[string]string{"login": "before@example.com"}); code != 200 {
+		t.Fatalf("request reset: code %d body %v", code, body)
+	}
+	token := tokenFromLink(t, fake.LinkWithPrefix(t, base+"/reset-password?token="),
+		base+"/reset-password?token=")
+
+	if code, body := call(t, admin, "PUT", base+"/api/admin/users/1", map[string]any{
+		"email": "after@example.com", "email_verified": false,
+	}); code != 200 {
+		t.Fatalf("change email: code %d body %v", code, body)
+	}
+	if code, body := call(t, browser(t), "POST", base+"/api/auth/reset-password",
+		map[string]string{"token": token, "password": "attacker-pass"}); code != 400 {
+		t.Fatalf("old reset link after email change = %d %v, want 400", code, body)
+	}
+	if code, _ := call(t, browser(t), "POST", base+"/api/auth/login", map[string]string{
+		"name": "admin", "password": "admin-pass",
+	}); code != 200 {
+		t.Error("a reset link mailed to the previous address changed the password")
+	}
+}
+
 // The reverse of the lockout test: with verification off, an unverified address
 // is not a reason to refuse a sign-in.
 func TestUnverifiedEmailDoesNotBlockWhenSettingIsOff(t *testing.T) {
@@ -445,6 +480,44 @@ func TestIncompleteTurnstileConfigurationIsIgnored(t *testing.T) {
 		"name": "admin", "password": "admin-pass",
 	}); code != 200 {
 		t.Error("sign-in was blocked by a configuration that cannot challenge anybody")
+	}
+}
+
+func TestEmailVerificationLinkInvalidAfterEmailChange(t *testing.T) {
+	srv, ts := newTestServer(t)
+	base := ts.URL
+	admin := setupAdmin(t, base)
+	fake := configureSMTP(t, srv)
+
+	code, body := call(t, admin, "PUT", base+"/api/admin/users/1", map[string]any{
+		"email": "before@example.com", "email_verified": false,
+	})
+	if code != 200 {
+		t.Fatalf("set original email: code %d body %v", code, body)
+	}
+	if code, body := call(t, browser(t), "POST", base+"/api/auth/resend-verification",
+		map[string]string{"login": "before@example.com"}); code != 200 {
+		t.Fatalf("request verification: code %d body %v", code, body)
+	}
+	token := tokenFromLink(t, fake.LinkWithPrefix(t, base+"/verify-email?token="),
+		base+"/verify-email?token=")
+
+	if code, body := call(t, admin, "PUT", base+"/api/admin/users/1", map[string]any{
+		"email": "after@example.com", "email_verified": false,
+	}); code != 200 {
+		t.Fatalf("change email: code %d body %v", code, body)
+	}
+	if code, body := call(t, browser(t), "POST", base+"/api/auth/verify-email",
+		map[string]string{"token": token}); code != 400 {
+		t.Fatalf("old verification link after email change = %d %v, want 400", code, body)
+	}
+	user, err := srv.Store.UserByID(1)
+	if err != nil {
+		t.Fatalf("read admin after rejected verification: %v", err)
+	}
+	if user.Email != "after@example.com" || user.EmailVerified {
+		t.Fatalf("verification state after email change = %q verified=%v",
+			user.Email, user.EmailVerified)
 	}
 }
 

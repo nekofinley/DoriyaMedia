@@ -1,0 +1,9 @@
+{
+  "ticket_id": "pt_example_failed",
+  "state": "failed",
+  "contract_version": 1,
+  "expires_at": "2026-10-26T12:05:00Z",
+  "remaining_transports": [],
+  "failure_code": "source_unavailable",
+  "message": "Playback preparation failed."
+}

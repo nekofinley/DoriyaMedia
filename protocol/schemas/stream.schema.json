@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaybackStream",
+  "description": "One media stream and the only request headers a native client may send to it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "role",
+    "url",
+    "mime",
+    "headers",
+    "range"
+  ],
+  "properties": {
+    "role": {
+      "type": "string",
+      "enum": [
+        "muxed",
+        "video",
+        "audio",
+        "subtitle"
+      ]
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "minLength": 8,
+      "maxLength": 4096,
+      "pattern": "^https?://[^\\s]+$"
+    },
+    "mime": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^(?:video|audio|application)/[0-9A-Za-z][0-9A-Za-z.+-]*$"
+    },
+    "headers": {
+      "$ref": "stream-headers.schema.json"
+    },
+    "range": {
+      "type": "boolean"
+    }
+  }
+}

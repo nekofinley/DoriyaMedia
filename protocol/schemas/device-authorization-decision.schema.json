@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeviceAuthorizationDecisionResponse",
+  "description": "Terminal browser-session decision for a pending device authorization.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "state"
+  ],
+  "properties": {
+    "state": {
+      "type": "string",
+      "enum": [
+        "authorized",
+        "denied"
+      ]
+    }
+  }
+}

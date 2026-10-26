@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "device_revoked",
+    "message": "This device authorization has been revoked.",
+    "details": {
+      "device_id": "dev_example_revoked",
+      "action": "reauth"
+    }
+  }
+}

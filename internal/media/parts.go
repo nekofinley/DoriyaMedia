@@ -3,9 +3,10 @@ package media
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
 	"strconv"
+	"strings"
 	"time"
 
 	"doriyamedia/internal/models"
@@ -186,7 +187,10 @@ type Input struct {
 // that publishes several, otherwise the single target. `rejected` forces a fresh
 // resolution of the link the caller just saw refused.
 func (e *Engine) SegmentInputs(ctx context.Context, file *models.MediaFile, drv source.Driver, rejected string) ([]Input, error) {
-	proxy := sourceProxyFor(drv)
+	proxy, err := sourceProxyFor(drv)
+	if err != nil {
+		return nil, err
+	}
 	if _, ok := drv.(source.MultiPart); ok {
 		parts, err := e.PartsFor(ctx, file, drv, rejected)
 		if err != nil {
@@ -226,22 +230,21 @@ func sameInputs(a, b []Input) bool {
 //
 // Only a source that configures its own proxy has one: the scraper proxies are
 // deliberately not inherited, because they are configured for TMDB / Bangumi and
-// a source that needs a different route says so itself. A bridge failure is
-// logged and treated as "no proxy" rather than failing the playback here — the
-// request will then fail at the source, with the source's own message.
-func sourceProxyFor(drv source.Driver) string {
+// a source that needs a different route says so itself. A configured bridge that
+// cannot be created fails closed; silently direct-dialing would bypass the
+// administrator's chosen egress and may expose the server's real address.
+func sourceProxyFor(drv source.Driver) (string, error) {
 	pd, ok := drv.(source.ProxiedDriver)
-	if !ok {
-		return ""
+	if !ok || strings.TrimSpace(pd.ProxySpec()) == "" {
+		return "", nil
 	}
 	spec, err := netproxy.Parse(pd.ProxySpec())
 	if err != nil {
-		return ""
+		return "", errors.New("source proxy configuration invalid")
 	}
 	b, err := netproxy.BridgeFor(spec)
 	if err != nil {
-		log.Printf("ffmpeg proxy bridge for %s: %v", spec.Summary(), err)
-		return ""
+		return "", errors.New("source proxy bridge unavailable")
 	}
-	return b.URL()
+	return b.URL(), nil
 }

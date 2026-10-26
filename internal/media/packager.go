@@ -89,6 +89,10 @@ type PackagerOptions struct {
 	PrepareDir func(dir string) error
 
 	Dir string // output directory; must already exist
+
+	// egressTrust is set by Engine.EnsureSession. It is intentionally not part of
+	// the public options: callers cannot widen the LAN trust boundary.
+	egressTrust *egressTrust
 }
 
 // BurnRequest picks the subtitle to overlay onto the video.
@@ -108,11 +112,12 @@ type Packager struct {
 	initPath string
 	args     []string
 
-	cmd  *exec.Cmd
-	done chan struct{}
-	mu   sync.Mutex
-	err  error
-	tail []string // last stderr lines, for diagnostics
+	cmd    *exec.Cmd
+	done   chan struct{}
+	mu     sync.Mutex
+	err    error
+	tail   []string // last stderr lines, for diagnostics
+	egress *egressControllerSet
 }
 
 const packagerErrTail = 8
@@ -144,6 +149,10 @@ func StartPackager(ctx context.Context, o PackagerOptions) (*Packager, error) {
 	if err != nil {
 		return nil, err
 	}
+	args, egress, err := secureFFmpegArgs(args, o.egressTrust)
+	if err != nil {
+		return nil, err
+	}
 
 	p := &Packager{
 		dir:      o.Dir,
@@ -151,16 +160,24 @@ func StartPackager(ctx context.Context, o PackagerOptions) (*Packager, error) {
 		initPath: filepath.Join(o.Dir, "init.mp4"),
 		args:     args,
 		done:     make(chan struct{}),
+		egress:   egress,
 	}
 	cmd := exec.CommandContext(ctx, o.ffmpegPath(), args...)
+	cmd.Env = secureMediaEnv(egress.DefaultProxyURL())
 	// The relative output names below are resolved against the child's working
 	// directory — see the note about the init filename at the top of this file.
 	cmd.Dir = o.Dir
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		if egress != nil {
+			egress.Close()
+		}
 		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
+		if egress != nil {
+			egress.Close()
+		}
 		return nil, fmt.Errorf("packager: start ffmpeg: %w", err)
 	}
 	p.cmd = cmd
@@ -180,6 +197,9 @@ func StartPackager(ctx context.Context, o PackagerOptions) (*Packager, error) {
 
 	go func() {
 		defer close(p.done)
+		if p.egress != nil {
+			defer p.egress.Close()
+		}
 		werr := cmd.Wait()
 		p.mu.Lock()
 		p.err = werr

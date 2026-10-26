@@ -139,6 +139,7 @@ type Prober struct {
 	// streams are known. Zero falls back to the historical deep window.
 	ProbeSizeMB int
 	AnalyzeSec  int
+	egress      *egressTrust
 }
 
 // deepProbeSizeMB / deepProbeAnalyzeSec are the historical fixed window. They
@@ -191,10 +192,32 @@ func (p *Prober) ProbeFileVia(ctx context.Context, target string, headers map[st
 		}
 		args = append(args, "-headers", b.String())
 	}
-	args = ProxyArgs(args, proxy)
+	trust := egressTrustFromContext(cctx, p.egress)
+	remote, err := egressRemoteTarget(target)
+	if err != nil {
+		return nil, err
+	}
+	controller, err := secureEgressProxy(
+		target, proxy, renderMediaHeaders(headers), trust.targetView(target))
+	if err != nil {
+		return nil, err
+	}
+	if controller != nil {
+		defer controller.Close()
+		protocolWhitelist := egressLocalProtocolWhitelist
+		if remote {
+			protocolWhitelist = egressRemoteProtocolWhitelist
+		} else {
+			args = append(args, "-format_whitelist", egressLocalFormatWhitelist)
+		}
+		args = append(args,
+			"-protocol_whitelist", protocolWhitelist,
+			"-http_proxy", controller.ProxyURL())
+	}
 	args = append(args, target)
 
 	cmd := exec.CommandContext(cctx, p.FFProbe, args...)
+	cmd.Env = secureMediaEnv(controller.ProxyURL())
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -209,6 +232,17 @@ func (p *Prober) ProbeFileVia(ctx context.Context, target string, headers map[st
 		return nil, fmt.Errorf("ffprobe: empty result")
 	}
 	return &probe, nil
+}
+
+func renderMediaHeaders(headers map[string]string) string {
+	var b strings.Builder
+	for k, v := range headers {
+		b.WriteString(k)
+		b.WriteString(": ")
+		b.WriteString(v)
+		b.WriteString("\r\n")
+	}
+	return b.String()
 }
 
 func (p *Probe) BitRate() int64 {

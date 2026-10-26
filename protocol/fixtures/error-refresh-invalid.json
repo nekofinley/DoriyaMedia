@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "refresh_token_invalid",
+    "message": "The refresh token is invalid or expired.",
+    "details": {
+      "action": "reauth"
+    }
+  }
+}

@@ -301,7 +301,8 @@ func (s *Session) ShiftSegment(data []byte) []byte {
 		}
 		parsed, err := ParseInitTracks(initBytes)
 		if err != nil {
-			log.Printf("hls session %d: cannot read track timescales (%v); serving segments unshifted", s.key.fileID, err)
+			log.Printf("hls session %d: cannot read track timescales (%s); serving segments unshifted",
+				s.key.fileID, safeMediaLogError(err))
 			return data
 		}
 		s.mu.Lock()
@@ -311,7 +312,8 @@ func (s *Session) ShiftSegment(data []byte) []byte {
 	}
 	out, _, err := ShiftTfdt(data, tracks, s.startSeconds)
 	if err != nil {
-		log.Printf("hls session %d: tfdt shift failed (%v); serving segment unshifted", s.key.fileID, err)
+		log.Printf("hls session %d: tfdt shift failed (%s); serving segment unshifted",
+			s.key.fileID, safeMediaLogError(err))
 		return data
 	}
 	return out
@@ -714,6 +716,7 @@ func (e *Engine) EnsureSession(ctx context.Context, key sessionKey, opts Package
 		return nil, fmt.Errorf("create session dir: %w", err)
 	}
 	opts.Dir = dir
+	opts.egressTrust = e.egressTrust
 
 	// Detach from the request context: the session must outlive the HTTP request
 	// that happened to start it.

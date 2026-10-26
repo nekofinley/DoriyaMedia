@@ -1,0 +1,9 @@
+{
+  "ticket_id": "pt_example_unsupported",
+  "state": "unsupported",
+  "contract_version": 1,
+  "expires_at": "2026-10-26T12:05:00Z",
+  "remaining_transports": [],
+  "failure_code": "unsupported_media",
+  "message": "No supported transport is available for this media."
+}

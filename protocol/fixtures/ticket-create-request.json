@@ -1,0 +1,32 @@
+{
+  "file_id": 123,
+  "device_id": "dev_example_windows",
+  "client": {
+    "platform": "windows",
+    "version": "0.1.0",
+    "engine": "mpv",
+    "containers": [
+      "mp4",
+      "mkv"
+    ],
+    "video_codecs": [
+      "h264",
+      "hevc"
+    ],
+    "audio_codecs": [
+      "aac",
+      "flac"
+    ],
+    "subtitle_codecs": [
+      "text",
+      "ass"
+    ],
+    "supports_range": true,
+    "supports_headers": true
+  },
+  "preferred_transports": [
+    "direct-http",
+    "server-proxy",
+    "server-hls"
+  ]
+}

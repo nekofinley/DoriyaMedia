@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "refresh_reuse_detected",
+    "message": "This refresh token was already used. Sign in on the device again.",
+    "details": {
+      "action": "reauth",
+      "family_revoked": true
+    }
+  }
+}

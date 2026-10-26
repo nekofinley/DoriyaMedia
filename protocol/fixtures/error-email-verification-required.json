@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "forbidden",
+    "message": "The account cannot complete device authentication."
+  }
+}

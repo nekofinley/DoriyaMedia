@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "forbidden",
+    "message": "The approval token is invalid or expired. Look up the authorization again.",
+    "details": {
+      "action": "reload_authorization"
+    }
+  }
+}

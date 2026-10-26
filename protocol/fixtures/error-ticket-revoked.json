@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": "forbidden",
+    "message": "This playback ticket has been revoked.",
+    "details": {
+      "action": "reauthorize",
+      "state": "revoked",
+      "ticket_id": "pt_example_revoked"
+    }
+  }
+}

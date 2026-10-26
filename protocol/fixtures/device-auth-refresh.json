@@ -1,0 +1,20 @@
+{
+  "access_token": "example_rotated_access_token_not_a_real_credential_0002",
+  "token_type": "Bearer",
+  "expires_in": 900,
+  "refresh_token": "example_rotated_refresh_token_not_a_real_credential_0002",
+  "refresh_expires_in": 518400,
+  "device": {
+    "id": "dev_example_windows_0001",
+    "name": "Example Windows Desktop",
+    "platform": "windows",
+    "client_version": "0.1.0",
+    "created_at": "2026-10-26T10:00:00Z",
+    "last_seen_at": "2026-10-26T10:15:00Z",
+    "revoked_at": null
+  },
+  "user": {
+    "id": 42,
+    "name": "example-user"
+  }
+}

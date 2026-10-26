@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RefreshTokenRequest",
+  "description": "Public token-rotation request. The refresh token is carried only in the JSON body, never in a URL or Cookie.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "refresh_token"
+  ],
+  "properties": {
+    "refresh_token": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9._~-]+$"
+    }
+  }
+}

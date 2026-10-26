@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "authorization_consumed",
+    "message": "The device authorization has already been used.",
+    "details": {
+      "action": "start_new_authorization"
+    }
+  }
+}

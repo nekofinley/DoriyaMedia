@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "authorization_expired",
+    "message": "The device authorization has expired.",
+    "details": {
+      "action": "start_new_authorization"
+    }
+  }
+}

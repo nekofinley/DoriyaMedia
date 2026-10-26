@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeviceTokenRequest",
+  "description": "Public polling and token-exchange request. The verifier is compared with the S256 challenge registered at authorization start.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "device_code",
+    "code_verifier"
+  ],
+  "properties": {
+    "device_code": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9._~-]+$"
+    },
+    "code_verifier": {
+      "type": "string",
+      "minLength": 43,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._~-]+$"
+    }
+  }
+}

@@ -195,14 +195,14 @@ func (e *Engine) runProbeJob(ctx context.Context, file *models.MediaFile, drv so
 	e.probeMu.Lock()
 	job.finished = time.Now()
 	if err != nil {
-		job.state, job.errMsg = "failed", err.Error()
+		job.state, job.errMsg = "failed", safeProbeStatusError(err)
 	} else {
 		job.state = "ready"
 	}
 	e.probeMu.Unlock()
 
 	if err != nil {
-		log.Printf("probe failed for file %d (%s): %v", file.ID, file.Path, err)
+		log.Printf("probe failed for file %d (%s)", file.ID, safeMediaLogError(err))
 	}
 }
 
@@ -213,7 +213,12 @@ func (e *Engine) doProbe(ctx context.Context, file *models.MediaFile, drv source
 		job.err = err
 		return err
 	}
-	probe, err := e.probeWithFallback(ctx, target, headers, sourceProxyFor(drv))
+	proxy, err := sourceProxyFor(drv)
+	if err != nil {
+		job.err = err
+		return err
+	}
+	probe, err := e.probeWithFallback(ctx, target, headers, proxy)
 	if err != nil {
 		job.err = err
 		return err
@@ -224,7 +229,7 @@ func (e *Engine) doProbe(ctx context.Context, file *models.MediaFile, drv source
 		return err
 	}
 	if err := e.Store.UpdateFileProbe(file.ID, string(raw)); err != nil {
-		log.Printf("persist probe for file %d failed: %v", file.ID, err)
+		log.Printf("persist probe for file %d failed (%s)", file.ID, safeMediaLogError(err))
 	}
 	file.Probe = string(raw)
 	e.RegisterEmbeddedSubs(file, probe)

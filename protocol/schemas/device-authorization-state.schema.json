@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeviceAuthorizationState",
+  "description": "Lifecycle state of a device authorization. Pending is polled, authorized is exchangeable once, and denied, consumed, or expired are terminal.",
+  "type": "string",
+  "enum": [
+    "pending",
+    "authorized",
+    "denied",
+    "consumed",
+    "expired"
+  ]
+}

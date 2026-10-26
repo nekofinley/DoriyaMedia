@@ -1,0 +1,229 @@
+{
+  "schema_version": 1,
+  "baseline_date": "2026-10-26",
+  "source_url_policy": "Must remain null. Resolve secret_ref from the process environment at runtime.",
+  "samples": [
+    {
+      "id": "S1",
+      "kind": "openlist",
+      "source_label": "OpenList",
+      "container": "mp4",
+      "video": "h264",
+      "video_profile": "High",
+      "audio": [
+        "aac"
+      ],
+      "features": [
+        "range",
+        "http-direct"
+      ],
+      "subtitles": [],
+      "source_url": null,
+      "secret_ref": "DORIYA_SAMPLE_S1_URL",
+      "headers_ref": null,
+      "file_id": null,
+      "file_id_env": "DORIYA_SAMPLE_S1_FILE_ID",
+      "coverage": "required",
+      "coverage_status": "candidate-required",
+      "notes": "MP4 H.264 High/AAC with normal byte-range support."
+    },
+    {
+      "id": "S2",
+      "kind": "openlist",
+      "source_label": "OpenList",
+      "container": "mkv",
+      "video": "h264",
+      "video_profile": "High",
+      "audio": [
+        "eac3"
+      ],
+      "features": [
+        "range",
+        "eac3-audio"
+      ],
+      "subtitles": [],
+      "source_url": null,
+      "secret_ref": "DORIYA_SAMPLE_S2_URL",
+      "headers_ref": null,
+      "file_id": null,
+      "file_id_env": "DORIYA_SAMPLE_S2_FILE_ID",
+      "coverage": "required",
+      "coverage_status": "pending",
+      "coverage_gap": "No confirmed E-AC3 candidate was found in the current local catalog. Do not substitute another audio codec.",
+      "notes": "MKV H.264/E-AC3. This sample remains pending until a real E-AC3 file is found."
+    },
+    {
+      "id": "S3",
+      "kind": "openlist",
+      "source_label": "OpenList",
+      "container": "mkv",
+      "video": "hevc",
+      "video_profile": "Main10",
+      "audio": [
+        "flac"
+      ],
+      "features": [
+        "range",
+        "10-bit-video",
+        "text-subtitle"
+      ],
+      "subtitles": [
+        "ass"
+      ],
+      "source_url": null,
+      "secret_ref": "DORIYA_SAMPLE_S3_URL",
+      "headers_ref": null,
+      "file_id": null,
+      "file_id_env": "DORIYA_SAMPLE_S3_FILE_ID",
+      "coverage": "required",
+      "coverage_status": "candidate-required",
+      "notes": "MKV HEVC Main10/FLAC. Use a source with an ASS subtitle track when available."
+    },
+    {
+      "id": "S3-PGS",
+      "kind": "openlist",
+      "source_label": "OpenList",
+      "container": "mkv",
+      "video": "h264",
+      "video_profile": "High10",
+      "audio": [
+        "flac"
+      ],
+      "features": [
+        "range",
+        "10-bit-video",
+        "graphic-subtitle"
+      ],
+      "subtitles": [
+        "pgs"
+      ],
+      "source_url": null,
+      "secret_ref": "DORIYA_SAMPLE_S3_PGS_URL",
+      "headers_ref": null,
+      "file_id": null,
+      "file_id_env": "DORIYA_SAMPLE_S3_PGS_FILE_ID",
+      "coverage": "supplemental",
+      "coverage_status": "candidate-required",
+      "notes": "Supplemental MKV H.264 High10/FLAC/PGS sample for the graphical subtitle path."
+    },
+    {
+      "id": "S4",
+      "kind": "bilibili",
+      "source_label": "Bilibili DASH",
+      "container": "dash",
+      "video": "h264",
+      "video_profile": "High",
+      "audio": [
+        "aac"
+      ],
+      "features": [
+        "dual-url",
+        "dash",
+        "requires-referer"
+      ],
+      "subtitles": [],
+      "source_url": null,
+      "secret_ref": "DORIYA_SAMPLE_S4_SOURCES_JSON",
+      "headers_ref": "DORIYA_SAMPLE_S4_HEADERS_JSON",
+      "file_id": null,
+      "file_id_env": "DORIYA_SAMPLE_S4_FILE_ID",
+      "coverage": "required",
+      "coverage_status": "candidate-required",
+      "notes": "Real Bilibili video/audio DASH URLs. The secret value must be JSON with video and audio roles."
+    },
+    {
+      "id": "S5",
+      "kind": "mock",
+      "source_label": "Local loopback mock",
+      "container": "mp4",
+      "video": "h264",
+      "video_profile": "High",
+      "audio": [
+        "aac"
+      ],
+      "features": [
+        "local-mock",
+        "requires-referer",
+        "requires-authorization",
+        "range",
+        "malformed-range",
+        "expired",
+        "redirect-anomaly"
+      ],
+      "subtitles": [],
+      "source_url": null,
+      "secret_ref": "DORIYA_SAMPLE_S5_URL",
+      "headers_ref": null,
+      "file_id": null,
+      "file_id_env": "DORIYA_SAMPLE_S5_FILE_ID",
+      "mock_profile": "s5-auth-range-anomalies",
+      "coverage": "required",
+      "coverage_status": "local-only",
+      "notes": "The script starts its own loopback-only mock. No external URL or credential is required."
+    }
+  ],
+  "devices": [
+    {
+      "id": "windows-10-22h2",
+      "platform": "windows",
+      "version": "10 22H2",
+      "soc": null,
+      "gpu": null,
+      "notes": "Record the real GPU and driver before running decode checks."
+    },
+    {
+      "id": "windows-11-current",
+      "platform": "windows",
+      "version": "11 current stable",
+      "soc": null,
+      "gpu": null,
+      "notes": "Record the real GPU and driver before running decode checks."
+    },
+    {
+      "id": "android-9",
+      "platform": "android",
+      "version": "9",
+      "soc": null,
+      "gpu": null,
+      "notes": "Use a physical device; record Qualcomm/MediaTek and arm64-v8a in the result template."
+    },
+    {
+      "id": "android-12",
+      "platform": "android",
+      "version": "12",
+      "soc": null,
+      "gpu": null,
+      "notes": "Use a physical device; record Qualcomm/MediaTek and arm64-v8a in the result template."
+    },
+    {
+      "id": "android-14",
+      "platform": "android",
+      "version": "14",
+      "soc": null,
+      "gpu": null,
+      "notes": "Use a physical device; record Qualcomm/MediaTek and arm64-v8a in the result template."
+    }
+  ],
+  "networks": [
+    {
+      "id": "same-lan",
+      "label": "same-LAN",
+      "notes": "Client and source access through the same public egress when applicable."
+    },
+    {
+      "id": "phone-hotspot",
+      "label": "phone-hotspot",
+      "notes": "Client uses a cellular hotspot."
+    },
+    {
+      "id": "alternate-egress",
+      "label": "alternate-public-egress",
+      "notes": "A different public egress from the server."
+    },
+    {
+      "id": "vpn-source-proxy",
+      "label": "VPN-or-source-proxy",
+      "notes": "VPN or source-side proxy path. Record the egress region separately."
+    }
+  ]
+}

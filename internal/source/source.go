@@ -2,6 +2,7 @@ package source
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -267,13 +268,115 @@ func NewDriver(src *models.Source) (Driver, error) {
 
 // ---------- shared helpers ----------
 
-var httpClient = &http.Client{
+var httpClient = newSourceHTTPClient(&http.Client{
 	Timeout: 0, // streaming; per-call contexts apply
 	Transport: &http.Transport{
 		MaxIdleConns:        32,
 		MaxIdleConnsPerHost: 8,
 		IdleConnTimeout:     90 * time.Second,
 	},
+})
+
+var errSourceHTTPSDowngrade = errors.New("source: refusing redirect from HTTPS to HTTP")
+
+// newSourceHTTPClient clones client and installs the redirect policy shared by
+// every source request. Cloning keeps a caller's transport, timeout and cookie
+// jar while ensuring a preconfigured client cannot bypass the policy.
+func newSourceHTTPClient(client *http.Client) *http.Client {
+	if client == nil {
+		return nil
+	}
+	cloned := *client
+	next := cloned.CheckRedirect
+	cloned.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("source: stopped after 10 redirects")
+		}
+		if next != nil {
+			if err := next(req, via); err != nil {
+				return err
+			}
+		}
+		return enforceSourceRedirectPolicy(req, via)
+	}
+	return &cloned
+}
+
+// enforceSourceRedirectPolicy rejects TLS downgrades and removes credentials
+// when a redirect leaves the original scheme+host+port origin. The comparison is
+// against the first request, not just the previous hop, so a cross-origin chain
+// cannot reintroduce the original caller's headers on a later same-origin hop.
+func enforceSourceRedirectPolicy(req *http.Request, via []*http.Request) error {
+	if req == nil || req.URL == nil || len(via) == 0 {
+		return nil
+	}
+	previous := via[len(via)-1]
+	if previous != nil && previous.URL != nil &&
+		strings.EqualFold(previous.URL.Scheme, "https") &&
+		strings.EqualFold(req.URL.Scheme, "http") {
+		return errSourceHTTPSDowngrade
+	}
+	original := via[0]
+	if original == nil || original.URL == nil || !sameSourceOrigin(original.URL, req.URL) {
+		stripSourceCrossOriginHeaders(req.Header)
+	}
+	return nil
+}
+
+func sameSourceOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		sourceOriginPort(a) == sourceOriginPort(b)
+}
+
+func sourceOriginPort(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch {
+	case strings.EqualFold(u.Scheme, "https"):
+		return "443"
+	case strings.EqualFold(u.Scheme, "http"):
+		return "80"
+	default:
+		return ""
+	}
+}
+
+// sourceCrossOriginSafeHeaders is deliberately an allowlist. Source header
+// maps may contain provider-specific credentials that are not named
+// Authorization or Cookie, so a denylist would miss them.
+var sourceCrossOriginSafeHeaders = map[string]struct{}{
+	"accept":              {},
+	"accept-encoding":     {},
+	"accept-language":     {},
+	"cache-control":       {},
+	"content-length":      {},
+	"content-range":       {},
+	"content-type":        {},
+	"expect":              {},
+	"if-match":            {},
+	"if-modified-since":   {},
+	"if-none-match":       {},
+	"if-range":            {},
+	"if-unmodified-since": {},
+	"pragma":              {},
+	"range":               {},
+	"user-agent":          {},
+}
+
+func stripSourceCrossOriginHeaders(header http.Header) {
+	for name := range header {
+		if _, ok := sourceCrossOriginSafeHeaders[strings.ToLower(name)]; !ok {
+			delete(header, name)
+		}
+	}
 }
 
 // escapeURLPath escapes each path segment, preserving "/" separators.

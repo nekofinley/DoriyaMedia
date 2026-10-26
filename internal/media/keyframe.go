@@ -124,10 +124,32 @@ func (p *Prober) keyframeRead(ctx context.Context, target string, headers map[st
 		}
 		args = append(args, "-headers", b.String())
 	}
-	args = ProxyArgs(args, proxy)
+	trust := egressTrustFromContext(cctx, p.egress)
+	remote, err := egressRemoteTarget(target)
+	if err != nil {
+		return keyframeWindow{}, err
+	}
+	controller, err := secureEgressProxy(
+		target, proxy, renderMediaHeaders(headers), trust.targetView(target))
+	if err != nil {
+		return keyframeWindow{}, err
+	}
+	if controller != nil {
+		defer controller.Close()
+		protocolWhitelist := egressLocalProtocolWhitelist
+		if remote {
+			protocolWhitelist = egressRemoteProtocolWhitelist
+		} else {
+			args = append(args, "-format_whitelist", egressLocalFormatWhitelist)
+		}
+		args = append(args,
+			"-protocol_whitelist", protocolWhitelist,
+			"-http_proxy", controller.ProxyURL())
+	}
 	args = append(args, target)
 
 	cmd := exec.CommandContext(cctx, p.FFProbe, args...)
+	cmd.Env = secureMediaEnv(controller.ProxyURL())
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -211,12 +233,15 @@ func (e *Engine) PackWindowAt(ctx context.Context, file *models.MediaFile, drv s
 	if pos <= 0 || file == nil || drv == nil {
 		return PackWindow{}
 	}
+	e.egressTrust.addDriver(drv)
+	ctx = withEgressTrust(ctx, egressTrustForDriver(drv))
 	if _, ok := drv.(source.MultiPart); !ok {
 		return PackWindow{}
 	}
 	inputs, err := e.SegmentInputs(ctx, file, drv, "")
 	if err != nil || len(inputs) == 0 {
-		log.Printf("keyframe alignment for file %d at %.1fs: no inputs: %v", file.ID, pos, err)
+		log.Printf("keyframe alignment for file %d at %.1fs: no inputs (%s)",
+			file.ID, pos, safeMediaLogError(err))
 		e.rememberAlignment(fmt.Sprintf("%d|%.3f", file.ID, pos), PackWindow{}, false)
 		return PackWindow{}
 	}
@@ -269,12 +294,15 @@ func (e *Engine) AlignedStart(ctx context.Context, file *models.MediaFile, drv s
 	if pos <= 0 || file == nil || drv == nil {
 		return pos, false
 	}
+	e.egressTrust.addDriver(drv)
+	ctx = withEgressTrust(ctx, egressTrustForDriver(drv))
 	if _, ok := drv.(source.MultiPart); !ok {
 		return pos, false
 	}
 	inputs, err := e.SegmentInputs(ctx, file, drv, "")
 	if err != nil || len(inputs) == 0 {
-		log.Printf("keyframe alignment for file %d at %.1fs: no inputs: %v", file.ID, pos, err)
+		log.Printf("keyframe alignment for file %d at %.1fs: no inputs (%s)",
+			file.ID, pos, safeMediaLogError(err))
 		e.rememberAlignment(fmt.Sprintf("%d|%.3f", file.ID, pos), PackWindow{}, false)
 		return pos, false
 	}
@@ -299,7 +327,8 @@ func (e *Engine) alignInputs(ctx context.Context, file *models.MediaFile, inputs
 	video := inputs[0]
 	found, err := e.prober.keyframeWindowAtOrBefore(ctx, video.Target, video.Headers, video.Proxy, pos, keyframeSearchWindow)
 	if err != nil {
-		log.Printf("keyframe alignment for file %d at %.1fs: %v", file.ID, pos, err)
+		log.Printf("keyframe alignment for file %d at %.1fs: %s",
+			file.ID, pos, safeMediaLogError(err))
 		e.rememberAlignment(cacheKey, PackWindow{}, false)
 		return PackWindow{}, false
 	}

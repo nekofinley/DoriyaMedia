@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaybackTransportKind",
+  "description": "Closed S3 transport set. direct-dash and local-relay are intentionally excluded from this contract revision.",
+  "type": "string",
+  "enum": [
+    "direct-http",
+    "server-proxy",
+    "server-hls"
+  ]
+}

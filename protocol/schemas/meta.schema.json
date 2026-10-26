@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientMetadata",
+  "description": "Response body for GET /api/v1/meta. Feature flags are runtime capabilities and are all disabled by default.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "server_version",
+    "minimum_client_versions",
+    "features"
+  ],
+  "properties": {
+    "contract_version": {
+      "const": 1
+    },
+    "server_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]*$"
+    },
+    "minimum_client_versions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "windows",
+        "android"
+      ],
+      "properties": {
+        "windows": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]*$"
+        },
+        "android": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]*$"
+        }
+      }
+    },
+    "features": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client_v1_enabled",
+        "device_auth_enabled",
+        "playback_ticket_enabled",
+        "direct_http_enabled",
+        "server_proxy_v1_enabled",
+        "server_hls_v1_enabled",
+        "direct_dash_enabled",
+        "local_relay_enabled",
+        "native_player_enabled",
+        "libmpv_fallback_enabled"
+      ],
+      "properties": {
+        "client_v1_enabled": {
+          "type": "boolean"
+        },
+        "device_auth_enabled": {
+          "type": "boolean"
+        },
+        "playback_ticket_enabled": {
+          "type": "boolean"
+        },
+        "direct_http_enabled": {
+          "type": "boolean"
+        },
+        "server_proxy_v1_enabled": {
+          "type": "boolean"
+        },
+        "server_hls_v1_enabled": {
+          "type": "boolean"
+        },
+        "direct_dash_enabled": {
+          "type": "boolean"
+        },
+        "local_relay_enabled": {
+          "type": "boolean"
+        },
+        "native_player_enabled": {
+          "type": "boolean"
+        },
+        "libmpv_fallback_enabled": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

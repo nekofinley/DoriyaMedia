@@ -21,6 +21,9 @@ type Engine struct {
 	Cfg    *config.Config
 	prober *Prober
 	ffmpeg *FFMpeg
+	// egressTrust is the explicit administrator-configured private-origin
+	// allowlist shared by probes, segments and packaging sessions.
+	egressTrust *egressTrust
 
 	subMu    sync.Mutex
 	subCache map[string][]byte
@@ -79,7 +82,16 @@ type resolveEntry struct {
 }
 
 func NewEngine(store *db.Store, cfg *config.Config) *Engine {
+	trust := newEgressTrust()
+	if store != nil {
+		if sources, err := store.Sources(); err == nil {
+			for i := range sources {
+				trust.addSource(&sources[i])
+			}
+		}
+	}
 	prober := NewProber(cfg.FFProbe)
+	prober.egress = trust
 	if cfg.Playback.ProbeSizeMB > 0 {
 		prober.ProbeSizeMB = cfg.Playback.ProbeSizeMB
 	}
@@ -90,7 +102,8 @@ func NewEngine(store *db.Store, cfg *config.Config) *Engine {
 		Store:        store,
 		Cfg:          cfg,
 		prober:       prober,
-		ffmpeg:       &FFMpeg{Path: cfg.FFmpeg},
+		ffmpeg:       &FFMpeg{Path: cfg.FFmpeg, egress: trust},
+		egressTrust:  trust,
 		subCache:     map[string][]byte{},
 		resolveCache: map[string]resolveEntry{},
 		resolveLocks: map[string]*sync.Mutex{},
@@ -113,7 +126,11 @@ func NewEngine(store *db.Store, cfg *config.Config) *Engine {
 
 // SetBins updates tool paths after config changes (hot reload).
 func (e *Engine) SetBins(ffmpeg, ffprobe string) {
+	if e.egressTrust == nil {
+		e.egressTrust = newEgressTrust()
+	}
 	prober := NewProber(ffprobe)
+	prober.egress = e.egressTrust
 	if e.Cfg != nil {
 		if e.Cfg.Playback.ProbeSizeMB > 0 {
 			prober.ProbeSizeMB = e.Cfg.Playback.ProbeSizeMB
@@ -123,7 +140,7 @@ func (e *Engine) SetBins(ffmpeg, ffprobe string) {
 		}
 	}
 	e.prober = prober
-	e.ffmpeg = &FFMpeg{Path: ffmpeg}
+	e.ffmpeg = &FFMpeg{Path: ffmpeg, egress: e.egressTrust}
 }
 
 // resolveTTL is how long one minted source link is reused before a new one is
@@ -163,10 +180,12 @@ func (e *Engine) resolveTarget(ctx context.Context, file *models.MediaFile, drv 
 		switch {
 		case rejected == "" && time.Since(ent.at) < resolveTTL:
 			e.resolveMu.Unlock()
+			e.leaseResolvedTarget(file, drv, ent.target)
 			return ent.target, ent.headers, nil
 		case rejected != "" && ent.target != rejected:
 			// Somebody already refreshed this link while we waited for the lock.
 			e.resolveMu.Unlock()
+			e.leaseResolvedTarget(file, drv, ent.target)
 			return ent.target, ent.headers, nil
 		}
 		delete(e.resolveCache, key)
@@ -190,7 +209,22 @@ func (e *Engine) resolveTarget(ctx context.Context, file *models.MediaFile, drv 
 	}
 	e.resolveCache[key] = resolveEntry{target: target, headers: headers, at: time.Now()}
 	e.resolveMu.Unlock()
+	e.leaseResolvedTarget(file, drv, target)
 	return target, headers, nil
+}
+
+func (e *Engine) leaseResolvedTarget(
+	file *models.MediaFile,
+	drv source.Driver,
+	target string,
+) {
+	if e == nil || e.egressTrust == nil {
+		return
+	}
+	if drv == nil && file != nil {
+		drv, _ = e.DriverFor(file)
+	}
+	e.egressTrust.leaseDriverTarget(drv, target)
 }
 
 // resolveLock returns the mutex guarding one file's link resolution.
@@ -217,7 +251,11 @@ func (e *Engine) DriverFor(file *models.MediaFile) (source.Driver, error) {
 	if err != nil {
 		return nil, err
 	}
-	return source.NewDriver(src)
+	drv, err := source.NewDriver(src)
+	if err == nil {
+		e.egressTrust.addDriver(drv)
+	}
+	return drv, err
 }
 
 func isHTTPPath(p string) bool {
@@ -287,6 +325,8 @@ func (c *countWriter) Write(p []byte) (int, error) {
 func (e *Engine) Segment(ctx context.Context, file *models.MediaFile, drv source.Driver,
 	start, length float64, videoMode, audioMode string, audioOrdinal, videoIndex, transcodeHeight int, out io.Writer) (n int64, err error) {
 
+	e.egressTrust.addDriver(drv)
+	ctx = withEgressTrust(ctx, egressTrustForDriver(drv))
 	e.noteSegmentStart(file.ID)
 	began := time.Now()
 	defer func() { e.noteSegmentDone(file.ID, length, time.Since(began), n, err) }()
@@ -318,8 +358,8 @@ func (e *Engine) Segment(ctx context.Context, file *models.MediaFile, drv source
 	if rerr != nil || sameInputs(retryInputs, inputs) {
 		return 0, runErr
 	}
-	log.Printf("hls segment %d @%.0fs: source refused the link, retrying with a fresh one: %v",
-		file.ID, start, runErr)
+	log.Printf("hls segment %d @%.0fs: source refused the link (%s), retrying with a fresh one",
+		file.ID, start, safeMediaLogError(runErr))
 
 	buf.Reset()
 	cw2 := &countWriter{w: buf}

@@ -1,0 +1,8 @@
+{
+  "ticket_id": "pt_example_revoked",
+  "state": "revoked",
+  "contract_version": 1,
+  "expires_at": "2026-10-26T12:05:00Z",
+  "remaining_transports": [],
+  "message": "This playback ticket is no longer authorized."
+}

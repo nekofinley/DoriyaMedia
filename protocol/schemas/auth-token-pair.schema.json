@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeviceTokenPair",
+  "description": "Native-client access and rotating refresh token pair. The server stores only hashes and returns plaintext credentials solely in this response.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "access_token",
+    "token_type",
+    "expires_in",
+    "refresh_token",
+    "refresh_expires_in",
+    "device",
+    "user"
+  ],
+  "properties": {
+    "access_token": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9._~-]+$"
+    },
+    "token_type": {
+      "const": "Bearer"
+    },
+    "expires_in": {
+      "const": 900
+    },
+    "refresh_token": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9._~-]+$"
+    },
+    "refresh_expires_in": {
+      "type": "integer",
+      "description": "Remaining seconds in the refresh token's sliding 30-day window. The value is 2592000 or less and may be truncated by the token family's absolute 180-day deadline.",
+      "minimum": 0,
+      "maximum": 2592000
+    },
+    "device": {
+      "$ref": "device.schema.json"
+    },
+    "user": {
+      "$ref": "auth-user.schema.json"
+    }
+  }
+}

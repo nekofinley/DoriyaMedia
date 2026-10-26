@@ -1,0 +1,20 @@
+{
+  "ticket_id": "pt_example_consuming_status",
+  "state": "consuming",
+  "contract_version": 1,
+  "expires_at": "2026-10-26T12:05:00Z",
+  "media": {
+    "container": "mp4",
+    "duration": 1440.0,
+    "video": {
+      "codec": "h264",
+      "width": 1920,
+      "height": 1080,
+      "bit_depth": 8
+    },
+    "audio": []
+  },
+  "remaining_transports": [
+    "server-hls"
+  ]
+}

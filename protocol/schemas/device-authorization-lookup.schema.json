@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeviceAuthorizationLookup",
+  "description": "Browser-session response used by the approval page. It exposes only the information a signed-in user needs to decide whether to approve the device.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "authorization_id",
+    "device_name",
+    "platform",
+    "client_version",
+    "state",
+    "expires_at"
+  ],
+  "properties": {
+    "authorization_id": {
+      "type": "string",
+      "pattern": "^dva_[A-Za-z0-9_-]{22,96}$"
+    },
+    "device_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[^\\r\\n\\t]+$"
+    },
+    "platform": {
+      "$ref": "device-platform.schema.json"
+    },
+    "client_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]*$"
+    },
+    "state": {
+      "$ref": "device-authorization-state.schema.json"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "csrf_token": {
+      "type": "string",
+      "description": "One-time approval capability returned only while the authorization is pending. Every successful pending lookup rotates this value and invalidates the previous token. It must be sent to the decision endpoint in X-CSRF-Token.",
+      "minLength": 32,
+      "maxLength": 512,
+      "pattern": "^csrf_[A-Za-z0-9_-]+$"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "pending"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "csrf_token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "csrf_token"
+        ]
+      },
+      "else": {
+        "properties": {
+          "csrf_token": false
+        }
+      }
+    }
+  ]
+}

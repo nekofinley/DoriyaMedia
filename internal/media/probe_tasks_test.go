@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -406,7 +407,11 @@ func TestPreProbeSkipsProbedFilesAndCountsProgress(t *testing.T) {
 		return videoProbe("h264"), nil
 	})
 	e.Cfg.Playback.PreProbeConcurrency = 2
-	srcID := addLocalSource(t, e, t.TempDir())
+	root := t.TempDir()
+	srcID := addLocalSource(t, e, root)
+	if err := os.WriteFile(filepath.Join(root, "b.mkv"), []byte("media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	cached := testFile()
 	cached.ID, cached.SourceID, cached.Path = 1, srcID, "/a.mp4"

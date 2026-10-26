@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "rate_limited",
+    "message": "Too many requests. Try again later.",
+    "details": {
+      "retry_after_seconds": 30,
+      "scope": "playback_ticket"
+    }
+  }
+}

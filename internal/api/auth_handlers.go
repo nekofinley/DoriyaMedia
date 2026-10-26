@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 
 	"doriyamedia/internal/auth"
 	"doriyamedia/internal/config"
+	"doriyamedia/internal/db"
 	"doriyamedia/internal/models"
 )
 
@@ -103,7 +105,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// An unknown name and a wrong password are answered identically, and both
 	// count against the limiter, so the form cannot be used to discover which
 	// accounts exist.
-	u, err := s.Store.UserByName(strings.TrimSpace(req.Name))
+	u, authEpoch, err := s.Store.UserAuthStateByName(strings.TrimSpace(req.Name))
 	if err != nil || !auth.Verify(req.Password, u.PassHash, u.Salt) {
 		if wait := s.loginLimiter.Hit(key); wait > 0 {
 			fail(w, 429, fmt.Sprintf("密码错误次数过多,请 %d 秒后再试", wait))
@@ -130,15 +132,30 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.loginLimiter.Reset(key)
-	s.startSession(w, u)
+	if err := s.startSessionAtAuthEpoch(w, u, authEpoch); err != nil {
+		if errors.Is(err, db.ErrAuthStateChanged) {
+			fail(w, 401, "用户名或密码错误")
+			return
+		}
+		fail(w, 500, err.Error())
+	}
 }
 
 func (s *Server) startSession(w http.ResponseWriter, u *models.User) {
+	if err := s.startSessionAtAuthEpoch(w, u, 0); err != nil {
+		fail(w, 500, err.Error())
+	}
+}
+
+func (s *Server) startSessionAtAuthEpoch(w http.ResponseWriter, u *models.User, expectedEpoch int64) error {
 	token := auth.NewToken()
 	exp := time.Now().Add(sessionTTL)
-	if err := s.Store.CreateSession(token, u.ID, exp); err != nil {
-		fail(w, 500, err.Error())
-		return
+	if expectedEpoch > 0 {
+		if err := s.Store.CreateSessionIfAuthCurrent(token, u.ID, expectedEpoch, exp); err != nil {
+			return err
+		}
+	} else if err := s.Store.CreateSession(token, u.ID, exp); err != nil {
+		return err
 	}
 	// Every session starts here — setup, signup and sign-in alike — so this is
 	// the one place that has to record the visit. Registering and being signed
@@ -154,6 +171,7 @@ func (s *Server) startSession(w http.ResponseWriter, u *models.User) {
 		SameSite: http.SameSiteLaxMode, Expires: exp,
 	})
 	writeJSON(w, 200, map[string]any{"token": token, "user": u})
+	return nil
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, user *models.User) {
@@ -218,13 +236,13 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request, user *m
 
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *models.User) {
 	var req struct {
-		Port            *int            `json:"port"`
-		FFmpeg          *string         `json:"ffmpeg"`
-		FFProbe         *string         `json:"ffprobe"`
-		ScanConcurrency *int            `json:"scan_concurrency"`
-		DevWebDir       *string         `json:"dev_web_dir"`
-		TMDB            *configTMDB     `json:"tmdb"`
-		BGM             *configBGM      `json:"bgm"`
+		Port            *int             `json:"port"`
+		FFmpeg          *string          `json:"ffmpeg"`
+		FFProbe         *string          `json:"ffprobe"`
+		ScanConcurrency *int             `json:"scan_concurrency"`
+		DevWebDir       *string          `json:"dev_web_dir"`
+		TMDB            *configTMDB      `json:"tmdb"`
+		BGM             *configBGM       `json:"bgm"`
 		Playback        *configPlayback  `json:"playback"`
 		Users           *configUsers     `json:"users"`
 		SMTP            *configSMTP      `json:"smtp"`
