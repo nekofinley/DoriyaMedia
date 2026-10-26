@@ -538,10 +538,11 @@ func bracketShowTitle(groups [][]string, epIdx int) string {
 		if _, ok := bracketEpisode(val); ok {
 			continue
 		}
-		// A group is never the show, wherever it sits: "[VCB-Studio] [Ma10p_1080p]
-		// [01]" has no title at all, and calling the group one would file every
-		// release of that group under a single show.
-		if looksLikeGroup(val) {
+		// A release group opens the run, so only the first bracket can be one. A
+		// later bracket is a name: reading "[KTXP][Kono Subarashii Sekai ni
+		// Shukufuku o！…]" as a group because the title contains "sub" is how a
+		// show ended up with no title at all.
+		if i == 0 && looksLikeGroup(val) {
 			continue
 		}
 		if t, n := titleCandidates(val); t != "" && n > 0 && !techOnlyTitle(t) {
@@ -577,16 +578,25 @@ func bracketShowTitle(groups [][]string, epIdx int) string {
 func looksLikeGroup(s string) bool {
 	low := strings.ToLower(s)
 	for _, tok := range []string{"字幕", "汉化", "漢化", "工作室", "制作组", "製作組", "压制", "壓制", "搬运", "搬運",
-		"屋", "社", "组", "組", "fans", "raws", "sub", "house"} {
+		"屋", "社", "组", "組"} {
 		if strings.Contains(low, tok) {
 			return true
 		}
+	}
+	if reGroupWord.MatchString(low) {
+		return true
 	}
 	if !strings.Contains(s, " ") && len([]rune(s)) <= 12 && hasLatin(s) {
 		return true
 	}
 	return false
 }
+
+// reGroupWord matches the latin half of a release-group name as a whole word:
+// "Sakurato.sub" and "[Raws]" are groups, while a show whose name merely happens
+// to contain those letters is not — "Kono Subarashii Sekai ni Shukufuku o！"
+// contains "sub" and is still a title.
+var reGroupWord = regexp.MustCompile(`(?i)(?:^|[\s._\-\[\]()（）])(?:fansubs?|raws?|subs?|house)(?:$|[\s._\-\[\]()（）])`)
 
 func hasLatin(s string) bool {
 	for _, r := range s {
