@@ -496,6 +496,12 @@ func (sc *Scanner) organize(lib *models.Library, files []fileRec, prog *models.S
 		log.Printf("organize: ping before organize failed: %v", err)
 	}
 
+	// What this library refuses to import: release furniture, and whatever the
+	// user added to the list. Dropping the files here — before anything is
+	// planned — is what keeps them out of the library *and* lets cleanup take
+	// back a file whose keyword was added after it was imported.
+	files = dropExcluded(files, excludeMatcher(EffectiveExcludes(lib, sc.Cfg)))
+
 	switch lib.Type {
 	case "series":
 		err := sc.organizeSeries(lib, files, prog, current, walked, partial, listings)
@@ -594,6 +600,88 @@ func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *mo
 		prog.AddEvent("show", fmt.Sprintf("%s%s", g.Title, yearSuffix(g.Year)))
 	}
 	return sc.cleanup(lib, files, current, walked, partial, listings)
+}
+
+// filmPlan is a film a series library holds: a file with no episode number whose
+// own folder ("[show][S0]") or own name says what it is.
+type filmPlan struct {
+	fr    fileRec
+	title string
+	year  int
+}
+
+// planFilm names one film. The folder wins when it names something — a film kept
+// in "[show][S0]" belongs to that show, so the show is a better search key than
+// the release's own file name — and the file name is the fallback for a movie
+// sitting loose at the root, the way organizeMovies reads a movie library.
+func planFilm(fr fileRec, p Parsed) (filmPlan, bool) {
+	title := ""
+	year := 0
+	if fr.Dir != "" && fr.Dir != fr.Root {
+		// A folder in the "[show][S0]" convention names the show in its first
+		// bracket; the later brackets are the season, never the film's name.
+		if t, _, _, _ := ParseShowDirName(baseName(fr.Dir)); t != "" {
+			title = t
+		} else if dp := ParseName(baseName(fr.Dir)); dp.Title != "" {
+			title, year = dp.Title, dp.Year
+		}
+	}
+	if title == "" {
+		title = orDefault(stripTitleYear(p.Title), displayBaseName(fr.Path))
+		year = p.Year
+	}
+	title = strings.TrimSpace(title)
+	if title == "" || SkipEntry(title) {
+		return filmPlan{}, false
+	}
+	return filmPlan{fr: fr, title: title, year: year}, true
+}
+
+// storeFilms writes the films a series library holds as movie items of that
+// library. A film is keyed by name and year, so a rescan lands on the same row
+// and two cuts of one film are two files on one card.
+func (sc *Scanner) storeFilms(lib *models.Library, films []filmPlan, prog *models.ScanProgress) error {
+	if len(films) == 0 {
+		return nil
+	}
+	existing, _, err := sc.Store.ItemsByLibrary(lib.ID, "movie", "", "", false, 0, 1000000)
+	if err != nil {
+		log.Printf("organize: load films of library %d failed: %v", lib.ID, err)
+		return err
+	}
+	byKey := map[string]int64{}
+	for _, it := range existing {
+		byKey[NormalizeKey(fmt.Sprintf("%s|%d", it.Name, it.Year))] = it.ID
+	}
+	for _, f := range films {
+		key := NormalizeKey(fmt.Sprintf("%s|%d", f.title, f.year))
+		id, ok := byKey[key]
+		if !ok {
+			it := &models.Item{
+				LibraryID: lib.ID, Type: "movie", Name: f.title, Year: f.year, SourceType: f.fr.SrcType,
+			}
+			if err := sc.Store.InsertItem(it); err != nil {
+				log.Printf("organize: insert film %q failed: %v", f.title, err)
+				return err
+			}
+			id = it.ID
+			byKey[key] = id
+		}
+		if _, err := sc.Store.UpsertFile(&models.MediaFile{
+			ItemID: id, SourceID: f.fr.SourceID, Path: f.fr.Path, Size: f.fr.Size, MTime: f.fr.MTime,
+		}); err != nil {
+			log.Printf("organize: UpsertFile film %q failed: %v", f.title, err)
+			return err
+		}
+		if prog != nil {
+			prog.Update(func(st *models.ScanState) {
+				st.Done++
+				st.Current = f.title
+			})
+			prog.AddEvent("movie", f.title)
+		}
+	}
+	return nil
 }
 
 // yearSuffix renders " (2019)" for the feed, empty when the year is unknown.
@@ -870,12 +958,20 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 	}
 	numbered := make([]planned, 0, len(files))
 	named := make([]planned, 0, len(files))
+	films := make([]filmPlan, 0, 8)
 	for _, fr := range files {
 		p := ParseName(baseName(fr.Path))
-		// extras / unparseable files (NCOP, NCED, menus, previews…) have no
-		// episode number — keep them out of the library (still playable via
-		// the file browser)
+		// A file with no episode number is not an episode of this show: by the
+		// collection's own convention it is a film — the "[show][S0]" folder, or
+		// a standalone movie sitting beside the shows. It is filed as a movie
+		// item below. Dropping it (the old behaviour) lost every theatre film.
+		//
+		// Release furniture (NCOP/NCED, menus, previews) never reaches this loop:
+		// SkipEntry drops those files during the walk.
 		if p.Episode == 0 {
+			if f, ok := planFilm(fr, p); ok {
+				films = append(films, f)
+			}
 			continue
 		}
 		// Show title: prefer the show DIRECTORY (the season-dir's parent), so
@@ -1086,6 +1182,14 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 		prog.AddEvent("episode", fmt.Sprintf("%s S%02dE%02d", showTitle, season, ep))
 
 	}
+
+	// The films this library holds beside its shows. They are ordinary movie
+	// items in the same library: the scraper treats them like any other film, and
+	// every page that lists a library's films picks them up by type.
+	if err := sc.storeFilms(lib, films, prog); err != nil {
+		return err
+	}
+
 	if err := sc.cleanup(lib, files, current, walked, partial, listings); err != nil {
 		log.Printf("organize: cleanup failed (done=%d): %v", progDone(prog), err)
 		return err

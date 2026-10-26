@@ -276,18 +276,28 @@ func (m *Manager) enrichMovies(ctx context.Context, drv source.Driver, lib *mode
 func (m *Manager) enrichSeries(ctx context.Context, drv source.Driver, lib *models.Library, say func(done, total int, msg string)) {
 	shows, _, _ := m.Store.ItemsByLibrary(lib.ID, "show", "", "", false, 0, 100000)
 	seasons, _, _ := m.Store.ItemsByLibrary(lib.ID, "season", "", "", false, 0, 200000)
+	// A series library also holds the show's films ("[show][S0]", a movie sitting
+	// beside the shows). They are movie items of this library and are scraped the
+	// way any other film is: a film is a film, whatever the library is called.
+	films, _, _ := m.Store.ItemsByLibrary(lib.ID, "movie", "", "", false, 0, 100000)
 	// count all episodes for the progress denominator
 	epTotal := 0
 	if all, _, err := m.Store.ItemsByLibrary(lib.ID, "episode", "", "", false, 0, 500000); err == nil {
 		epTotal = len(all)
 	}
-	total := len(shows) + epTotal
+	total := len(shows) + epTotal + len(films)
 	done := 0
 	for i := range shows {
 		say(done, total, "识别剧集 "+shows[i].Name)
 		m.enrichShow(ctx, drv, lib, &shows[i])
 		done++
 		say(done, total, "识别剧集 "+shows[i].Name)
+	}
+	for i := range films {
+		say(done, total, "识别电影 "+films[i].Name)
+		m.enrichMovie(ctx, drv, lib, &films[i])
+		done++
+		say(done, total, "识别电影 "+films[i].Name)
 	}
 	// episodes after shows are identified
 	showByID := map[int64]models.Item{}

@@ -324,10 +324,64 @@ func (p *providersField) UnmarshalJSON(b []byte) error {
 	}
 }
 
+// excludesField accepts the exclusion list either as a json array or as the
+// newline-separated text a form sends, and stores it as json — the column holds
+// json, and a caller should not have to know that.
+type excludesField string
+
+func (e *excludesField) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	switch {
+	case s == "" || s == "null":
+		*e = ""
+		return nil
+	case strings.HasPrefix(s, `"`):
+		var str string
+		if err := json.Unmarshal(b, &str); err != nil {
+			return err
+		}
+		*e = excludesField(encodeKeywords(splitKeywords(str)))
+		return nil
+	default:
+		var arr []string
+		if err := json.Unmarshal(b, &arr); err != nil {
+			return err
+		}
+		*e = excludesField(encodeKeywords(arr))
+		return nil
+	}
+}
+
+// splitKeywords reads the list the way people type it: one per line, or comma
+// separated.
+func splitKeywords(text string) []string {
+	return strings.FieldsFunc(text, func(r rune) bool { return r == '\n' || r == ',' || r == '，' })
+}
+
+// encodeKeywords normalises the list: trimmed, empty entries dropped, and always
+// valid json — including for an empty list, which is how a library opts out.
+func encodeKeywords(list []string) string {
+	raw, _ := json.Marshal(cleanKeywords(list))
+	return string(raw)
+}
+
+// cleanKeywords trims a list and drops what is not a keyword, so a stray blank
+// line in the settings form does not become an exclusion that matches everything.
+func cleanKeywords(list []string) []string {
+	out := make([]string, 0, len(list))
+	for _, k := range list {
+		if k = strings.TrimSpace(k); k != "" {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request, user *models.User) {
 	var req struct {
 		models.Library
 		Providers providersField `json:"providers"`
+		Excludes  excludesField  `json:"excludes"`
 	}
 	if err := readBody(r, &req); err != nil || req.Name == "" {
 		fail(w, 400, "名称不能为空")
@@ -343,6 +397,12 @@ func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request, use
 	}
 	if lib.Providers == "" {
 		lib.Providers = `["nfo","bgm","tmdb"]`
+	}
+	// A new library follows the global exclusion list unless it was given one.
+	lib.Excludes = string(req.Excludes)
+	if lib.ExcludeMode != "custom" {
+		lib.ExcludeMode = "inherit"
+		lib.Excludes = ""
 	}
 	// The library's own source_id/path name its first place: the column is NOT
 	// NULL with a foreign key, and everything that predates multi-source reads
@@ -381,6 +441,7 @@ func (s *Server) handleUpdateLibrary(w http.ResponseWriter, r *http.Request, use
 	var req struct {
 		models.Library
 		Providers providersField `json:"providers"`
+		Excludes  excludesField  `json:"excludes"`
 	}
 	if err := readBody(r, &req); err != nil {
 		fail(w, 400, err.Error())
@@ -397,6 +458,22 @@ func (s *Server) handleUpdateLibrary(w http.ResponseWriter, r *http.Request, use
 	}
 	if p := string(req.Providers); p != "" {
 		lib.Providers = p
+	}
+	// The exclusion list only changes when the request carries the mode: a client
+	// that never heard of the field must not silently reset a tuned library. An
+	// empty list is a real answer ("this library excludes nothing"), so it is
+	// written, not ignored.
+	if req.ExcludeMode != "" {
+		lib.ExcludeMode = req.ExcludeMode
+	}
+	if lib.ExcludeMode == "custom" {
+		lib.Excludes = string(req.Excludes)
+		if strings.TrimSpace(lib.Excludes) == "" {
+			lib.Excludes = "[]"
+		}
+	} else {
+		lib.ExcludeMode = "inherit"
+		lib.Excludes = "[]"
 	}
 	if err := s.Store.UpdateLibrary(lib); err != nil {
 		fail(w, 500, err.Error())

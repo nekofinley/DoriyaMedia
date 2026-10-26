@@ -137,11 +137,11 @@ type BGMTV struct {
 }
 
 type Playback struct {
-	ForceMode       string  `json:"force_mode"` // auto | direct | proxy | remux
-	SegmentSeconds  float64 `json:"segment_seconds"`
+	ForceMode      string  `json:"force_mode"` // auto | direct | proxy | remux
+	SegmentSeconds float64 `json:"segment_seconds"`
 	// TranscodeHeight now only bounds a burned-in subtitle's output: the one
 	// remaining path that re-encodes video. Ordinary playback never re-encodes.
-	TranscodeHeight int     `json:"transcode_height"`
+	TranscodeHeight int `json:"transcode_height"`
 
 	// ProbeSizeMB / ProbeAnalyzeSec bound how much of the source ffprobe pulls
 	// before playback can be decided. The historical fixed 50MB/20s values cost
@@ -179,7 +179,6 @@ type Playback struct {
 	// budget, and nothing partial survives a restart. 0 turns the cache off, and
 	// then a session's output is deleted as soon as it ends.
 	HLSCacheMB int `json:"hls_cache_mb"`
-
 }
 
 type Config struct {
@@ -196,6 +195,17 @@ type Config struct {
 	Turnstile       Turnstile `json:"turnstile"`
 	ScanConcurrency int       `json:"scan_concurrency"`
 	DevWebDir       string    `json:"dev_web_dir"`
+	// ExcludeKeywords is what a scan refuses to import: release furniture
+	// (NCED, menus, previews…) and anything else the user wants kept out of the
+	// library. A library that keeps its own list replaces this one.
+	ExcludeKeywords []string `json:"exclude_keywords"`
+}
+
+// DefaultExcludeKeywords is the list a fresh install starts with. It is written
+// into the config file rather than applied on load: a user who deletes an entry
+// has deleted it, and a user who wants NCED back must be able to remove it.
+func DefaultExcludeKeywords() []string {
+	return []string{"ncop", "nced", "nc-op", "nc-ed", "creditless", "menu", "preview", "trailer", "sample", "pv", "cm", "sp"}
 }
 
 // RegistrationAllowed reports whether visitors may create their own account,
@@ -247,6 +257,7 @@ func Defaults() *Config {
 			Proxy:    DefaultTMDBProxy,
 		},
 		ScanConcurrency: 4,
+		ExcludeKeywords: DefaultExcludeKeywords(),
 	}
 }
 

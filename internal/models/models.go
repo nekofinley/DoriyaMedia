@@ -110,12 +110,19 @@ type SourceConfig struct {
 }
 
 type Library struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	Type      string    `json:"type"` // movie | series
-	SourceID  int64     `json:"source_id"`
-	Path      string    `json:"path"`
-	Providers string    `json:"providers"` // json array e.g. ["nfo","tmdb"]
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	Type      string `json:"type"` // movie | series
+	SourceID  int64  `json:"source_id"`
+	Path      string `json:"path"`
+	Providers string `json:"providers"` // json array e.g. ["nfo","tmdb"]
+	// ExcludeMode decides which exclusion list a scan uses for this library:
+	// "inherit" (or empty) follows the global setting, "custom" uses Excludes —
+	// including an empty Excludes, which is how a library opts out entirely.
+	ExcludeMode string `json:"exclude_mode"`
+	// Excludes is a json array of keywords, only read when ExcludeMode is
+	// "custom". A file whose name contains one is not imported.
+	Excludes  string    `json:"excludes"`
 	CreatedAt time.Time `json:"created_at"`
 	// Sources is every place this library scans. SourceID/Path above stay in
 	// step with the first entry, so anything that only knows about one source

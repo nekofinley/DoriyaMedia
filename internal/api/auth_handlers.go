@@ -205,6 +205,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request, user *m
 		"ffmpeg":           s.Cfg.FFmpeg,
 		"ffprobe":          s.Cfg.FFProbe,
 		"scan_concurrency": s.Cfg.ScanConcurrency,
+		"exclude_keywords": s.Cfg.ExcludeKeywords,
 		"dev_web_dir":      s.Cfg.DevWebDir,
 		"tmdb":             s.Cfg.TMDB,
 		"bgm":              s.Cfg.BGM,
@@ -218,13 +219,14 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request, user *m
 
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *models.User) {
 	var req struct {
-		Port            *int            `json:"port"`
-		FFmpeg          *string         `json:"ffmpeg"`
-		FFProbe         *string         `json:"ffprobe"`
-		ScanConcurrency *int            `json:"scan_concurrency"`
-		DevWebDir       *string         `json:"dev_web_dir"`
-		TMDB            *configTMDB     `json:"tmdb"`
-		BGM             *configBGM      `json:"bgm"`
+		Port            *int             `json:"port"`
+		FFmpeg          *string          `json:"ffmpeg"`
+		FFProbe         *string          `json:"ffprobe"`
+		ScanConcurrency *int             `json:"scan_concurrency"`
+		ExcludeKeywords *[]string        `json:"exclude_keywords"`
+		DevWebDir       *string          `json:"dev_web_dir"`
+		TMDB            *configTMDB      `json:"tmdb"`
+		BGM             *configBGM       `json:"bgm"`
 		Playback        *configPlayback  `json:"playback"`
 		Users           *configUsers     `json:"users"`
 		SMTP            *configSMTP      `json:"smtp"`
@@ -245,6 +247,11 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 	}
 	if req.ScanConcurrency != nil && *req.ScanConcurrency > 0 {
 		s.Cfg.ScanConcurrency = *req.ScanConcurrency
+	}
+	// A list is saved as sent, including an empty one: the defaults are written into
+	// the config file so that deleting an entry is how a user turns it off.
+	if req.ExcludeKeywords != nil {
+		s.Cfg.ExcludeKeywords = cleanKeywords(*req.ExcludeKeywords)
 	}
 	if req.DevWebDir != nil {
 		s.Cfg.DevWebDir = *req.DevWebDir

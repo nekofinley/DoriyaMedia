@@ -5,6 +5,7 @@ import { api, fmtDate, fmtRelative } from '../api.js'
 import { me } from '../auth.js'
 import AppIcon from '../components/AppIcon.vue'
 import EmptyState from '../components/EmptyState.vue'
+import ExcludeKeywords from '../components/ExcludeKeywords.vue'
 import LiveProgress from '../components/LiveProgress.vue'
 import { toast } from '../toast.js'
 import { site, setToolbar, panelTab, publishedLabel, dirty } from '../site/store.js'
@@ -117,7 +118,22 @@ const libForm = ref({
   // and a 番剧 library is often a cloud source plus a folder on this machine.
   sources: [{ source_id: '', path: '/' }],
   providers: ['nfo', 'bgm', 'tmdb'],
+  // What this library refuses to import. A new library follows the global list
+  // until someone gives it its own.
+  excludeMode: 'inherit',
+  excludes: [],
 })
+
+// A library's exclusion list is stored as json text; a hand-written row may be
+// plain text instead, and either way the form needs a list.
+function parseKeywords(raw) {
+  if (!raw) return []
+  try {
+    const list = JSON.parse(raw)
+    if (Array.isArray(list)) return list.filter((w) => String(w).trim())
+  } catch {}
+  return String(raw).split(/[\n,，]/).map((w) => w.trim()).filter(Boolean)
+}
 
 function addLibSource() {
   const first = libForm.value.sources[0]
@@ -179,7 +195,11 @@ function startEdit(lib) {
   const places = (lib.sources && lib.sources.length)
     ? lib.sources.map((s) => ({ source_id: s.source_id, path: s.path }))
     : [{ source_id: lib.source_id, path: lib.path }]
-  editForm.value = { name: lib.name, type: lib.type, sources: places, providers: provs }
+  editForm.value = {
+    name: lib.name, type: lib.type, sources: places, providers: provs,
+    excludeMode: lib.exclude_mode === 'custom' ? 'custom' : 'inherit',
+    excludes: parseKeywords(lib.excludes),
+  }
 }
 function toggleProvider(p) {
   const a = editForm.value.providers
@@ -205,6 +225,8 @@ async function saveEdit(id) {
       source_id: picked[0].source_id, path: picked[0].path,
       sources: picked,
       providers: JSON.stringify(f.providers.length ? f.providers : ['nfo', 'bgm', 'tmdb']),
+      exclude_mode: f.excludeMode === 'custom' ? 'custom' : 'inherit',
+      excludes: JSON.stringify(f.excludes || []),
     })
     editing.value = null
     await loadAll()
@@ -480,11 +502,15 @@ async function addLibrary() {
       source_id: picked[0].source_id, path: picked[0].path,
       sources: picked,
       providers: JSON.stringify(f.providers.length ? f.providers : ['nfo', 'bgm', 'tmdb']),
+      exclude_mode: f.excludeMode === 'custom' ? 'custom' : 'inherit',
+      excludes: JSON.stringify(f.excludes || []),
     })
     libForm.value = {
       name: '', type: 'movie',
       sources: [{ source_id: f.sources[0]?.source_id || '', path: '/' }],
       providers: ['nfo', 'bgm', 'tmdb'],
+      excludeMode: 'inherit',
+      excludes: [],
     }
     addingLibrary.value = false
     await loadAll()
@@ -568,6 +594,9 @@ async function saveConfig() {
       ffmpeg: cfg.value.ffmpeg,
       ffprobe: cfg.value.ffprobe,
       scan_concurrency: Number(cfg.value.scan_concurrency),
+      // Sent even when empty: an empty list is how the user turns an exclusion
+      // off, and the server writes exactly what it is given.
+      exclude_keywords: (cfg.value.exclude_keywords || []).map((w) => String(w).trim()).filter(Boolean),
       tmdb: cfg.value.tmdb,
       bgm: cfg.value.bgm,
       playback: cfg.value.playback,
@@ -1043,6 +1072,14 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                       >{{ providerLabels[p] }}</button>
                     </div>
                   </div>
+                  <div class="field">
+                    <label>扫描排除</label>
+                    <ExcludeKeywords
+                      v-model="libForm.excludes"
+                      v-model:mode="libForm.excludeMode"
+                      :inherited="cfg?.exclude_keywords || []"
+                    />
+                  </div>
                   <button class="btn primary" :disabled="!libForm.sources.some(s => s.source_id) || !libForm.name" @click="addLibrary">
                     <AppIcon name="check" :size="15" /> 创建媒体库
                   </button>
@@ -1090,6 +1127,14 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                       {{ providerLabels[p] }}
                     </button>
                   </div>
+                </div>
+                <div class="field">
+                  <label>扫描排除</label>
+                  <ExcludeKeywords
+                    v-model="editForm.excludes"
+                    v-model:mode="editForm.excludeMode"
+                    :inherited="cfg?.exclude_keywords || []"
+                  />
                 </div>
                 <div class="btn-row">
                   <button class="btn primary" @click="saveEdit(lib.id)"><AppIcon name="check" :size="15" /> 保存</button>
@@ -1813,6 +1858,14 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                 <label>扫描并发数</label>
                 <input v-model="cfg.scan_concurrency" type="number" min="1" max="16" />
                 <span class="hint">网盘源建议 2–4,本地磁盘可以更高。</span>
+              </div>
+              <div class="field wide">
+                <label>扫描排除(全局默认)</label>
+                <ExcludeKeywords v-model="cfg.exclude_keywords" />
+                <span class="hint">
+                  命中的文件不会被导入媒体库——不当剧集、不当电影、不出卡片,也不会被刮削;文件浏览里仍然能播。
+                  下面的媒体库可以「跟随全局」或单独设一份。
+                </span>
               </div>
             </div>
             <div class="save-bar flat">

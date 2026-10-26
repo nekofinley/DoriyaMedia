@@ -201,9 +201,12 @@ var cjkTokens = regexp.MustCompile(`(国语|普通话|粤语|中字|简体|繁�
 
 // ParseName identifies a media filename.
 func ParseName(filename string) Parsed {
+	// Only a *video* extension is removed. The last dot in a name is often not
+	// one: "[弹丸论破][S2.5][狛枝凪斗与世界的破坏者]" is a folder, and cutting at the
+	// ".5" left "[弹丸论破][S2" — a film called "S2". "Dr. Stone" became "Dr".
 	base := filename
-	if i := strings.LastIndex(base, "."); i >= 0 {
-		base = base[:i]
+	if IsVideo(base) {
+		base = base[:strings.LastIndex(base, ".")]
 	}
 	original := base
 
