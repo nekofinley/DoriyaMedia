@@ -199,7 +199,59 @@ function startEdit(lib) {
     name: lib.name, type: lib.type, sources: places, providers: provs,
     excludeMode: lib.exclude_mode === 'custom' ? 'custom' : 'inherit',
     excludes: parseKeywords(lib.excludes),
+    poster_mode: lib.poster_mode === 'static' ? 'static' : 'auto',
   }
+  posterMissing.value = false
+  posterVersion.value++
+}
+
+// ---------- library cover ----------
+// The cover is either dynamic (follows the newest item with cached artwork) or a
+// fixed image. Picking or auto-fetching a file applies immediately — the two
+// buttons sit outside the 保存 flow on purpose, so the stored file and the
+// 动态/静态 choice cannot drift apart.
+const posterVersion = ref(0)
+const posterBusy = ref(false)
+const posterMissing = ref(false)
+
+function posterSrc(id) { return `/api/libraries/${id}/poster?v=${posterVersion.value}` }
+
+async function applyLibraryPoster(id, call, okText) {
+  posterBusy.value = true
+  try {
+    await call()
+    editForm.value.poster_mode = 'static'
+    posterMissing.value = false
+    posterVersion.value++
+    await loadAll()
+    toast.ok(okText)
+  } catch (e) { toast.err(e.message) } finally { posterBusy.value = false }
+}
+
+function pickLibraryPoster(id, event) {
+  const file = event.target.files && event.target.files[0]
+  event.target.value = ''
+  if (!file) return
+  applyLibraryPoster(id, () => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return api.upload(`/api/libraries/${id}/poster`, fd)
+  }, '封面已保存')
+}
+
+function autoLibraryPoster(id) {
+  applyLibraryPoster(id, () => api.post(`/api/libraries/${id}/poster/auto`), '已取该库最新入库条目的海报')
+}
+
+async function clearLibraryPoster(id) {
+  posterBusy.value = true
+  try {
+    await api.del(`/api/libraries/${id}/poster`)
+    posterVersion.value++
+    posterMissing.value = false
+    await loadAll()
+    toast.ok('已恢复动态封面')
+  } catch (e) { toast.err(e.message) } finally { posterBusy.value = false }
 }
 function toggleProvider(p) {
   const a = editForm.value.providers
@@ -224,6 +276,7 @@ async function saveEdit(id) {
       name: f.name, type: f.type,
       source_id: picked[0].source_id, path: picked[0].path,
       sources: picked,
+      poster_mode: f.poster_mode === 'static' ? 'static' : 'auto',
       providers: JSON.stringify(f.providers.length ? f.providers : ['nfo', 'bgm', 'tmdb']),
       exclude_mode: f.excludeMode === 'custom' ? 'custom' : 'inherit',
       excludes: JSON.stringify(f.excludes || []),
@@ -1135,6 +1188,50 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                     v-model:mode="editForm.excludeMode"
                     :inherited="cfg?.exclude_keywords || []"
                   />
+                </div>
+                <div class="field">
+                  <label>封面(Emby 里的媒体库图标)</label>
+                  <div class="type-picker">
+                    <button
+                      class="chip" :class="{ on: editForm.poster_mode !== 'static' }"
+                      @click="editForm.poster_mode = 'auto'"
+                    >动态(跟随最新入库)</button>
+                    <button
+                      class="chip" :class="{ on: editForm.poster_mode === 'static' }"
+                      @click="editForm.poster_mode = 'static'"
+                    >静态(固定一张)</button>
+                  </div>
+                  <div v-if="editForm.poster_mode === 'static'" class="lib-poster">
+                    <img
+                      v-if="!posterMissing"
+                      :src="posterSrc(lib.id)" class="lib-poster-thumb" alt="封面预览"
+                      @error="posterMissing = true"
+                    />
+                    <div v-else class="lib-poster-thumb lib-poster-empty tiny dim">还没有封面</div>
+                    <div class="lib-poster-actions">
+                      <div class="btn-row">
+                        <label class="btn sm" :class="{ disabled: posterBusy }">
+                          <AppIcon name="image" :size="14" /> 选取图片
+                          <input
+                            type="file" hidden accept="image/png,image/jpeg,image/webp"
+                            :disabled="posterBusy" @change="pickLibraryPoster(lib.id, $event)"
+                          />
+                        </label>
+                        <button class="btn sm" :disabled="posterBusy" @click="autoLibraryPoster(lib.id)">
+                          <AppIcon name="download" :size="14" /> 自动获取
+                        </button>
+                        <button class="btn sm danger" :disabled="posterBusy" @click="clearLibraryPoster(lib.id)">
+                          <AppIcon name="trash" :size="14" /> 恢复动态
+                        </button>
+                      </div>
+                      <div class="tiny dim">
+                        这两个按钮改完立即生效,不用点保存。自动获取取该媒体库最近入库、且已缓存海报的条目。
+                      </div>
+                    </div>
+                  </div>
+                  <div v-else class="tiny dim">
+                    动态封面由该库最近入库、且已缓存海报的条目决定,新片入库后会跟着变;切到静态可以自己选一张。
+                  </div>
                 </div>
                 <div class="btn-row">
                   <button class="btn primary" @click="saveEdit(lib.id)"><AppIcon name="check" :size="15" /> 保存</button>
@@ -2051,6 +2148,15 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
 .src-row input { flex: 1 1 auto; min-width: 0; }
 .src-row .btn { flex: 0 0 auto; }
 .lib-actions { display: flex; gap: 8px; flex: none; flex-wrap: wrap; }
+/* 封面:预览缩略图 + 选取图片 / 自动获取 / 恢复动态 三个按钮 */
+.lib-poster { display: flex; gap: 12px; align-items: flex-start; margin-top: 10px; }
+.lib-poster-thumb {
+  flex: 0 0 auto; width: 76px; height: 108px; border-radius: var(--r-m);
+  object-fit: cover; background: var(--bg-2); border: 1px solid var(--line-1);
+}
+.lib-poster-empty { display: flex; align-items: center; justify-content: center; text-align: center; padding: 6px; }
+.lib-poster-actions { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.lib-poster-actions .btn-row { flex-wrap: wrap; }
 /* 扫描/体检的进度显示由 LiveProgress 组件自己带样式 */
 .scan-done { margin-top: 10px; display: flex; align-items: center; gap: 6px; color: var(--text-3); }
 .scan-done svg { color: var(--ok); }

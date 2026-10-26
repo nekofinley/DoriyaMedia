@@ -23,11 +23,25 @@ async function request(method, url, body) {
   return data
 }
 
+// Uploads send FormData as-is: fetch sets the multipart boundary itself.
+async function upload(url, formData) {
+  const resp = await fetch(url, { method: 'POST', credentials: 'include', body: formData })
+  const text = await resp.text()
+  let data = null
+  try { data = text ? JSON.parse(text) : null } catch { data = text }
+  if (!resp.ok) {
+    const msg = data && data.error ? data.error : `HTTP ${resp.status}`
+    throw new ApiError(resp.status, msg)
+  }
+  return data
+}
+
 export const api = {
   get: (url) => request('GET', url),
   post: (url, body) => request('POST', url, body ?? {}),
   put: (url, body) => request('PUT', url, body),
   del: (url) => request('DELETE', url),
+  upload,
 }
 
 export function imgUrl(itemId, kind) {
