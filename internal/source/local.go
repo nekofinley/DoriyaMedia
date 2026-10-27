@@ -39,11 +39,19 @@ func (d *LocalDriver) relativePath(p string) (string, error) {
 	// Virtual paths may begin with one slash. Everything else must remain a
 	// relative path: absolute paths, drive-qualified paths, UNC shares, and
 	// parent traversal are never valid inside a local source.
+	if strings.IndexByte(p, 0) >= 0 ||
+		strings.HasPrefix(p, `\`) ||
+		hasWindowsDrivePrefix(p) {
+		return "", errLocalPathOutsideRoot
+	}
 	slashed := filepath.ToSlash(p)
-	if strings.IndexByte(slashed, 0) >= 0 || strings.HasPrefix(slashed, "//") {
+	if strings.HasPrefix(slashed, "//") {
 		return "", errLocalPathOutsideRoot
 	}
 	virtual := strings.TrimPrefix(slashed, "/")
+	if hasWindowsDrivePrefix(virtual) {
+		return "", errLocalPathOutsideRoot
+	}
 	relative := filepath.FromSlash(virtual)
 	if filepath.IsAbs(relative) ||
 		filepath.VolumeName(relative) != "" {
@@ -58,6 +66,14 @@ func (d *LocalDriver) relativePath(p string) (string, error) {
 		return "", errLocalPathOutsideRoot
 	}
 	return relative, nil
+}
+
+func hasWindowsDrivePrefix(path string) bool {
+	if len(path) < 2 || path[1] != ':' {
+		return false
+	}
+	return path[0] >= 'A' && path[0] <= 'Z' ||
+		path[0] >= 'a' && path[0] <= 'z'
 }
 
 func (d *LocalDriver) resolve(p string) (string, error) {

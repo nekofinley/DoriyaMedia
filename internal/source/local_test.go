@@ -23,15 +23,19 @@ func TestLocalDriverRejectsPathsOutsideRoot(t *testing.T) {
 	}
 	driver := NewLocal(root)
 
-	for _, path := range []string{
+	paths := []string{
 		"../secret.txt",
 		"nested/../../secret.txt",
-		secret,
 		`\\server\share\secret.txt`,
 		"//server/share/secret.txt",
 		`C:\Windows\win.ini`,
+		"C:/Windows/win.ini",
 		"nested/clip.mp4\x00.png",
-	} {
+	}
+	if runtime.GOOS == "windows" {
+		paths = append(paths, secret)
+	}
+	for _, path := range paths {
 		if _, err := driver.resolve(path); !errors.Is(err, errLocalPathOutsideRoot) {
 			t.Errorf("resolve(%q) error = %v, want escape rejection", path, err)
 		}
