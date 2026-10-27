@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DirectDASHTransport",
+  "description": "A one-time S5 direct-dash description containing exactly one independent video stream and one independent audio stream. It never creates or exposes a media session; clients merge the two streams locally.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "streams"
+  ],
+  "properties": {
+    "kind": {
+      "const": "direct-dash"
+    },
+    "streams": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "direct-dash-stream.schema.json"
+      },
+      "allOf": [
+        {
+          "contains": {
+            "properties": {
+              "role": {
+                "const": "video"
+              }
+            },
+            "required": [
+              "role"
+            ]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "properties": {
+              "role": {
+                "const": "audio"
+              }
+            },
+            "required": [
+              "role"
+            ]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        }
+      ]
+    },
+    "subtitles": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "subtitle.schema.json"
+      }
+    }
+  }
+}

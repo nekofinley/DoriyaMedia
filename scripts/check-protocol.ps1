@@ -21,6 +21,11 @@ if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
 
 Push-Location -LiteralPath $helperDir
 try {
+    & go test -mod=readonly -count=1 ./...
+    if ($LASTEXITCODE -ne 0) {
+        throw "Protocol checker self-tests exited with code $LASTEXITCODE"
+    }
+
     & go run -mod=readonly . -root $RepoRoot
     if ($LASTEXITCODE -ne 0) {
         throw "Protocol checker exited with code $LASTEXITCODE"

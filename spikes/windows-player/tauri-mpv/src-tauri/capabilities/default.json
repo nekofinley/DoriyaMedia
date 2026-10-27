@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Minimum capability for the isolated W0 player window",
+  "windows": ["main"],
+  "permissions": []
+}

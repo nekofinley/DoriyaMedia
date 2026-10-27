@@ -1,0 +1,52 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{CD5568EF-564D-44DF-A5F3-5C14E9CD414B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DoriyaMedia.WinUISpike.Core", "src\DoriyaMedia.WinUISpike.Core\DoriyaMedia.WinUISpike.Core.csproj", "{9D742CFB-2368-4BDE-92E4-017402D2F49A}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DoriyaMedia.WinUISpike.App", "src\DoriyaMedia.WinUISpike.App\DoriyaMedia.WinUISpike.App.csproj", "{38C5A88E-F479-4F71-8CCE-E79CA192A4D1}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{EC562CF5-5055-4719-88B0-9DCAFD15D697}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DoriyaMedia.WinUISpike.Core.Tests", "tests\DoriyaMedia.WinUISpike.Core.Tests\DoriyaMedia.WinUISpike.Core.Tests.csproj", "{E139BC42-877B-4DEB-9ED1-EEB193012ECA}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tools", "tools", "{6BC6DB04-9AD8-4E28-80C8-E449F932E779}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DoriyaMedia.WinUISpike.VlcProbe", "tools\DoriyaMedia.WinUISpike.VlcProbe\DoriyaMedia.WinUISpike.VlcProbe.csproj", "{D72A5324-F717-4D33-A4FF-CA17B81154D8}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{9D742CFB-2368-4BDE-92E4-017402D2F49A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9D742CFB-2368-4BDE-92E4-017402D2F49A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9D742CFB-2368-4BDE-92E4-017402D2F49A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9D742CFB-2368-4BDE-92E4-017402D2F49A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{38C5A88E-F479-4F71-8CCE-E79CA192A4D1}.Debug|Any CPU.ActiveCfg = Debug|x64
+		{38C5A88E-F479-4F71-8CCE-E79CA192A4D1}.Debug|Any CPU.Build.0 = Debug|x64
+		{38C5A88E-F479-4F71-8CCE-E79CA192A4D1}.Release|Any CPU.ActiveCfg = Release|x64
+		{38C5A88E-F479-4F71-8CCE-E79CA192A4D1}.Release|Any CPU.Build.0 = Release|x64
+		{E139BC42-877B-4DEB-9ED1-EEB193012ECA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E139BC42-877B-4DEB-9ED1-EEB193012ECA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E139BC42-877B-4DEB-9ED1-EEB193012ECA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E139BC42-877B-4DEB-9ED1-EEB193012ECA}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D72A5324-F717-4D33-A4FF-CA17B81154D8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D72A5324-F717-4D33-A4FF-CA17B81154D8}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D72A5324-F717-4D33-A4FF-CA17B81154D8}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D72A5324-F717-4D33-A4FF-CA17B81154D8}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{9D742CFB-2368-4BDE-92E4-017402D2F49A} = {CD5568EF-564D-44DF-A5F3-5C14E9CD414B}
+		{38C5A88E-F479-4F71-8CCE-E79CA192A4D1} = {CD5568EF-564D-44DF-A5F3-5C14E9CD414B}
+		{E139BC42-877B-4DEB-9ED1-EEB193012ECA} = {EC562CF5-5055-4719-88B0-9DCAFD15D697}
+		{D72A5324-F717-4D33-A4FF-CA17B81154D8} = {6BC6DB04-9AD8-4E28-80C8-E449F932E779}
+	EndGlobalSection
+EndGlobal

@@ -1,0 +1,138 @@
+<Window
+    x:Class="DoriyaMedia.WinUISpike.App.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:lvs="using:LibVLCSharp.Platforms.Windows">
+
+    <Grid Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <Border
+            Grid.Row="0"
+            Padding="24,20"
+            Background="{ThemeResource LayerFillColorDefaultBrush}"
+            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+            BorderThickness="0,0,0,1">
+            <StackPanel Spacing="4">
+                <TextBlock
+                    FontSize="26"
+                    FontWeight="SemiBold"
+                    Text="WinUI 3 + LibVLCSharp spike" />
+                <TextBlock
+                    x:Name="RuntimeText"
+                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                    Text="Probing the system VLC installation..." />
+            </StackPanel>
+        </Border>
+
+        <Grid
+            Grid.Row="1"
+            Margin="24,20,24,0"
+            ColumnSpacing="12"
+            RowSpacing="8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <TextBox
+                x:Name="VideoUriBox"
+                Grid.Column="0"
+                Grid.Row="0"
+                Header="Video URL (HTTPS)"
+                PlaceholderText="https://example.invalid/video.mp4"
+                IsEnabled="False" />
+            <TextBox
+                x:Name="AudioUriBox"
+                Grid.Column="0"
+                Grid.Row="1"
+                Header="Audio URL (optional, HTTPS)"
+                PlaceholderText="https://example.invalid/audio.mp4"
+                IsEnabled="False" />
+            <TextBox
+                x:Name="HeadersBox"
+                Grid.Column="0"
+                Grid.Row="2"
+                MinHeight="72"
+                AcceptsReturn="True"
+                Header="Source headers (optional, one Name: Value per line)"
+                IsEnabled="False"
+                PlaceholderText="Referer: https://example.invalid/&#x0a;User-Agent: App/1.0"
+                TextWrapping="Wrap" />
+            <CheckBox
+                x:Name="LoopbackHttpCheckBox"
+                Grid.Column="0"
+                Grid.Row="3"
+                Content="Allow exact-loopback HTTP (test only)"
+                IsEnabled="False" />
+            <Button
+                x:Name="OpenButton"
+                Grid.Column="1"
+                Grid.Row="0"
+                MinWidth="96"
+                VerticalAlignment="Bottom"
+                Click="OnOpenClicked"
+                Content="Open"
+                IsEnabled="False"
+                Style="{StaticResource AccentButtonStyle}" />
+            <Button
+                x:Name="StopButton"
+                Grid.Column="2"
+                Grid.Row="0"
+                MinWidth="96"
+                VerticalAlignment="Bottom"
+                Click="OnStopClicked"
+                Content="Stop"
+                IsEnabled="False" />
+        </Grid>
+
+        <Border
+            Grid.Row="2"
+            Margin="24,16,24,0"
+            Padding="14,10"
+            Background="{ThemeResource LayerFillColorDefaultBrush}"
+            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+            BorderThickness="1"
+            CornerRadius="8">
+            <StackPanel Spacing="2">
+                <TextBlock
+                    x:Name="StatusText"
+                    FontWeight="SemiBold"
+                    Text="Initializing" />
+                <TextBlock
+                    x:Name="StatusDetailText"
+                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                    Text="Waiting for the LibVLCSharp video surface." />
+            </StackPanel>
+        </Border>
+
+        <Border
+            Grid.Row="3"
+            Margin="24,16,24,0"
+            Background="Black"
+            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+            BorderThickness="1"
+            CornerRadius="8">
+            <lvs:VideoView x:Name="VideoView" />
+        </Border>
+
+        <TextBlock
+            Grid.Row="4"
+            Margin="24,12,24,20"
+            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+            Text="URLs and allowlisted headers are passed only to LibVLC. Referer and User-Agent apply to both sources; unsupported headers are rejected. This spike writes no URL, query token, or source header value to application logs."
+            TextWrapping="Wrap" />
+    </Grid>
+</Window>

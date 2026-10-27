@@ -72,8 +72,20 @@ func (s *fakeV1HLSStore) FileByID(id int64) (*models.MediaFile, error) {
 
 func (s *fakeV1HLSStore) RevokePlaybackMediaSessionsForTransport(
 	transport string,
+	now time.Time,
+) (int64, error) {
+	return s.RevokePlaybackMediaSessionsForTransportContext(
+		context.Background(), transport, now)
+}
+
+func (s *fakeV1HLSStore) RevokePlaybackMediaSessionsForTransportContext(
+	ctx context.Context,
+	transport string,
 	_ time.Time,
 ) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	s.revokeCalls = append(s.revokeCalls, transport)
 	return 0, s.revokeErr
 }
@@ -843,6 +855,135 @@ func TestV1ServerHLSAuthorizationErrors(t *testing.T) {
 			}
 			if strings.Contains(rec.Body.String(), "database detail") {
 				t.Fatalf("error body leaked the internal error: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestV1HLSAuthorizeErrorMapsContextErrors(t *testing.T) {
+	const internalDetail = "database detail must not leak"
+	tests := []struct {
+		name   string
+		err    error
+		status int
+		code   V1ErrorCode
+		action string
+	}{
+		{
+			name:   "deadline",
+			err:    context.DeadlineExceeded,
+			status: http.StatusGatewayTimeout,
+			code:   V1ErrorInternal,
+			action: "retry",
+		},
+		{
+			name:   "canceled",
+			err:    context.Canceled,
+			status: http.StatusRequestTimeout,
+			code:   V1ErrorInvalidRequest,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			err := errors.Join(errors.New(internalDetail), tc.err)
+			writeV1HLSAuthorizeError(rec, err)
+
+			body := append([]byte(nil), rec.Body.Bytes()...)
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d; body %s",
+					rec.Code, tc.status, body)
+			}
+			var envelope v1ErrorEnvelope
+			if err := json.NewDecoder(bytes.NewReader(body)).Decode(&envelope); err != nil {
+				t.Fatalf("decode HLS authorization error: %v", err)
+			}
+			if envelope.Error.Code != tc.code {
+				t.Fatalf("error code = %q, want %q", envelope.Error.Code, tc.code)
+			}
+			if tc.action != "" && envelope.Error.Details["action"] != tc.action {
+				t.Fatalf("error action = %v, want %q",
+					envelope.Error.Details["action"], tc.action)
+			}
+			if bytes.Contains(body, []byte(internalDetail)) {
+				t.Fatalf("error body leaked the internal error: %s", body)
+			}
+			assertV1HLSCommonResponseHeaders(t, rec)
+		})
+	}
+}
+
+func TestV1ServerHLSAuthorizationMapsRequestContext(t *testing.T) {
+	capability := "ms_" + strings.Repeat("a", 22)
+	tests := []struct {
+		name       string
+		newContext func() (context.Context, context.CancelFunc)
+		status     int
+		code       V1ErrorCode
+		action     string
+	}{
+		{
+			name: "deadline",
+			newContext: func() (context.Context, context.CancelFunc) {
+				return context.WithDeadline(
+					context.Background(), time.Now().Add(-time.Second))
+			},
+			status: http.StatusGatewayTimeout,
+			code:   V1ErrorInternal,
+			action: "retry",
+		},
+		{
+			name: "canceled",
+			newContext: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, cancel
+			},
+			status: http.StatusRequestTimeout,
+			code:   V1ErrorInvalidRequest,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeV1HLSStore{access: v1HLSAccess("remux")}
+			engine := &fakeV1HLSEngine{probe: v1HLSProbe(30, 2)}
+			h := v1HLSTestHandler(store, engine)
+			ctx, cancel := tc.newContext()
+			req := v1HLSPlaylistRequest(capability).WithContext(ctx)
+			rec := httptest.NewRecorder()
+
+			h.servePlaylist(rec, req)
+			cancel()
+
+			body := append([]byte(nil), rec.Body.Bytes()...)
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d; body %s",
+					rec.Code, tc.status, body)
+			}
+			var envelope v1ErrorEnvelope
+			if err := json.NewDecoder(bytes.NewReader(body)).Decode(&envelope); err != nil {
+				t.Fatalf("decode HLS request error: %v", err)
+			}
+			if envelope.Error.Code != tc.code {
+				t.Fatalf("error code = %q, want %q; body %s",
+					envelope.Error.Code, tc.code, body)
+			}
+			if tc.action != "" && envelope.Error.Details["action"] != tc.action {
+				t.Fatalf("error action = %v, want %q",
+					envelope.Error.Details["action"], tc.action)
+			}
+			if bytes.Contains(body, []byte("context canceled")) ||
+				bytes.Contains(body, []byte("context deadline exceeded")) {
+				t.Fatalf("error body leaked context details: %s", body)
+			}
+			assertV1HLSCommonResponseHeaders(t, rec)
+			if len(store.authorizeLog) != 0 {
+				t.Fatalf("authorization store called %d times after request cancel",
+					len(store.authorizeLog))
+			}
+			if engine.ensureProbeCalls != 0 {
+				t.Fatalf("HLS context error reached media preparation %d times",
+					engine.ensureProbeCalls)
 			}
 		})
 	}

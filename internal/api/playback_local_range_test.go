@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -47,11 +46,8 @@ func runV1LocalMedia(
 func TestPlaybackLocalMediaRangeSemantics(t *testing.T) {
 	const body = "0123456789abcdefghijklmnopqrstuvwxyz"
 	target, modTime := newV1LocalMediaFixture(t, body)
-	info, err := os.Stat(target)
-	if err != nil {
-		t.Fatalf("stat media fixture: %v", err)
-	}
-	etag := fmt.Sprintf(`"%x-%x"`, info.Size(), info.ModTime().UTC().UnixNano())
+	full := runV1LocalMedia(t, http.MethodGet, target, nil)
+	etag := full.Header().Get("ETag")
 
 	t.Run("full GET and HEAD", func(t *testing.T) {
 		for _, method := range []string{http.MethodGet, http.MethodHead} {
@@ -157,15 +153,15 @@ func TestPlaybackLocalMediaIfRange(t *testing.T) {
 		}
 	})
 
-	t.Run("matching modification date", func(t *testing.T) {
+	t.Run("modification date is not a strong validator", func(t *testing.T) {
 		rec := runV1LocalMedia(t, http.MethodGet, target, map[string]string{
 			"Range": "bytes=6-8", "If-Range": modTime.Format(http.TimeFormat),
 		})
-		if rec.Code != http.StatusPartialContent {
-			t.Fatalf("status = %d, want 206; body=%q", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
 		}
-		if got := rec.Body.String(); got != "678" {
-			t.Errorf("body = %q, want matching range", got)
+		if got := rec.Body.String(); got != body {
+			t.Errorf("body = %q, want full representation", got)
 		}
 	})
 
@@ -213,6 +209,111 @@ func TestPlaybackLocalMediaIfRange(t *testing.T) {
 				t.Errorf("body = %q, want full representation", got)
 			}
 		})
+	}
+}
+
+func TestPlaybackLocalMediaETagChangesAfterSameSizeRewrite(t *testing.T) {
+	const (
+		original    = "0123456789"
+		replacement = "abcdefghij"
+	)
+	target, modTime := newV1LocalMediaFixture(t, original)
+	before := runV1LocalMedia(t, http.MethodGet, target, nil)
+	oldETag := before.Header().Get("ETag")
+	if oldETag == "" {
+		t.Skip("platform does not provide a reliable local file version")
+	}
+
+	time.Sleep(25 * time.Millisecond)
+	if err := os.WriteFile(target, []byte(replacement), 0o600); err != nil {
+		t.Fatalf("rewrite media fixture: %v", err)
+	}
+	if err := os.Chtimes(target, modTime, modTime); err != nil {
+		t.Fatalf("restore media fixture time: %v", err)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat rewritten media fixture: %v", err)
+	}
+	if !info.ModTime().Equal(modTime) {
+		t.Fatalf("rewritten media modification time = %s, want %s",
+			info.ModTime(), modTime)
+	}
+	if info.Size() != int64(len(original)) {
+		t.Fatalf("rewritten media size = %d, want %d",
+			info.Size(), len(original))
+	}
+
+	after := runV1LocalMedia(t, http.MethodGet, target, nil)
+	newETag := after.Header().Get("ETag")
+	if newETag == "" {
+		t.Fatal("rewritten media did not retain a strong ETag")
+	}
+	if newETag == oldETag {
+		t.Fatalf("ETag = %q after same-size rewrite with restored mtime", newETag)
+	}
+
+	stale := runV1LocalMedia(t, http.MethodGet, target, map[string]string{
+		"Range": "bytes=2-4", "If-Range": oldETag,
+	})
+	if stale.Code != http.StatusOK {
+		t.Fatalf("stale If-Range status = %d, want 200; body=%q",
+			stale.Code, stale.Body.String())
+	}
+	assertPlaybackProxyHeader(t, stale, "Content-Length", strconv.Itoa(len(replacement)))
+	if got := stale.Header().Get("Content-Range"); got != "" {
+		t.Errorf("stale If-Range Content-Range = %q, want empty", got)
+	}
+	if got := stale.Body.String(); got != replacement {
+		t.Errorf("stale If-Range body = %q, want complete replacement", got)
+	}
+
+	current := runV1LocalMedia(t, http.MethodGet, target, map[string]string{
+		"Range": "bytes=2-4", "If-Range": newETag,
+	})
+	if current.Code != http.StatusPartialContent {
+		t.Fatalf("current If-Range status = %d, want 206; body=%q",
+			current.Code, current.Body.String())
+	}
+	if got := current.Body.String(); got != "cde" {
+		t.Errorf("current If-Range body = %q, want cde", got)
+	}
+}
+
+func TestPlaybackLocalMediaWithoutReliableVersionDisablesIfRange(t *testing.T) {
+	const body = "0123456789"
+	target, modTime := newV1LocalMediaFixture(t, body)
+	f, err := os.Open(target)
+	if err != nil {
+		t.Fatalf("open media fixture: %v", err)
+	}
+	_, supported, _ := localFileVersionForFile(f)
+	_ = f.Close()
+	if supported {
+		t.Skip("platform provides a reliable local file version")
+	}
+
+	full := runV1LocalMedia(t, http.MethodGet, target, nil)
+	if got := full.Header().Get("ETag"); got != "" {
+		t.Fatalf("ETag = %q without a reliable file version", got)
+	}
+	for _, validator := range []string{
+		`"old-file-version"`,
+		modTime.Format(http.TimeFormat),
+	} {
+		rec := runV1LocalMedia(t, http.MethodGet, target, map[string]string{
+			"Range": "bytes=2-4", "If-Range": validator,
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("If-Range %q status = %d, want 200; body=%q",
+				validator, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Content-Range"); got != "" {
+			t.Errorf("If-Range %q Content-Range = %q, want empty", validator, got)
+		}
+		if got := rec.Body.String(); got != body {
+			t.Errorf("If-Range %q body = %q, want complete file", validator, got)
+		}
 	}
 }
 

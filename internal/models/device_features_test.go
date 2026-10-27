@@ -48,3 +48,30 @@ func TestDeviceFeatureOverridesDenyOnlySemantics(t *testing.T) {
 		t.Fatal("client engine deny should not prevent alternate server transport")
 	}
 }
+
+func TestDeviceFeatureOverridesDisableMatchingPlaybackTransport(t *testing.T) {
+	tests := []struct {
+		name      string
+		override  DeviceFeatureOverrides
+		transport string
+	}{
+		{"direct http", DeviceFeatureOverrides{DirectHTTPDisabled: true}, PlaybackTransportDirectHTTP},
+		{"direct dash", DeviceFeatureOverrides{DirectDASHDisabled: true}, PlaybackTransportDirectDASH},
+		{"server proxy", DeviceFeatureOverrides{ServerProxyV1Disabled: true}, PlaybackTransportServerProxy},
+		{"server hls", DeviceFeatureOverrides{ServerHLSV1Disabled: true}, PlaybackTransportServerHLS},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if !tc.override.DisablesPlaybackTransport(tc.transport) {
+				t.Fatalf("%s was not disabled", tc.transport)
+			}
+		})
+	}
+	if (DeviceFeatureOverrides{DirectDASHDisabled: true}).DisablesPlaybackTransport(
+		PlaybackTransportServerHLS) {
+		t.Fatal("direct dash deny should not disable server HLS")
+	}
+	if (DeviceFeatureOverrides{}).DisablesPlaybackTransport(PlaybackTransportDirectDASH) {
+		t.Fatal("zero overrides disabled direct dash")
+	}
+}

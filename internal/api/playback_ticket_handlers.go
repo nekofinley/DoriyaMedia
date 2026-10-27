@@ -29,31 +29,60 @@ import (
 )
 
 const (
-	v1PlaybackContractVersion  = 1
-	v1PlaybackProbeTimeout     = 150 * time.Second
-	v1PlaybackCreateProbeTTL   = 20 * time.Second
-	v1PlaybackFinalizeTimeout  = 20 * time.Second
-	v1PlaybackIssuanceTimeout  = 20 * time.Second
-	v1PlaybackDirectURLTimeout = 5 * time.Second
-	v1PlaybackCleanupTimeout   = 3 * time.Second
+	v1PlaybackContractVersion       = 1
+	v1PlaybackProbeTimeout          = 150 * time.Second
+	v1PlaybackCreateProbeTTL        = 20 * time.Second
+	v1PlaybackFinalizeTimeout       = 20 * time.Second
+	v1PlaybackIssuanceTimeout       = 20 * time.Second
+	v1PlaybackDirectURLTimeout      = 5 * time.Second
+	v1PlaybackPartsTimeout          = 5 * time.Second
+	v1PlaybackCleanupTimeout        = 3 * time.Second
+	v1PlaybackConnectHandshakeLimit = 15 * time.Second
+	v1PlaybackTLSHandshakeTimeout   = 15 * time.Second
+	v1PlaybackResponseHeaderTimeout = 60 * time.Second
+
+	playbackFailureSourceUnavailable = "source_unavailable"
+	playbackFailureProbeInterrupted  = "probe_interrupted"
+	playbackFailureProbeTimeout      = "probe_timeout"
+	playbackFailureFinalizeFailed    = "probe_finalize_failed"
 )
 
 var (
 	v1PlaybackCodecPattern            = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._-]*$`)
 	v1PlaybackTokenPattern            = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z.+-]*$`)
 	errV1PlaybackCandidateUnavailable = errors.New("playback transport candidate unavailable")
+	v1PlaybackTicketProbeRunnerFor    = func(s *Server) v1PlaybackTicketProbeRunner {
+		if s == nil || s.Engine == nil {
+			return nil
+		}
+		return s.Engine
+	}
 )
 
+type v1PlaybackTicketProbeRunner interface {
+	ProbeFor(
+		context.Context,
+		*models.MediaFile,
+		source.Driver,
+	) (*media.Probe, error)
+	ProbeTransient(
+		context.Context,
+		*models.MediaFile,
+		source.Driver,
+	) (*media.Probe, error)
+}
+
 type v1PlaybackClientCapabilities struct {
-	Platform        string   `json:"platform"`
-	Version         string   `json:"version"`
-	Engine          string   `json:"engine"`
-	Containers      []string `json:"containers"`
-	VideoCodecs     []string `json:"video_codecs"`
-	AudioCodecs     []string `json:"audio_codecs"`
-	SubtitleCodecs  []string `json:"subtitle_codecs"`
-	SupportsRange   bool     `json:"supports_range"`
-	SupportsHeaders bool     `json:"supports_headers"`
+	Platform          string   `json:"platform"`
+	Version           string   `json:"version"`
+	Engine            string   `json:"engine"`
+	Containers        []string `json:"containers"`
+	VideoCodecs       []string `json:"video_codecs"`
+	AudioCodecs       []string `json:"audio_codecs"`
+	SubtitleCodecs    []string `json:"subtitle_codecs"`
+	SupportsRange     bool     `json:"supports_range"`
+	SupportsHeaders   bool     `json:"supports_headers"`
+	SupportsDASHMerge bool     `json:"supports_dash_merge"`
 }
 
 type v1PlaybackTicketCreateRequest struct {
@@ -164,8 +193,22 @@ func (s *Server) handleV1PlaybackTicketCreate(
 		s.writeV1PlaybackFileError(w, err)
 		return
 	}
+	runner := v1PlaybackTicketProbeRunnerFor(s)
+	if runner == nil {
+		writeV1PlaybackError(w, http.StatusInternalServerError, V1ErrorInternal,
+			"The playback probe is unavailable.", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), v1PlaybackCreateProbeTTL)
+	defer cancel()
+	probe, probeErr := runner.ProbeFor(ctx, file, drv)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		writeV1PlaybackStoreError(w, ctxErr)
+		return
+	}
+
 	now := time.Now().UTC()
-	ticket, err := s.Store.CreatePlaybackTicket(models.PlaybackTicketRequest{
+	ticket, err := s.Store.CreatePlaybackTicketContext(ctx, models.PlaybackTicketRequest{
 		UserID:              access.User.ID,
 		DeviceID:            access.Device.ID,
 		FileID:              file.ID,
@@ -182,12 +225,9 @@ func (s *Server) handleV1PlaybackTicketCreate(
 	w.Header().Set("Cache-Control", "no-store")
 	binding := playbackBinding(ticket)
 
-	ctx, cancel := context.WithTimeout(r.Context(), v1PlaybackCreateProbeTTL)
-	defer cancel()
-	probe, probeErr := s.Engine.ProbeFor(ctx, file, drv)
 	if probeErr != nil {
 		failed, finishErr := s.finishV1PlaybackProbeFailed(
-			binding, ticket.Version, "source_unavailable")
+			binding, ticket.Version, playbackFailureSourceUnavailable)
 		if finishErr != nil {
 			writeV1PlaybackStoreError(w, finishErr)
 			return
@@ -196,9 +236,8 @@ func (s *Server) handleV1PlaybackTicketCreate(
 		return
 	}
 	if probe == nil {
-		s.Engine.StartProbe(file, drv)
 		go s.completeV1PlaybackProbe(
-			binding, ticket.Version, file.ID, client, preferred, features)
+			binding, ticket.Version, file.ID, client, preferred, features, runner)
 		s.writeV1PlaybackTicketResponse(w, http.StatusAccepted, ticket, features)
 		return
 	}
@@ -236,14 +275,9 @@ func (s *Server) finalizeV1PlaybackTicketCreate(
 		}
 		return finalized, nil
 	}
-	failed, finishErr := s.finishV1PlaybackProbeFailed(
-		binding, version, "source_unavailable")
-	if finishErr == nil {
-		if failed == nil {
-			return nil, db.ErrPlaybackTicketConflict
-		}
-		return failed, nil
-	}
+	_, _ = s.finishV1PlaybackProbeFailed(
+		binding, version,
+		playbackFailureFinalizeFailed)
 	return nil, err
 }
 
@@ -255,7 +289,8 @@ func (s *Server) handleV1PlaybackTicketStatus(
 	if !s.requireV1PlaybackFeature(w, r, access) {
 		return
 	}
-	ticket, err := s.lookupV1PlaybackTicket(access, r.PathValue("id"))
+	ticket, err := s.lookupV1PlaybackTicket(
+		r.Context(), access, r.PathValue("id"))
 	if err != nil {
 		writeV1PlaybackStoreError(w, err)
 		return
@@ -282,7 +317,8 @@ func (s *Server) handleV1PlaybackTicketRefresh(
 			"The refresh operation does not accept a request body.", nil)
 		return
 	}
-	ticket, err := s.lookupV1PlaybackTicket(access, r.PathValue("id"))
+	ticket, err := s.lookupV1PlaybackTicket(
+		r.Context(), access, r.PathValue("id"))
 	if err != nil {
 		writeV1PlaybackStoreError(w, err)
 		return
@@ -364,33 +400,37 @@ func (s *Server) completeV1PlaybackProbe(
 	client media.NativeClientCapabilities,
 	preferred []media.NativeTransportKind,
 	features config.ClientFeatures,
+	runner v1PlaybackTicketProbeRunner,
 ) {
 	ctx, cancel := context.WithTimeout(context.Background(), v1PlaybackProbeTimeout)
 	defer cancel()
 	if err := s.verifyV1PlaybackProbeActive(ctx, binding, version); err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			_, _ = s.finishV1PlaybackProbeFailed(
-				binding, version, "source_unavailable")
-		}
+		_, _ = s.finishV1PlaybackProbeFailed(
+			binding, version, v1PlaybackProbeContextFailureCode(err))
 		return
 	}
 	file, drv, err := s.v1PlaybackFileAndDriver(fileID)
 	if err != nil {
 		_, _ = s.finishV1PlaybackProbeFailed(
-			binding, version, "source_unavailable")
+			binding, version, playbackFailureSourceUnavailable)
 		return
 	}
 	if err := s.verifyV1PlaybackProbeActive(ctx, binding, version); err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			_, _ = s.finishV1PlaybackProbeFailed(
-				binding, version, "source_unavailable")
-		}
+		_, _ = s.finishV1PlaybackProbeFailed(
+			binding, version, v1PlaybackProbeContextFailureCode(err))
 		return
 	}
-	probe, err := s.Engine.EnsureProbe(ctx, file, drv)
-	if err != nil || probe == nil {
+	probe, _ := runner.ProbeTransient(ctx, file, drv)
+	if ctxErr := ctx.Err(); ctxErr != nil {
 		_, _ = s.finishV1PlaybackProbeFailed(
-			binding, version, "source_unavailable")
+			binding, version,
+			v1PlaybackProbeContextFailureCode(ctxErr))
+		return
+	}
+	if probe == nil {
+		_, _ = s.finishV1PlaybackProbeFailed(
+			binding, version,
+			v1PlaybackProbeFailureCode(ctx, playbackFailureSourceUnavailable))
 		return
 	}
 	finalCtx, cancelFinal := s.finalizeV1PlaybackProbeContext()
@@ -398,8 +438,29 @@ func (s *Server) completeV1PlaybackProbe(
 	if _, err := s.finishV1PlaybackTicketWithProbe(
 		finalCtx, binding, version, file, drv, probe, client, features); err != nil {
 		_, _ = s.finishV1PlaybackProbeFailed(
-			binding, version, "source_unavailable")
+			binding, version, playbackFailureFinalizeFailed)
 	}
+}
+
+func v1PlaybackProbeContextFailureCode(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return playbackFailureProbeTimeout
+	case errors.Is(err, context.Canceled):
+		return playbackFailureProbeInterrupted
+	default:
+		return playbackFailureProbeInterrupted
+	}
+}
+
+func v1PlaybackProbeFailureCode(
+	ctx context.Context,
+	fallback string,
+) string {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return v1PlaybackProbeContextFailureCode(ctxErr)
+	}
+	return fallback
 }
 
 func (s *Server) finalizeV1PlaybackProbeContext() (context.Context, context.CancelFunc) {
@@ -431,18 +492,15 @@ func (s *Server) finishV1PlaybackTicketWithProbe(
 	client media.NativeClientCapabilities,
 	features config.ClientFeatures,
 ) (*models.PlaybackTicket, error) {
-	// Embedding discovery depends on this exact probe rather than a stale
-	// cached copy on MediaFile. External and driver-published tracks are then
-	// registered by the shared discovery path before the immutable id snapshot
-	// is written to the ticket.
 	if err := s.verifyV1PlaybackProbeActive(ctx, binding, version); err != nil {
 		return nil, err
 	}
-	s.Engine.RegisterEmbeddedSubs(file, probe)
-	if err := ctx.Err(); err != nil {
+	// Discovery is read-only. The final transaction rechecks the live ticket
+	// before writing files.probe, subtitle candidates, grants, and ticket state.
+	metadata, err := s.prepareV1PlaybackProbeMetadata(ctx, file, drv, probe)
+	if err != nil {
 		return nil, err
 	}
-	subtitleIDs := s.snapshotV1PlaybackSubtitleIDs(ctx, file, drv)
 	selection, err := s.selectV1PlaybackTransports(
 		ctx, file, drv, probe, client, features)
 	if err != nil {
@@ -454,7 +512,6 @@ func (s *Server) finishV1PlaybackTicketWithProbe(
 	}
 	result := models.PlaybackTicketProbeResult{
 		MediaSummary: summaryJSON,
-		SubtitleIDs:  subtitleIDs,
 	}
 	if video := probe.Video(); video != nil {
 		index := video.Index
@@ -471,8 +528,13 @@ func (s *Server) finishV1PlaybackTicketWithProbe(
 	if err := s.verifyV1PlaybackProbeActive(ctx, binding, version); err != nil {
 		return nil, err
 	}
-	return s.Store.FinishPlaybackTicketProbeContext(
-		ctx, binding, version, result, time.Now().UTC())
+	finalized, err := s.Store.FinishPlaybackTicketProbeWithMetadataContext(
+		ctx, binding, version, result, &metadata, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	file.Probe = metadata.FileProbe
+	return finalized, nil
 }
 
 func (s *Server) finishV1PlaybackProbeFailed(
@@ -700,7 +762,8 @@ func (s *Server) issueV1PlaybackTransport(
 		issued := false
 		defer func() {
 			if !issued {
-				s.cleanupV1PlaybackSubtitleIssuance(ticket, transport.Kind)
+				s.cleanupV1PlaybackSubtitleIssuance(
+					ctx, ticket, transport.Kind)
 			}
 		}()
 		if err := ctx.Err(); err != nil {
@@ -708,7 +771,65 @@ func (s *Server) issueV1PlaybackTransport(
 		}
 		if baseURL, err := s.v1PlaybackBaseURL(r); err == nil {
 			transport.Subtitles, err = s.issueV1PlaybackSubtitles(
-				ticket, file, transport.Kind, "", 0, baseURL)
+				ctx, ticket, file, transport.Kind, "", 0, baseURL)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := s.Store.ValidatePlaybackTransportIssuance(
+			ctx, binding, ticket.Version, ticket.SelectedTransport,
+			ticket.ClaimToken, time.Now().UTC()); err != nil {
+			return nil, err
+		}
+		issued = true
+		return transport, nil
+	case models.PlaybackTransportDirectDASH:
+		client, _, _, err := decodeStoredPlaybackCapabilities(
+			ticket.ClientCapabilities)
+		if err != nil || !client.SupportsDASHMerge {
+			return nil, fmt.Errorf(
+				"%w: client DASH merge capability is unavailable",
+				errV1PlaybackCandidateUnavailable)
+		}
+		parts, err := s.partsForPlayback(ctx, file, drv)
+		if err != nil {
+			return nil, err
+		}
+		streams, ok := media.ResolveNativeDirectDASHStreams(parts, client)
+		if !ok {
+			return nil, fmt.Errorf(
+				"%w: DASH source no longer satisfies direct playback",
+				errV1PlaybackCandidateUnavailable)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		transport := &v1PlaybackTransport{
+			Kind:    models.PlaybackTransportDirectDASH,
+			Streams: make([]v1PlaybackStream, 0, len(streams)),
+		}
+		for _, stream := range streams {
+			transport.Streams = append(transport.Streams, v1PlaybackStream{
+				Role:    stream.Role,
+				URL:     stream.URL,
+				MIME:    stream.MIME,
+				Headers: stream.Headers,
+				Range:   false,
+			})
+		}
+		issued := false
+		defer func() {
+			if !issued {
+				s.cleanupV1PlaybackSubtitleIssuance(
+					ctx, ticket, transport.Kind)
+			}
+		}()
+		if baseURL, err := s.v1PlaybackBaseURL(r); err == nil {
+			transport.Subtitles, err = s.issueV1PlaybackSubtitles(
+				ctx, ticket, file, transport.Kind, "", 0, baseURL)
 			if err != nil {
 				return nil, err
 			}
@@ -760,7 +881,7 @@ func (s *Server) issueV1PlaybackTransport(
 				s.cleanupV1PlaybackMediaSessionGrant(
 					binding, ticket.SelectedTransport, grant)
 				s.cleanupV1PlaybackSubtitleIssuance(
-					ticket, ticket.SelectedTransport)
+					ctx, ticket, ticket.SelectedTransport)
 			}
 			return nil, err
 		}
@@ -771,7 +892,8 @@ func (s *Server) issueV1PlaybackTransport(
 			}
 			s.cleanupV1PlaybackMediaSessionGrant(
 				binding, ticket.SelectedTransport, grant)
-			s.cleanupV1PlaybackSubtitleIssuance(ticket, ticket.SelectedTransport)
+			s.cleanupV1PlaybackSubtitleIssuance(
+				ctx, ticket, ticket.SelectedTransport)
 		}()
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -801,7 +923,7 @@ func (s *Server) issueV1PlaybackTransport(
 			return nil, err
 		}
 		transport.Subtitles, err = s.issueV1PlaybackSubtitles(
-			ticket, file, transport.Kind, grant.Capability,
+			ctx, ticket, file, transport.Kind, grant.Capability,
 			grant.Session.StartSeconds, baseURL)
 		if err != nil {
 			return nil, err
@@ -829,7 +951,10 @@ func (s *Server) cleanupV1PlaybackMediaSessionGrant(
 	if s == nil || s.Store == nil || grant == nil || grant.Session == nil {
 		return
 	}
-	if _, err := s.Store.RevokePlaybackMediaSession(
+	ctx, cancel := context.WithTimeout(context.Background(), v1PlaybackCleanupTimeout)
+	defer cancel()
+	if _, err := s.Store.RevokePlaybackMediaSessionContext(
+		ctx,
 		models.PlaybackMediaSessionBinding{
 			Ticket: binding, Transport: transport,
 		},
@@ -933,6 +1058,10 @@ func (s *Server) authorizeV1PlaybackMediaSession(
 ) (*db.PlaybackMediaSessionAccess, bool) {
 	requireEmailVerification := s.Cfg != nil && s.Cfg.EmailVerificationRequired()
 	for attempts := 0; attempts < 4; attempts++ {
+		if err := r.Context().Err(); err != nil {
+			writeV1PlaybackMediaSessionError(w, err)
+			return nil, false
+		}
 		access, err := s.Store.AuthorizePlaybackMediaSessionContext(
 			r.Context(), capability, requireEmailVerification, time.Now().UTC())
 		if err == nil {
@@ -948,6 +1077,7 @@ func (s *Server) authorizeV1PlaybackMediaSession(
 		if errors.Is(err, db.ErrPlaybackMediaSessionConflict) && attempts < 3 {
 			select {
 			case <-r.Context().Done():
+				writeV1PlaybackMediaSessionError(w, r.Context().Err())
 				return nil, false
 			case <-time.After(time.Duration(attempts+1) * 5 * time.Millisecond):
 			}
@@ -961,53 +1091,67 @@ func (s *Server) authorizeV1PlaybackMediaSession(
 	return nil, false
 }
 
-type v1PlaybackMediaSessionRevoker interface {
-	RevokePlaybackMediaSessionsForTransport(string, time.Time) (int64, error)
+type v1PlaybackMediaSessionContextRevoker interface {
+	RevokePlaybackMediaSessionsForTransportContext(
+		context.Context, string, time.Time) (int64, error)
 }
 
 func (s *Server) revokeV1PlaybackMediaSessionsForTransport(transport string) {
 	if s == nil || s.Store == nil {
 		return
 	}
-	v1PlaybackRevokeMediaSessionsForTransport(s.Store, transport)
+	ctx, cancel := context.WithTimeout(
+		context.Background(), v1PlaybackCleanupTimeout)
+	defer cancel()
+	v1PlaybackRevokeMediaSessionsForTransportContext(ctx, s.Store, transport)
 }
 
 func (s *Server) revokeV1PlaybackAllMediaSessions() {
 	if s == nil || s.Store == nil {
 		return
 	}
-	v1PlaybackRevokeMediaSessionsForTransport(
-		s.Store, models.PlaybackTransportServerProxy)
-	v1PlaybackRevokeMediaSessionsForTransport(
-		s.Store, models.PlaybackTransportServerHLS)
-	s.revokeAllV1PlaybackSubtitleSessions()
+	ctx, cancel := context.WithTimeout(
+		context.Background(), v1PlaybackCleanupTimeout)
+	defer cancel()
+	v1PlaybackRevokeMediaSessionsForTransportContext(
+		ctx, s.Store, models.PlaybackTransportServerProxy)
+	v1PlaybackRevokeMediaSessionsForTransportContext(
+		ctx, s.Store, models.PlaybackTransportServerHLS)
+	revokeAllV1PlaybackSubtitleSessionsContext(ctx, s.Store)
 }
 
-func v1PlaybackRevokeMediaSessionsForTransport(
-	store v1PlaybackMediaSessionRevoker,
+func v1PlaybackRevokeMediaSessionsForTransportContext(
+	ctx context.Context,
+	store any,
 	transport string,
 ) {
 	if store == nil {
 		return
 	}
-	if _, err := store.RevokePlaybackMediaSessionsForTransport(
-		transport, time.Now().UTC()); err != nil {
+	revoker, ok := store.(v1PlaybackMediaSessionContextRevoker)
+	if !ok {
+		return
+	}
+	_, err := revoker.RevokePlaybackMediaSessionsForTransportContext(
+		ctx, transport, time.Now().UTC())
+	if err != nil {
 		// The DB error can contain source paths or connection details. Keep the
 		// emergency shutdown fail-closed without writing it to logs.
 		log.Printf("playback media session cleanup failed transport=%s", transport)
 	}
-	revokeV1PlaybackSubtitleSessionsForTransport(store, transport)
+	revokeV1PlaybackSubtitleSessionsForTransportContext(ctx, store, transport)
 }
 
 func (s *Server) lookupV1PlaybackTicket(
+	ctx context.Context,
 	access *v1DeviceAccessContext,
 	ticketID string,
 ) (*models.PlaybackTicket, error) {
 	if access == nil || access.User == nil || access.Device == nil {
 		return nil, db.ErrInvalidPlaybackTicket
 	}
-	return s.Store.PlaybackTicketByPublicID(
-		access.User.ID, access.Device.ID, ticketID, time.Now().UTC())
+	return s.Store.PlaybackTicketByPublicIDContext(
+		ctx, access.User.ID, access.Device.ID, ticketID, time.Now().UTC())
 }
 
 func (s *Server) authorizeV1PlaybackFile(
@@ -1054,9 +1198,23 @@ func (s *Server) selectV1PlaybackTransports(
 	client media.NativeClientCapabilities,
 	features config.ClientFeatures,
 ) (media.NativeTransportSelection, error) {
+	_, multiPart := drv.(source.MultiPart)
+	var parts []source.Part
+	if multiPart && features.DirectDASHEnabled && client.SupportsDASHMerge {
+		var err error
+		parts, err = s.partsForPlayback(ctx, file, drv)
+		if err != nil {
+			if ctx.Err() != nil {
+				return media.NativeTransportSelection{}, ctx.Err()
+			}
+			log.Printf("v1 playback: DASH parts unavailable for file %d", file.ID)
+			parts = nil
+		}
+	}
+
 	sourceURL := ""
 	var sourceHeaders map[string]string
-	if drv != nil && drv.HasDirect() {
+	if !multiPart && drv != nil && drv.HasDirect() {
 		target, headers, err := directURLForPlayback(ctx, drv, file.Path)
 		if err == nil {
 			sourceURL = target
@@ -1067,19 +1225,46 @@ func (s *Server) selectV1PlaybackTransports(
 			log.Printf("v1 playback: direct source unavailable for file %d", file.ID)
 		}
 	}
-	_, multiPart := drv.(source.MultiPart)
 	return media.SelectNativeTransports(media.NativeTransportInput{
 		Probe:         probe,
 		SourceURL:     sourceURL,
 		SourceHeaders: sourceHeaders,
 		MultiPart:     multiPart,
+		Parts:         parts,
 		Client:        client,
 		Features: media.NativeTransportFeatureFlags{
 			DirectHTTPEnabled:    features.DirectHTTPEnabled,
+			DirectDASHEnabled:    features.DirectDASHEnabled,
 			ServerProxyV1Enabled: features.ServerProxyV1Enabled,
 			ServerHLSV1Enabled:   features.ServerHLSV1Enabled,
 		},
 	}), nil
+}
+
+func (s *Server) partsForPlayback(
+	parent context.Context,
+	file *models.MediaFile,
+	drv source.Driver,
+) ([]source.Part, error) {
+	if s == nil || s.Engine == nil || file == nil || drv == nil {
+		return nil, fmt.Errorf("%w: multi-part source is unavailable",
+			errV1PlaybackCandidateUnavailable)
+	}
+	ctx, cancel := context.WithTimeout(parent, v1PlaybackPartsTimeout)
+	defer cancel()
+	parts, err := s.Engine.PartsFor(ctx, file, drv, "")
+	if err != nil {
+		if parent.Err() != nil {
+			return nil, parent.Err()
+		}
+		return nil, fmt.Errorf("%w: multi-part source is unavailable",
+			errV1PlaybackCandidateUnavailable)
+	}
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("%w: multi-part source did not yield two streams",
+			errV1PlaybackCandidateUnavailable)
+	}
+	return parts, nil
 }
 
 type v1PlaybackDirectURLResult struct {
@@ -1141,9 +1326,13 @@ func (s *Server) playbackTicketTransportSelection(
 		if !v1PlaybackTransportEnabled(features, kind) {
 			continue
 		}
+		supportsRange := client.SupportsRange
+		if kind == media.NativeTransportDirectDASH {
+			supportsRange = false
+		}
 		selection.Candidates = append(selection.Candidates, media.NativeTransportCandidate{
 			Kind:  kind,
-			Range: client.SupportsRange,
+			Range: supportsRange,
 		})
 	}
 	return selection, nil
@@ -1153,6 +1342,8 @@ func v1PlaybackTransportEnabled(features config.ClientFeatures, kind media.Nativ
 	switch kind {
 	case media.NativeTransportDirectHTTP:
 		return features.DirectHTTPEnabled
+	case media.NativeTransportDirectDASH:
+		return features.DirectDASHEnabled
 	case media.NativeTransportServerProxy:
 		return features.ServerProxyV1Enabled
 	case media.NativeTransportServerHLS:
@@ -1213,12 +1404,18 @@ func (s *Server) cleanupV1PlaybackWriteFailure(
 	if transport == nil {
 		return
 	}
-	if _, err := s.Store.RevokePlaybackMediaSessionsForTicketTransport(
-		binding, transport.Kind, now); err != nil {
+	mediaCtx, cancelMedia := context.WithTimeout(
+		context.Background(), v1PlaybackCleanupTimeout)
+	defer cancelMedia()
+	if _, err := s.Store.RevokePlaybackMediaSessionsForTicketTransportContext(
+		mediaCtx, binding, transport.Kind, now); err != nil {
 		log.Printf("playback response failure media cleanup failed")
 	}
-	if _, err := s.Store.RevokePlaybackSubtitleSessionsForTicket(
-		binding, transport.Kind, now); err != nil {
+	subtitleCtx, cancelSubtitle := context.WithTimeout(
+		context.Background(), v1PlaybackCleanupTimeout)
+	defer cancelSubtitle()
+	if _, err := s.Store.RevokePlaybackSubtitleSessionsForTicketContext(
+		subtitleCtx, binding, transport.Kind, now); err != nil {
 		log.Printf("playback response failure subtitle cleanup failed transport=%s",
 			transport.Kind)
 	}
@@ -1267,7 +1464,14 @@ func playbackPublicFailureCode(ticket *models.PlaybackTicket) string {
 	case models.PlaybackTicketUnsupported:
 		return "unsupported_media"
 	case models.PlaybackTicketFailed:
-		return "source_unavailable"
+		switch ticket.FailureCode {
+		case playbackFailureProbeInterrupted,
+			playbackFailureProbeTimeout,
+			playbackFailureFinalizeFailed:
+			return ticket.FailureCode
+		default:
+			return playbackFailureSourceUnavailable
+		}
 	}
 	return ""
 }
@@ -1495,15 +1699,16 @@ func normalizeV1PlaybackClient(
 		return media.NativeClientCapabilities{}, fmt.Errorf("client.subtitle_codecs %w", err)
 	}
 	return media.NativeClientCapabilities{
-		Platform:        platform,
-		Version:         version,
-		Engine:          engine,
-		Containers:      containers,
-		VideoCodecs:     video,
-		AudioCodecs:     audio,
-		SubtitleCodecs:  subtitles,
-		SupportsRange:   client.SupportsRange,
-		SupportsHeaders: client.SupportsHeaders,
+		Platform:          platform,
+		Version:           version,
+		Engine:            engine,
+		Containers:        containers,
+		VideoCodecs:       video,
+		AudioCodecs:       audio,
+		SubtitleCodecs:    subtitles,
+		SupportsRange:     client.SupportsRange,
+		SupportsHeaders:   client.SupportsHeaders,
+		SupportsDASHMerge: client.SupportsDASHMerge,
 	}, nil
 }
 
@@ -1533,8 +1738,8 @@ func normalizeV1PlaybackList(
 }
 
 func normalizeV1PreferredTransports(values []string) ([]media.NativeTransportKind, error) {
-	if len(values) < 1 || len(values) > 3 {
-		return nil, errors.New("preferred_transports must contain 1-3 values")
+	if len(values) < 1 || len(values) > 4 {
+		return nil, errors.New("preferred_transports must contain 1-4 values")
 	}
 	out := make([]media.NativeTransportKind, 0, len(values))
 	seen := make(map[string]bool, len(values))
@@ -1545,6 +1750,7 @@ func normalizeV1PreferredTransports(values []string) ([]media.NativeTransportKin
 		kind := media.NativeTransportKind(raw)
 		switch kind {
 		case media.NativeTransportDirectHTTP,
+			media.NativeTransportDirectDASH,
 			media.NativeTransportServerProxy,
 			media.NativeTransportServerHLS:
 		default:
@@ -1587,6 +1793,20 @@ type v1LocalMediaRequest struct {
 	wantRange byteRange
 	hasRange  bool
 	ifRange   string
+}
+
+type localFileVersion struct {
+	volume     uint64
+	fileID     uint64
+	changeTime uint64
+}
+
+func v1LocalMediaETag(size int64, version localFileVersion, ok bool) string {
+	if !ok || version.fileID == 0 || version.changeTime == 0 {
+		return ""
+	}
+	return fmt.Sprintf(`"%x-%x-%x-%x"`,
+		size, version.volume, version.fileID, version.changeTime)
 }
 
 func parseV1LocalMediaRequest(
@@ -1676,18 +1896,24 @@ func serveV1LocalMediaFileParsed(
 	}
 	total := info.Size()
 	modTime := info.ModTime().UTC()
-	etag := fmt.Sprintf(`"%x-%x"`, total, modTime.UnixNano())
+	version, versionOK, versionErr := localFileVersionForFile(f)
+	etag := ""
+	if versionErr == nil {
+		etag = v1LocalMediaETag(total, version, versionOK)
+	}
 	contentType := v1LocalMediaContentType(target)
 	w.Header().Set("Cache-Control", v1ProxyCacheControl)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Last-Modified", modTime.Format(http.TimeFormat))
-	w.Header().Set("ETag", etag)
+	if etag != "" {
+		w.Header().Set("ETag", etag)
+	}
 
 	honorRange := parsed.hasRange
 	if parsed.ifRange != "" &&
-		!v1LocalIfRangeMatches(parsed.ifRange, etag, modTime) {
+		!v1LocalIfRangeMatches(parsed.ifRange, etag) {
 		honorRange = false
 	}
 	if honorRange {
@@ -1729,21 +1955,15 @@ func serveV1LocalMediaFileParsed(
 	}
 }
 
-func v1LocalIfRangeMatches(raw, etag string, modTime time.Time) bool {
+func v1LocalIfRangeMatches(raw, etag string) bool {
 	raw = strings.TrimSpace(raw)
-	if raw == "" {
+	if raw == "" || etag == "" {
 		return false
 	}
-	// If-Range requires a strong entity-tag comparison. Our ETag is strong;
-	// weak or alternate validators must fall back to the full representation.
-	if strings.HasPrefix(raw, `"`) {
-		return raw == etag
-	}
-	validator, err := http.ParseTime(raw)
-	if err != nil {
-		return false
-	}
-	return modTime.Truncate(time.Second).Equal(validator)
+	// A restored modification time is not a strong validator. Local media
+	// therefore accepts If-Range only when it exactly matches our file-version
+	// ETag; dates, weak tags, and malformed values require a full response.
+	return strings.HasPrefix(raw, `"`) && raw == etag
 }
 
 func v1LocalMediaContentType(target string) string {
@@ -1881,11 +2101,13 @@ func v1PlaybackProxyClientWithPolicy(
 		dial = dialer.DialContext
 	}
 	transport := &http.Transport{
-		MaxIdleConns:        16,
-		MaxIdleConnsPerHost: 4,
-		IdleConnTimeout:     90 * time.Second,
-		ForceAttemptHTTP2:   true,
-		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+		MaxIdleConns:          16,
+		MaxIdleConnsPerHost:   4,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   v1PlaybackTLSHandshakeTimeout,
+		ResponseHeaderTimeout: v1PlaybackResponseHeaderTimeout,
+		ForceAttemptHTTP2:     true,
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 	}
 	policy := &v1PlaybackDialPolicy{
 		initialOrigin:        initialOrigin,
@@ -2103,6 +2325,17 @@ func v1PlaybackDialHTTPProxy(
 	if err != nil {
 		return nil, err
 	}
+	finishHandshake, err := v1PlaybackWatchConnectHandshake(ctx, conn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	handshakeFinished := false
+	defer func() {
+		if !handshakeFinished {
+			_ = finishHandshake()
+		}
+	}()
 	var request strings.Builder
 	request.WriteString("CONNECT ")
 	request.WriteString(target)
@@ -2120,23 +2353,67 @@ func v1PlaybackDialHTTPProxy(
 	request.WriteString("\r\n")
 	if _, err := io.WriteString(conn, request.String()); err != nil {
 		_ = conn.Close()
-		return nil, err
+		return nil, v1PlaybackConnectHandshakeError(ctx, err)
 	}
 	reader := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
 	if err != nil {
 		_ = conn.Close()
-		return nil, err
+		return nil, v1PlaybackConnectHandshakeError(ctx, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
 		_ = conn.Close()
 		return nil, errors.New("source proxy rejected the target")
 	}
+	handshakeFinished = true
+	if err := finishHandshake(); err != nil {
+		_ = resp.Body.Close()
+		_ = conn.Close()
+		return nil, err
+	}
 	if reader.Buffered() > 0 {
 		return &v1PlaybackBufferedConn{Conn: conn, reader: reader}, nil
 	}
 	return conn, nil
+}
+
+func v1PlaybackConnectHandshakeError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return err
+}
+
+func v1PlaybackWatchConnectHandshake(
+	ctx context.Context,
+	conn net.Conn,
+) (func() error, error) {
+	deadline := time.Now().Add(v1PlaybackConnectHandshakeLimit)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
+
+	watchDone := make(chan struct{})
+	stopWatch := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		close(watchDone)
+	})
+	return func() error {
+		if !stopWatch() {
+			<-watchDone
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return conn.SetDeadline(time.Time{})
+	}, nil
 }
 
 type v1PlaybackBufferedConn struct {
@@ -2458,6 +2735,13 @@ func writeV1PlaybackStoreError(w http.ResponseWriter, err error) {
 
 func writeV1PlaybackMediaSessionError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		writeV1PlaybackError(w, http.StatusGatewayTimeout, V1ErrorInternal,
+			"The server could not complete the playback request in time.",
+			map[string]any{"action": "retry"})
+	case errors.Is(err, context.Canceled):
+		writeV1PlaybackError(w, http.StatusRequestTimeout, V1ErrorInvalidRequest,
+			"The playback request was canceled.", nil)
 	case errors.Is(err, db.ErrPlaybackMediaSessionNotFound):
 		writeV1PlaybackError(w, http.StatusNotFound, V1ErrorMediaSessionNotFound,
 			"The media session was not found.", nil)

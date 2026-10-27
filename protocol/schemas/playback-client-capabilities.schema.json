@@ -80,6 +80,11 @@
         ]
       }
     },
+    "supports_dash_merge": {
+      "type": "boolean",
+      "default": false,
+      "description": "When true, the client can merge a separate direct-dash video stream and audio stream. Omitting this capability is equivalent to false."
+    },
     "supports_range": {
       "type": "boolean"
     },

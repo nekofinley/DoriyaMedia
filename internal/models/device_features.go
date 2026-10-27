@@ -63,6 +63,8 @@ func (o DeviceFeatureOverrides) DisablesPlaybackTransport(transport string) bool
 	switch transport {
 	case PlaybackTransportDirectHTTP:
 		return o.DirectHTTPDisabled
+	case PlaybackTransportDirectDASH:
+		return o.DirectDASHDisabled
 	case PlaybackTransportServerProxy:
 		return o.ServerProxyV1Disabled
 	case PlaybackTransportServerHLS:

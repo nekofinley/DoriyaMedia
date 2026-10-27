@@ -22,6 +22,7 @@ const (
 	PlaybackPurposePlayback = "playback"
 
 	PlaybackTransportDirectHTTP  = "direct-http"
+	PlaybackTransportDirectDASH  = "direct-dash"
 	PlaybackTransportServerProxy = "server-proxy"
 	PlaybackTransportServerHLS   = "server-hls"
 

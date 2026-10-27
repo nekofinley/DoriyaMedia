@@ -38,8 +38,12 @@ var requiredFixtures = []string{
 	"ticket-direct-http.json",
 	"ticket-server-proxy.json",
 	"ticket-server-hls.json",
+	"ticket-direct-dash.json",
 	"ticket-unsupported.json",
 	"ticket-failed.json",
+	"ticket-failed-probe-timeout.json",
+	"ticket-failed-probe-interrupted.json",
+	"ticket-failed-probe-finalize-failed.json",
 	"ticket-expired.json",
 	"ticket-revoked.json",
 	"ticket-exhausted.json",
@@ -93,10 +97,13 @@ var requiredSchemas = []string{
 	"subtitle.schema.json",
 	"transport.schema.json",
 	"transport-direct-http.schema.json",
+	"direct-dash-stream.schema.json",
+	"transport-direct-dash.schema.json",
 	"transport-server-proxy.schema.json",
 	"transport-server-hls.schema.json",
 	"playback-ticket.schema.json",
 	"playback-ticket-issuance.schema.json",
+	"playback-failure-code.schema.json",
 	"playback-ticket-create-request.schema.json",
 	"playback-ticket-state.schema.json",
 	"playback-transport-kind.schema.json",
@@ -166,9 +173,10 @@ var expectedAuthorizationStates = map[string]string{
 }
 
 type ticketExpectation struct {
-	schema string
-	state  string
-	kind   string
+	schema      string
+	state       string
+	kind        string
+	failureCode string
 }
 
 var expectedTickets = map[string]ticketExpectation{
@@ -178,11 +186,21 @@ var expectedTickets = map[string]ticketExpectation{
 	"ticket-direct-http.json":      {schema: "issuance", state: "consuming", kind: "direct-http"},
 	"ticket-server-proxy.json":     {schema: "issuance", state: "consuming", kind: "server-proxy"},
 	"ticket-server-hls.json":       {schema: "issuance", state: "consuming", kind: "server-hls"},
-	"ticket-unsupported.json":      {schema: "status", state: "unsupported"},
-	"ticket-failed.json":           {schema: "status", state: "failed"},
-	"ticket-expired.json":          {schema: "status", state: "expired"},
-	"ticket-revoked.json":          {schema: "status", state: "revoked"},
-	"ticket-exhausted.json":        {schema: "status", state: "exhausted"},
+	"ticket-direct-dash.json":      {schema: "issuance", state: "consuming", kind: "direct-dash"},
+	"ticket-unsupported.json":      {schema: "status", state: "unsupported", failureCode: "unsupported_media"},
+	"ticket-failed.json":           {schema: "status", state: "failed", failureCode: "source_unavailable"},
+	"ticket-failed-probe-timeout.json": {
+		schema: "status", state: "failed", failureCode: "probe_timeout",
+	},
+	"ticket-failed-probe-interrupted.json": {
+		schema: "status", state: "failed", failureCode: "probe_interrupted",
+	},
+	"ticket-failed-probe-finalize-failed.json": {
+		schema: "status", state: "failed", failureCode: "probe_finalize_failed",
+	},
+	"ticket-expired.json":   {schema: "status", state: "expired"},
+	"ticket-revoked.json":   {schema: "status", state: "revoked"},
+	"ticket-exhausted.json": {schema: "status", state: "exhausted"},
 }
 
 var requiredTicketStates = []string{
@@ -293,6 +311,15 @@ func (c *checker) run() error {
 	}
 	if err := c.checkS3Schemas(); err != nil {
 		return err
+	}
+	if err := checkPlaybackMediaContract(openapiDoc); err != nil {
+		return fmt.Errorf("S4 media contract: %w", err)
+	}
+	if err := checkPlaybackRangeContract(openapiDoc); err != nil {
+		return fmt.Errorf("S4 range contract: %w", err)
+	}
+	if err := c.checkPlaybackFailureCodeContract(openapiDoc); err != nil {
+		return fmt.Errorf("S4 failure-code contract: %w", err)
 	}
 
 	schemas, err := c.compileSchemas()
@@ -700,9 +727,10 @@ func (c *checker) checkS3Schemas() error {
 		"transport-direct-http.schema.json",
 		"transport-server-proxy.schema.json",
 		"transport-server-hls.schema.json",
+		"transport-direct-dash.schema.json",
 	}
 	if !sameStringSet(transportRefs, wantTransportRefs) || len(transportRefs) != len(wantTransportRefs) {
-		return fmt.Errorf("transport.schema.json must contain exactly the three S3 transports, got %v", transportRefs)
+		return fmt.Errorf("transport.schema.json must contain exactly the four v1 transports, got %v", transportRefs)
 	}
 
 	statusDoc, err := readJSON(filepath.Join(c.protocolDir, "schemas", "playback-ticket.schema.json"))
@@ -780,6 +808,7 @@ func (c *checker) checkS3Schemas() error {
 		"transport-direct-http.schema.json",
 		"transport-server-proxy.schema.json",
 		"transport-server-hls.schema.json",
+		"transport-direct-dash.schema.json",
 	} {
 		doc, err := readJSON(filepath.Join(c.protocolDir, "schemas", name))
 		if err != nil {
@@ -877,6 +906,790 @@ func (c *checker) checkS3Schemas() error {
 		return fmt.Errorf("media-session.schema.json must not expose a separate session_id capability field")
 	}
 	return nil
+}
+
+func checkPlaybackMediaContract(value any) error {
+	root, err := asObject(value, "$")
+	if err != nil {
+		return err
+	}
+	paths, err := requiredObject(root, "paths", "$")
+	if err != nil {
+		return err
+	}
+	components, err := requiredObject(root, "components", "$")
+	if err != nil {
+		return err
+	}
+	responses, err := requiredObject(components, "responses", "$.components")
+	if err != nil {
+		return err
+	}
+
+	streamPath := "/api/v1/playback/media-sessions/{id}/stream"
+	streamStatuses := []string{
+		"200", "206", "400", "403", "404", "408", "410", "416",
+		"429", "500", "502", "504",
+	}
+	for _, method := range []string{"get", "head"} {
+		operation, err := playbackOperation(paths, streamPath, method)
+		if err != nil {
+			return err
+		}
+		label := strings.ToUpper(method) + " " + streamPath
+		if err := checkParameterRefs(operation, label,
+			"#/components/parameters/MediaSessionId",
+			"#/components/parameters/Range",
+			"#/components/parameters/IfRange",
+		); err != nil {
+			return err
+		}
+		operationResponses, err := asObject(operation["responses"], label+".responses")
+		if err != nil {
+			return err
+		}
+		for _, status := range streamStatuses {
+			if _, ok := operationResponses[status]; !ok {
+				return fmt.Errorf("%s must declare %s", label, status)
+			}
+		}
+		if method == "head" {
+			for status, raw := range operationResponses {
+				response, err := asObject(raw, label+".responses["+status+"]")
+				if err != nil {
+					return err
+				}
+				if _, exists := response["content"]; exists {
+					return fmt.Errorf("%s response %s must not declare a response body", label, status)
+				}
+				if _, exists := response["$ref"]; exists {
+					return fmt.Errorf("%s response %s must be inline and bodyless", label, status)
+				}
+			}
+			continue
+		}
+		for _, status := range []string{"200", "206"} {
+			wantRef := "#/components/responses/ServerProxyStream"
+			if status == "206" {
+				wantRef = "#/components/responses/ServerProxyPartialContent"
+			}
+			if err := checkInlineResponseRef(
+				operationResponses, status, label, wantRef); err != nil {
+				return err
+			}
+		}
+		for _, status := range []string{
+			"400", "403", "404", "408", "410", "429", "500", "502", "504",
+		} {
+			if err := checkInlineResponseRef(
+				operationResponses, status, label,
+				"#/components/responses/StableError"); err != nil {
+				return err
+			}
+		}
+	}
+
+	hlsStatuses := []string{
+		"200", "400", "403", "404", "408", "410", "415", "500", "502", "504",
+	}
+	for _, tc := range []struct {
+		path     string
+		response string
+	}{
+		{
+			path:     "/api/v1/playback/media-sessions/{id}/index.m3u8",
+			response: "ServerHLSPlaylist",
+		},
+		{
+			path:     "/api/v1/playback/media-sessions/{id}/{segment}",
+			response: "ServerHLSSegment",
+		},
+	} {
+		operation, err := playbackOperation(paths, tc.path, "get")
+		if err != nil {
+			return err
+		}
+		label := "GET " + tc.path
+		operationResponses, err := asObject(operation["responses"], label+".responses")
+		if err != nil {
+			return err
+		}
+		for _, status := range hlsStatuses {
+			if _, ok := operationResponses[status]; !ok {
+				return fmt.Errorf("%s must declare %s", label, status)
+			}
+		}
+		if err := checkInlineResponseRef(
+			operationResponses, "200", label,
+			"#/components/responses/"+tc.response); err != nil {
+			return err
+		}
+		for _, status := range []string{
+			"400", "403", "404", "408", "410", "415", "500", "502", "504",
+		} {
+			if err := checkInlineResponseRef(
+				operationResponses, status, label,
+				"#/components/responses/StableError"); err != nil {
+				return err
+			}
+		}
+	}
+
+	hlsContract, err := requiredObject(
+		root, "x-server-hls-media-session", "$")
+	if err != nil {
+		return err
+	}
+	stableErrors, err := requiredObject(
+		hlsContract, "stable_errors", "$.x-server-hls-media-session")
+	if err != nil {
+		return err
+	}
+	for status, wantCodes := range map[string][]string{
+		"400": {"invalid_request"},
+		"408": {"invalid_request"},
+		"502": {"source_unavailable"},
+		"504": {"internal_error"},
+	} {
+		raw, ok := stableErrors[status]
+		if !ok {
+			return fmt.Errorf("$.x-server-hls-media-session.stable_errors must declare %s", status)
+		}
+		codes, err := stringArray(raw, "$.x-server-hls-media-session.stable_errors["+status+"]")
+		if err != nil {
+			return err
+		}
+		if !sameStringSet(codes, wantCodes) {
+			return fmt.Errorf("$.x-server-hls-media-session.stable_errors[%s] = %v, want %v",
+				status, codes, wantCodes)
+		}
+	}
+
+	if _, err := requiredObject(responses, "StableError", "$.components.responses"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func checkParameterRefs(operation map[string]any, label string, want ...string) error {
+	parameters, err := asArray(operation["parameters"], label+".parameters")
+	if err != nil {
+		return err
+	}
+	if len(parameters) != len(want) {
+		return fmt.Errorf("%s must declare exactly %d parameters", label, len(want))
+	}
+	refs := make([]string, 0, len(parameters))
+	for i, raw := range parameters {
+		parameter, err := asObject(raw, fmt.Sprintf("%s.parameters[%d]", label, i))
+		if err != nil {
+			return err
+		}
+		ref, err := asString(parameter["$ref"], fmt.Sprintf("%s.parameters[%d].$ref", label, i))
+		if err != nil {
+			return err
+		}
+		refs = append(refs, ref)
+	}
+	if !sameStringSet(refs, want) {
+		return fmt.Errorf("%s parameter refs = %v, want %v", label, refs, want)
+	}
+	return nil
+}
+
+func checkInlineResponseRef(
+	responses map[string]any,
+	status, label, wantRef string,
+) error {
+	response, err := requiredObject(responses, status, label+".responses")
+	if err != nil {
+		return err
+	}
+	if ref, _ := response["$ref"].(string); ref != wantRef {
+		return fmt.Errorf("%s response %s must reference %s, got %q",
+			label, status, wantRef, ref)
+	}
+	return nil
+}
+
+func checkPlaybackRangeContract(value any) error {
+	root, err := asObject(value, "$")
+	if err != nil {
+		return err
+	}
+	contract, err := requiredObject(root, "x-playback-byte-ranges", "$")
+	if err != nil {
+		return err
+	}
+	if unit, _ := contract["unit"].(string); unit != "bytes" {
+		return fmt.Errorf("$.x-playback-byte-ranges.unit must be bytes")
+	}
+	request, err := requiredObject(
+		contract, "request", "$.x-playback-byte-ranges")
+	if err != nil {
+		return err
+	}
+	if err := checkStringSetField(request, "outer_ows",
+		[]string{"SP", "HTAB"},
+		"$.x-playback-byte-ranges.request"); err != nil {
+		return err
+	}
+	if err := checkStringSetField(request, "accepted_forms",
+		[]string{"closed", "open-ended"},
+		"$.x-playback-byte-ranges.request"); err != nil {
+		return err
+	}
+	if err := checkStringSetField(request, "rejected_forms",
+		[]string{"suffix", "multi-range", "repeated-header", "reversed"},
+		"$.x-playback-byte-ranges.request"); err != nil {
+		return err
+	}
+	for key, want := range map[string]int64{
+		"malformed_status":     http.StatusBadRequest,
+		"unsatisfiable_status": http.StatusRequestedRangeNotSatisfiable,
+	} {
+		got, err := asInteger(request[key], "$.x-playback-byte-ranges.request."+key)
+		if err != nil || got != want {
+			return fmt.Errorf("$.x-playback-byte-ranges.request.%s must be %d", key, want)
+		}
+	}
+	if code, _ := request["malformed_code"].(string); code != "invalid_request" {
+		return fmt.Errorf("$.x-playback-byte-ranges.request.malformed_code must be invalid_request")
+	}
+	if pattern, _ := request["unsatisfiable_content_range_pattern"].(string); pattern != `^bytes \*/[0-9]+$` {
+		return fmt.Errorf("$.x-playback-byte-ranges.request.unsatisfiable_content_range_pattern is invalid")
+	}
+
+	response, err := requiredObject(
+		contract, "response", "$.x-playback-byte-ranges")
+	if err != nil {
+		return err
+	}
+	partial, err := asInteger(
+		response["partial_status"], "$.x-playback-byte-ranges.response.partial_status")
+	if err != nil || partial != http.StatusPartialContent {
+		return fmt.Errorf("$.x-playback-byte-ranges.response.partial_status must be 206")
+	}
+	required, ok := response["content_range_required"].(bool)
+	if !ok || !required {
+		return fmt.Errorf("$.x-playback-byte-ranges.response.content_range_required must be true")
+	}
+	if pattern, _ := response["content_range_pattern"].(string); pattern != `^bytes [0-9]+-[0-9]+/[0-9]+$` {
+		return fmt.Errorf("$.x-playback-byte-ranges.response.content_range_pattern is invalid")
+	}
+	bodyless, ok := response["head_bodyless"].(bool)
+	if !ok || !bodyless {
+		return fmt.Errorf("$.x-playback-byte-ranges.response.head_bodyless must be true")
+	}
+
+	validators, err := requiredObject(
+		contract, "validators", "$.x-playback-byte-ranges")
+	if err != nil {
+		return err
+	}
+	if localETag, _ := validators["local_etag"].(string); localETag != "strong" {
+		return fmt.Errorf("$.x-playback-byte-ranges.validators.local_etag must be strong")
+	}
+	ifRange, err := requiredObject(
+		validators, "if_range", "$.x-playback-byte-ranges.validators")
+	if err != nil {
+		return err
+	}
+	if accepted, _ := ifRange["accepted"].(string); accepted != "strong-etag-or-http-date" {
+		return fmt.Errorf("$.x-playback-byte-ranges.validators.if_range.accepted must be strong-etag-or-http-date")
+	}
+	for key, want := range map[string]int64{
+		"local_date_weak_stale_or_unavailable_status": http.StatusOK,
+		"conflicting_partial_status":                  http.StatusBadGateway,
+	} {
+		got, err := asInteger(ifRange[key],
+			"$.x-playback-byte-ranges.validators.if_range."+key)
+		if err != nil || got != want {
+			return fmt.Errorf("$.x-playback-byte-ranges.validators.if_range.%s must be %d", key, want)
+		}
+	}
+	forwards, ok := ifRange["server_proxy_forwards_condition"].(bool)
+	if !ok || !forwards {
+		return fmt.Errorf("$.x-playback-byte-ranges.validators.if_range.server_proxy_forwards_condition must be true")
+	}
+
+	components, err := requiredObject(root, "components", "$")
+	if err != nil {
+		return err
+	}
+	parameters, err := requiredObject(components, "parameters", "$.components")
+	if err != nil {
+		return err
+	}
+	rangeParameter, err := requiredObject(parameters, "Range", "$.components.parameters")
+	if err != nil {
+		return err
+	}
+	rangeSchema, err := requiredObject(
+		rangeParameter, "schema", "$.components.parameters.Range")
+	if err != nil {
+		return err
+	}
+	if schemaType, _ := rangeSchema["type"].(string); schemaType != "string" {
+		return fmt.Errorf("Range.schema.type must be string")
+	}
+	wantRangePattern := `^[ \t]*[bB][yY][tT][eE][sS]=[0-9]+-(?:[0-9]+)?[ \t]*$`
+	if pattern, _ := rangeSchema["pattern"].(string); pattern != wantRangePattern {
+		return fmt.Errorf("Range.schema.pattern must encode one closed/open range with outer SP/HTAB OWS")
+	}
+	if single, ok := rangeParameter["x-single-range"].(bool); !ok || !single {
+		return fmt.Errorf("Range.x-single-range must be true")
+	}
+	if status, err := asInteger(rangeParameter["x-malformed-status"], "Range.x-malformed-status"); err != nil || status != http.StatusBadRequest {
+		return fmt.Errorf("Range.x-malformed-status must be 400")
+	}
+	for _, key := range []string{"x-outer-ows", "x-accepted-forms", "x-rejected-forms"} {
+		if _, ok := rangeParameter[key]; !ok {
+			return fmt.Errorf("Range.%s is required", key)
+		}
+	}
+	if err := checkStringSetField(rangeParameter, "x-outer-ows",
+		[]string{"SP", "HTAB"}, "$.components.parameters.Range"); err != nil {
+		return err
+	}
+	if err := checkStringSetField(rangeParameter, "x-accepted-forms",
+		[]string{"closed", "open-ended"}, "$.components.parameters.Range"); err != nil {
+		return err
+	}
+	if err := checkStringSetField(rangeParameter, "x-rejected-forms",
+		[]string{"suffix", "multi-range", "repeated-header", "reversed"},
+		"$.components.parameters.Range"); err != nil {
+		return err
+	}
+
+	ifRangeParameter, err := requiredObject(
+		parameters, "IfRange", "$.components.parameters")
+	if err != nil {
+		return err
+	}
+	if accepted, _ := ifRangeParameter["x-if-range-accepted"].(string); accepted != "strong-etag-or-http-date" {
+		return fmt.Errorf("IfRange.x-if-range-accepted must be strong-etag-or-http-date")
+	}
+	if _, exists := ifRangeParameter["x-if-range-accepted-http-date"]; exists {
+		return fmt.Errorf("IfRange.x-if-range-accepted-http-date is obsolete; x-if-range-accepted includes HTTP-date")
+	}
+	if exactStrong, ok := ifRangeParameter["x-local-exact-strong-etag-required"].(bool); !ok || !exactStrong {
+		return fmt.Errorf("IfRange.x-local-exact-strong-etag-required must be true")
+	}
+	if forwarded, _ := ifRangeParameter["x-if-range-forwarded-by-server-proxy"].(string); forwarded != "single-value-raw" {
+		return fmt.Errorf("IfRange.x-if-range-forwarded-by-server-proxy must be single-value-raw")
+	}
+	if ignored, ok := ifRangeParameter["x-if-range-ignored-without-range"].(bool); !ok || !ignored {
+		return fmt.Errorf("IfRange.x-if-range-ignored-without-range must be true")
+	}
+	if status, err := asInteger(ifRangeParameter["x-if-range-repeated-status"], "IfRange.x-if-range-repeated-status"); err != nil || status != http.StatusBadRequest {
+		return fmt.Errorf("IfRange.x-if-range-repeated-status must be 400")
+	}
+	if status, err := asInteger(ifRangeParameter["x-local-nonmatch-status"], "IfRange.x-local-nonmatch-status"); err != nil || status != http.StatusOK {
+		return fmt.Errorf("IfRange.x-local-nonmatch-status must be 200")
+	}
+	if status, err := asInteger(ifRangeParameter["x-server-proxy-conflict-status"], "IfRange.x-server-proxy-conflict-status"); err != nil || status != http.StatusBadGateway {
+		return fmt.Errorf("IfRange.x-server-proxy-conflict-status must be 502")
+	}
+	ifRangeSchema, err := requiredObject(
+		ifRangeParameter, "schema", "$.components.parameters.IfRange")
+	if err != nil {
+		return err
+	}
+	if len(ifRangeSchema) != 1 {
+		return fmt.Errorf("IfRange.schema must only declare an unconstrained string header value")
+	}
+	if schemaType, _ := ifRangeSchema["type"].(string); schemaType != "string" {
+		return fmt.Errorf("IfRange.schema.type must be string")
+	}
+
+	componentResponses, err := requiredObject(
+		components, "responses", "$.components")
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{"ServerProxyStream", "ServerProxyPartialContent"} {
+		component, err := requiredObject(componentResponses, name, "$.components.responses")
+		if err != nil {
+			return err
+		}
+		headers, err := requiredObject(component, "headers", "$.components.responses."+name)
+		if err != nil {
+			return err
+		}
+		etag, err := requiredObject(headers, "ETag", "$.components.responses."+name+".headers")
+		if err != nil {
+			return err
+		}
+		if value, _ := etag["x-if-range-validator"].(string); value != "strong-exact-only" {
+			return fmt.Errorf("%s ETag must require a strong exact If-Range validator", name)
+		}
+		etagSchema, err := requiredObject(
+			etag, "schema", "$.components.responses."+name+".headers.ETag")
+		if err != nil {
+			return err
+		}
+		if schemaType, _ := etagSchema["type"].(string); schemaType != "string" {
+			return fmt.Errorf("%s ETag.schema.type must be string", name)
+		}
+	}
+	partialResponse, err := requiredObject(
+		componentResponses, "ServerProxyPartialContent", "$.components.responses")
+	if err != nil {
+		return err
+	}
+	partialHeaders, err := requiredObject(
+		partialResponse, "headers", "$.components.responses.ServerProxyPartialContent")
+	if err != nil {
+		return err
+	}
+	contentRange, err := requiredObject(
+		partialHeaders, "Content-Range",
+		"$.components.responses.ServerProxyPartialContent.headers")
+	if err != nil {
+		return err
+	}
+	if status, err := asInteger(
+		contentRange["x-required-on-status"],
+		"ServerProxyPartialContent.headers.Content-Range.x-required-on-status"); err != nil || status != http.StatusPartialContent {
+		return fmt.Errorf("206 Content-Range must be required")
+	}
+	contentRangeSchema, err := requiredObject(
+		contentRange, "schema",
+		"$.components.responses.ServerProxyPartialContent.headers.Content-Range")
+	if err != nil {
+		return err
+	}
+	if pattern, _ := contentRangeSchema["pattern"].(string); pattern != `^bytes [0-9]+-[0-9]+/[0-9]+$` {
+		return fmt.Errorf("206 Content-Range pattern is invalid")
+	}
+
+	paths, err := requiredObject(root, "paths", "$")
+	if err != nil {
+		return err
+	}
+	head, err := playbackOperation(
+		paths, "/api/v1/playback/media-sessions/{id}/stream", "head")
+	if err != nil {
+		return err
+	}
+	headResponses, err := asObject(
+		head["responses"], "HEAD media responses")
+	if err != nil {
+		return err
+	}
+	if err := checkResponseHeader(
+		headResponses, "206", "Content-Range",
+		http.StatusPartialContent, `^bytes [0-9]+-[0-9]+/[0-9]+$`,
+		"HEAD media"); err != nil {
+		return err
+	}
+	if err := checkResponseHeader(
+		headResponses, "416", "Content-Range",
+		http.StatusRequestedRangeNotSatisfiable, `^bytes \*/[0-9]+$`,
+		"HEAD media"); err != nil {
+		return err
+	}
+	for _, status := range []string{"200", "206"} {
+		response, err := requiredObject(headResponses, status, "HEAD media.responses")
+		if err != nil {
+			return err
+		}
+		headers, err := requiredObject(
+			response, "headers", "HEAD media.responses["+status+"]")
+		if err != nil {
+			return err
+		}
+		etag, err := requiredObject(
+			headers, "ETag", "HEAD media.responses["+status+"].headers")
+		if err != nil {
+			return err
+		}
+		if value, _ := etag["x-if-range-validator"].(string); value != "strong-exact-only" {
+			return fmt.Errorf("HEAD media %s ETag must require a strong exact If-Range validator", status)
+		}
+	}
+	return nil
+}
+
+func checkResponseHeader(
+	responses map[string]any,
+	status, name string,
+	requiredStatus int64,
+	pattern, label string,
+) error {
+	response, err := requiredObject(responses, status, label+".responses")
+	if err != nil {
+		return err
+	}
+	headers, err := requiredObject(
+		response, "headers", label+".responses["+status+"]")
+	if err != nil {
+		return err
+	}
+	header, err := requiredObject(
+		headers, name, label+".responses["+status+"].headers")
+	if err != nil {
+		return err
+	}
+	required, err := asInteger(
+		header["x-required-on-status"],
+		label+".responses["+status+"].headers."+name+".x-required-on-status")
+	if err != nil || required != requiredStatus {
+		return fmt.Errorf("%s %s %s must be required on %d",
+			label, status, name, requiredStatus)
+	}
+	schema, err := requiredObject(
+		header, "schema", label+".responses["+status+"].headers."+name)
+	if err != nil {
+		return err
+	}
+	if got, _ := schema["pattern"].(string); got != pattern {
+		return fmt.Errorf("%s %s %s pattern = %q, want %q",
+			label, status, name, got, pattern)
+	}
+	return nil
+}
+
+func checkStringSetField(
+	parent map[string]any,
+	key string,
+	want []string,
+	path string,
+) error {
+	raw, ok := parent[key]
+	if !ok {
+		return fmt.Errorf("%s.%s is required", path, key)
+	}
+	got, err := stringArray(raw, path+"."+key)
+	if err != nil {
+		return err
+	}
+	if !sameStringSet(got, want) {
+		return fmt.Errorf("%s.%s = %v, want %v", path, key, got, want)
+	}
+	return nil
+}
+
+func (c *checker) checkPlaybackFailureCodeContract(openapiDoc any) error {
+	failureCodeDoc, err := readJSON(filepath.Join(
+		c.protocolDir, "schemas", "playback-failure-code.schema.json"))
+	if err != nil {
+		return err
+	}
+	statusDoc, err := readJSON(filepath.Join(
+		c.protocolDir, "schemas", "playback-ticket.schema.json"))
+	if err != nil {
+		return err
+	}
+	issuanceDoc, err := readJSON(filepath.Join(
+		c.protocolDir, "schemas", "playback-ticket-issuance.schema.json"))
+	if err != nil {
+		return err
+	}
+	return checkPlaybackFailureCodeDocs(
+		openapiDoc, failureCodeDoc, statusDoc, issuanceDoc)
+}
+
+func checkPlaybackFailureCodeDocs(
+	openapiDoc, failureCodeDoc, statusDoc, issuanceDoc any,
+) error {
+	failedCodes := []string{
+		"source_unavailable",
+		"probe_timeout",
+		"probe_interrupted",
+		"probe_finalize_failed",
+	}
+	unsupportedCodes := []string{"unsupported_media"}
+	allCodes := append(append([]string(nil), failedCodes...), unsupportedCodes...)
+
+	root, err := asObject(openapiDoc, "$")
+	if err != nil {
+		return err
+	}
+	contract, err := requiredObject(root, "x-playback-failure-codes", "$")
+	if err != nil {
+		return err
+	}
+	if err := checkStringSetField(
+		contract, "failed", failedCodes,
+		"$.x-playback-failure-codes"); err != nil {
+		return err
+	}
+	if err := checkStringSetField(
+		contract, "unsupported", unsupportedCodes,
+		"$.x-playback-failure-codes"); err != nil {
+		return err
+	}
+	if fallback, _ := contract["unknown_internal_failed_fallback"].(string); fallback != "source_unavailable" {
+		return fmt.Errorf("$.x-playback-failure-codes.unknown_internal_failed_fallback must be source_unavailable")
+	}
+
+	codes, err := schemaEnum(failureCodeDoc)
+	if err != nil {
+		return fmt.Errorf("playback-failure-code.schema.json: %w", err)
+	}
+	if !sameStringSet(codes, allCodes) {
+		return fmt.Errorf("playback-failure-code.schema.json enum = %v, want %v", codes, allCodes)
+	}
+
+	for name, doc := range map[string]any{
+		"playback-ticket.schema.json":          statusDoc,
+		"playback-ticket-issuance.schema.json": issuanceDoc,
+	} {
+		object, err := asObject(doc, "$")
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		properties, err := requiredObject(object, "properties", "$")
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		failureProperty, err := requiredObject(properties, "failure_code", "$.properties")
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		if ref, _ := failureProperty["$ref"].(string); ref != "playback-failure-code.schema.json" {
+			return fmt.Errorf("%s failure_code must reference playback-failure-code.schema.json", name)
+		}
+		unsupported, err := failureCodeConstraint(object, "unsupported")
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		if value, _ := unsupported["const"].(string); value != "unsupported_media" {
+			return fmt.Errorf("%s unsupported failure_code must be unsupported_media", name)
+		}
+		failed, err := failureCodeConstraint(object, "failed")
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		failedEnum, err := schemaEnum(failed)
+		if err != nil {
+			return fmt.Errorf("%s failed failure_code: %w", name, err)
+		}
+		if !sameStringSet(failedEnum, failedCodes) {
+			return fmt.Errorf("%s failed failure_code enum = %v, want %v",
+				name, failedEnum, failedCodes)
+		}
+		forbidden, forbiddenStates, err :=
+			failureCodeForbiddenConstraint(object)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		if !sameStringSet(forbiddenStates, []string{"failed", "unsupported"}) {
+			return fmt.Errorf("%s failure_code must be forbidden for every other state, got allowed states %v",
+				name, forbiddenStates)
+		}
+		if value, ok := forbidden["failure_code"].(bool); !ok || value {
+			return fmt.Errorf("%s non-terminal failure_code must be false", name)
+		}
+	}
+	return nil
+}
+
+func failureCodeConstraint(doc map[string]any, state string) (map[string]any, error) {
+	allOf, err := asArray(doc["allOf"], "$.allOf")
+	if err != nil {
+		return nil, err
+	}
+	for i, raw := range allOf {
+		item, err := asObject(raw, fmt.Sprintf("$.allOf[%d]", i))
+		if err != nil {
+			return nil, err
+		}
+		condition, err := asObject(item["if"], fmt.Sprintf("$.allOf[%d].if", i))
+		if err != nil {
+			continue
+		}
+		conditionProperties, err := asObject(
+			condition["properties"], fmt.Sprintf("$.allOf[%d].if.properties", i))
+		if err != nil {
+			continue
+		}
+		stateCondition, err := asObject(
+			conditionProperties["state"],
+			fmt.Sprintf("$.allOf[%d].if.properties.state", i))
+		if err != nil {
+			continue
+		}
+		constant, _ := stateCondition["const"].(string)
+		if constant != state {
+			continue
+		}
+		then, err := asObject(item["then"], fmt.Sprintf("$.allOf[%d].then", i))
+		if err != nil {
+			return nil, err
+		}
+		thenProperties, err := asObject(
+			then["properties"], fmt.Sprintf("$.allOf[%d].then.properties", i))
+		if err != nil {
+			return nil, err
+		}
+		constraint, err := asObject(
+			thenProperties["failure_code"],
+			fmt.Sprintf("$.allOf[%d].then.properties.failure_code", i))
+		if err != nil {
+			return nil, err
+		}
+		return constraint, nil
+	}
+	return nil, fmt.Errorf("missing failure_code constraint for state %q", state)
+}
+
+func failureCodeForbiddenConstraint(
+	doc map[string]any,
+) (map[string]any, []string, error) {
+	allOf, err := asArray(doc["allOf"], "$.allOf")
+	if err != nil {
+		return nil, nil, err
+	}
+	for i, raw := range allOf {
+		item, err := asObject(raw, fmt.Sprintf("$.allOf[%d]", i))
+		if err != nil {
+			return nil, nil, err
+		}
+		condition, err := asObject(item["if"], fmt.Sprintf("$.allOf[%d].if", i))
+		if err != nil {
+			continue
+		}
+		conditionProperties, err := asObject(
+			condition["properties"], fmt.Sprintf("$.allOf[%d].if.properties", i))
+		if err != nil {
+			continue
+		}
+		stateCondition, err := asObject(
+			conditionProperties["state"],
+			fmt.Sprintf("$.allOf[%d].if.properties.state", i))
+		if err != nil {
+			continue
+		}
+		notCondition, err := asObject(
+			stateCondition["not"],
+			fmt.Sprintf("$.allOf[%d].if.properties.state.not", i))
+		if err != nil {
+			continue
+		}
+		states, err := schemaEnum(notCondition)
+		if err != nil {
+			continue
+		}
+		then, err := asObject(item["then"], fmt.Sprintf("$.allOf[%d].then", i))
+		if err != nil {
+			return nil, nil, err
+		}
+		thenProperties, err := asObject(
+			then["properties"], fmt.Sprintf("$.allOf[%d].then.properties", i))
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, ok := thenProperties["failure_code"]; !ok {
+			return nil, nil, fmt.Errorf(
+				"$.allOf[%d].then.properties.failure_code is required", i)
+		}
+		return thenProperties, states, nil
+	}
+	return nil, nil, errors.New(
+		"missing condition forbidding failure_code outside failed/unsupported")
 }
 
 func nestedStringEnum(value any, objectKey, propertyKey string) ([]string, error) {
@@ -1148,7 +1961,7 @@ func (c *checker) checkOpenAPIShape(value any) error {
 	if err != nil {
 		return err
 	}
-	for name, wantRef := range map[string]string{
+	expectedComponentSchemas := map[string]string{
 		"MetaResponse":                       "./schemas/meta.schema.json",
 		"ErrorEnvelope":                      "./schemas/error.schema.json",
 		"DevicePlatform":                     "./schemas/device-platform.schema.json",
@@ -1173,12 +1986,26 @@ func (c *checker) checkOpenAPIShape(value any) error {
 		"PlaybackTicketCreateRequest":        "./schemas/playback-ticket-create-request.schema.json",
 		"PlaybackTicket":                     "./schemas/playback-ticket.schema.json",
 		"PlaybackTicketIssuance":             "./schemas/playback-ticket-issuance.schema.json",
+		"PlaybackFailureCode":                "./schemas/playback-failure-code.schema.json",
 		"PlaybackTransport":                  "./schemas/transport.schema.json",
+		"PlaybackDirectDASHStream":           "./schemas/direct-dash-stream.schema.json",
+		"PlaybackDirectDASHTransport":        "./schemas/transport-direct-dash.schema.json",
 		"PlaybackMediaSummary":               "./schemas/media.schema.json",
 		"PlaybackStream":                     "./schemas/stream.schema.json",
 		"PlaybackStreamHeaders":              "./schemas/stream-headers.schema.json",
 		"MediaSession":                       "./schemas/media-session.schema.json",
-	} {
+		"PlaybackSubtitle":                   "./schemas/subtitle.schema.json",
+	}
+	if len(componentSchemas) != len(expectedComponentSchemas) {
+		return fmt.Errorf("$.components.schemas must contain exactly %d documented schemas, got %d",
+			len(expectedComponentSchemas), len(componentSchemas))
+	}
+	for name := range componentSchemas {
+		if _, ok := expectedComponentSchemas[name]; !ok {
+			return fmt.Errorf("$.components.schemas contains unexpected schema %q", name)
+		}
+	}
+	for name, wantRef := range expectedComponentSchemas {
 		component, err := requiredObject(componentSchemas, name, "$.components.schemas")
 		if err != nil {
 			return err
@@ -1293,6 +2120,13 @@ func checkPlaybackOperations(doc map[string]any, paths, components map[string]an
 		return err
 	}
 	if err := checkNoStoreHeader(create, "201", "POST /api/v1/playback/tickets"); err != nil {
+		return err
+	}
+	if err := checkOptionalTicketLocationHeader(
+		create, "500", "POST /api/v1/playback/tickets"); err != nil {
+		return err
+	}
+	if err := checkJSONResponseRef(create, "/api/v1/playback/tickets", "post", "500", "#/components/schemas/ErrorEnvelope"); err != nil {
 		return err
 	}
 	if err := checkPlaybackDeadlineResponses(
@@ -1773,6 +2607,43 @@ func checkNoStoreHeader(operation map[string]any, status, label string) error {
 	}
 	if value, _ := schema["const"].(string); value != "no-store" {
 		return fmt.Errorf("%s %s Cache-Control must be no-store", label, status)
+	}
+	return nil
+}
+
+func checkOptionalTicketLocationHeader(
+	operation map[string]any,
+	status, label string,
+) error {
+	responses, err := asObject(operation["responses"], label+".responses")
+	if err != nil {
+		return err
+	}
+	response, err := requiredObject(responses, status, label+".responses")
+	if err != nil {
+		return err
+	}
+	headers, err := requiredObject(
+		response, "headers", label+".responses["+status+"]")
+	if err != nil {
+		return err
+	}
+	location, err := requiredObject(
+		headers, "Location", label+".responses["+status+"].headers")
+	if err != nil {
+		return err
+	}
+	schema, err := requiredObject(
+		location, "schema",
+		label+".responses["+status+"].headers.Location")
+	if err != nil {
+		return err
+	}
+	if schemaType, _ := schema["type"].(string); schemaType != "string" {
+		return fmt.Errorf("%s %s Location.schema.type must be string", label, status)
+	}
+	if pattern, _ := schema["pattern"].(string); pattern != "^/api/v1/playback/tickets/pt_[A-Za-z0-9_-]{8,96}$" {
+		return fmt.Errorf("%s %s Location.schema.pattern is invalid", label, status)
 	}
 	return nil
 }
@@ -2353,6 +3224,16 @@ func checkTicketFixture(name string, value any) error {
 	}
 	if state != expectation.state {
 		return fmt.Errorf("state must be %q, got %q", expectation.state, state)
+	}
+	if expectation.failureCode != "" {
+		failureCode, err := asString(doc["failure_code"], "$.failure_code")
+		if err != nil {
+			return err
+		}
+		if failureCode != expectation.failureCode {
+			return fmt.Errorf("failure_code must be %q, got %q",
+				expectation.failureCode, failureCode)
+		}
 	}
 	if expectation.schema == "status" {
 		forbidden := map[string]bool{

@@ -1930,26 +1930,41 @@ func (d *BilibiliDriver) Parts(ctx context.Context, path string) ([]Part, error)
 	} else if ref.Duration > 0 {
 		dur = float64(ref.Duration) / 1000.0
 	}
-	headers := d.streamHeaders()
-
 	vid, ok := d.pickVideo(info.Dash.Video)
 	if !ok {
 		return nil, fmt.Errorf("bilibili: 没有可用的视频流")
 	}
 	vname, vtag, vprofile := codecOf(vid.Codecs)
 	parts := []Part{{
-		URL: repURL(vid), Headers: headers, Kind: "video",
+		URL: repURL(vid), Headers: d.streamHeaders(), MIME: vid.MimeType,
+		Kind:  "video",
 		Codec: vname, Tag: vtag, Profile: vprofile,
+		BitDepth: bitDepthOfProfile(vprofile), HDR: vid.isHDR(),
 		Width: vid.Width, Height: vid.Height, Duration: dur,
 	}}
 	if aud, ok := pickAudio(info.Dash.Audio); ok {
 		aname, atag, _ := codecOf(aud.Codecs)
 		parts = append(parts, Part{
-			URL: repURL(aud), Headers: headers, Kind: "audio",
+			URL: repURL(aud), Headers: d.streamHeaders(), MIME: aud.MimeType,
+			Kind:  "audio",
 			Codec: aname, Tag: atag, Channels: 2, Duration: dur,
 		})
 	}
 	return parts, nil
+}
+
+func bitDepthOfProfile(profile string) int {
+	p := strings.ToLower(strings.TrimSpace(profile))
+	switch {
+	case strings.Contains(p, "12"):
+		return 12
+	case strings.Contains(p, "10"):
+		return 10
+	case p != "":
+		return 8
+	default:
+		return 0
+	}
 }
 
 // Open returns the video stream's bytes. Nothing in this tree is a small file

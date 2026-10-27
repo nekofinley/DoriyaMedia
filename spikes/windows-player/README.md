@@ -1,8 +1,8 @@
-# Windows 播放内核 W0 可行性预检
+# Windows 播放内核 W0 Spike
 
-> 状态：仅完成环境与可行性文档预检，W0 尚未完成。
+> 状态：两个候选均已形成隔离机制原型并通过本机构建、自动测试和无真实媒体的启动/探针冒烟；W0 尚未完成。
 >
-> 截至 2026-10-27，两个候选原型均未创建或构建，S1-S5 均未运行；30 分钟连续播放、20 次 seek、音画差和 DPI 矩阵均无实测结果。
+> 截至 2026-10-28，S1-S5 均未运行；30 分钟连续播放、20 次 seek、音画差、真实 Bilibili 双流和 DPI/多显示器矩阵均无实测结果。
 
 ## 1. 范围
 
@@ -38,7 +38,7 @@
 - WebView2 Runtime。
 - 可执行的 `mpv`，以及该 mpv 构建实际包含的 FFmpeg/解码器/字幕依赖。
 
-当前阻断项：`mpv` 不在 `PATH`，未在本机标准位置发现可执行文件。只看到 `ffmpeg` 不代表已有 mpv，也不能把系统 ffmpeg 的存在当作 mpv 的解码器或发布许可已经确认。
+当前状态：本机已配置 mpv `v0.41.0`，原型位于 `tauri-mpv/`。Rust 宿主管理 sidecar、Windows 命名管道、JSON IPC、退出清理、URL/Header 边界和固定命令白名单。已通过本机真实 mpv 空载 IPC smoke；尚未加载真实媒体。
 
 ### 2.2 WinUI 3 + LibVLCSharp
 
@@ -56,19 +56,19 @@
 - 适用于目标架构的 LibVLCSharp NuGet 包。
 - 与 LibVLCSharp 版本匹配的 libVLC 动态库和 plugins。
 
-当前阻断项：`dotnet` host 存在，但 `.NET SDK` 缺失。`C:\Program Files\VideoLAN\VLC\libvlc.dll` 仅说明本机有可检测到的 VLC 运行时文件；`vlc` 命令入口未发现，且该 DLL 尚未证明能被 LibVLCSharp 加载、解码目标样本，也不能据此认定可随产品分发。
+当前状态：本机已安装 .NET SDK `8.0.427`，原型位于 `winui-libvlcsharp/`。该项目能从已安装 VLC `3.0.19` 初始化 LibVLCSharp、显示 WinUI video surface、构造音频 slave，并支持 `Referer`/`User-Agent` 白名单 Header；其他 Header 或两流不同 Header 会 fail-closed。已用两个 loopback 合成源验证 `Opening -> Playing`，但没有真实来源、音画同步、seek 或 30 分钟结果。`libvlc.dll` 可加载不等于目标样本可解码，也不等于可随产品分发。
 
 ## 3. 落盘目录
 
-W0 开始后使用以下隔离目录：
+W0 使用以下隔离目录：
 
 ```text
 spikes/windows-player/
   README.md                 当前文件
   preflight.ps1             只读环境预检
-  tauri-mpv/                未来原型；尚未创建
-  winui-libvlcsharp/        未来原型；尚未创建
-  fixtures/                 未来本地测试素材/脱敏 fixture；尚未创建
+  tauri-mpv/                Tauri 2 + mpv 机制原型
+  winui-libvlcsharp/        WinUI 3 + LibVLCSharp 机制原型
+  fixtures/                 合成 S1-S3 样本与 Header/Range loopback fixture
   results/                  未来脱敏测试记录；尚未创建
   artifacts/                未来本机构建产物；不进入版本控制
 ```
@@ -117,11 +117,11 @@ PREFLIGHT|<category>|<id>|<status>|<detail>|<source>
 - `UNVERIFIED`：使用 `-NoVersionProbe`，跳过版本查询；只证明部分存在性（含 libVLC 结构/PE 架构检查），不能判定版本或就绪。
 - `W0_NOT_RUN`：始终追加在 summary 中，防止把预检误读为实测完成。
 
-退出码：`0` 表示本机前置组件就绪但未执行 W0；`2` 表示阻塞或未验证。任何输出都没有证明 S1-S5、全屏、DPI 或 30 分钟稳定性通过。
+退出码：`0` 表示本机前置组件就绪；`2` 表示阻塞或未验证。预检脚本自身不执行 W0，任何输出都没有证明 S1-S5、全屏、DPI 或 30 分钟稳定性通过。
 
 ## 5. 当前环境快照
 
-2026-10-27 的只读预检结果：
+2026-10-28 的只读预检结果：
 
 | 项目 | 结果 |
 | --- | --- |
@@ -129,23 +129,40 @@ PREFLIGHT|<category>|<id>|<status>|<detail>|<source>
 | PowerShell | Windows PowerShell 5.1.19041.6456；pwsh 7.6.5 |
 | GPU | NVIDIA RTX 3070 Laptop；AMD Radeon 核显；GameViewer 虚拟显示适配器 |
 | Rust | cargo/rustc 1.87.0 |
-| .NET | host/runtime 8.0.21；SDK 目录不存在 |
-| 媒体工具 | ffmpeg/ffprobe 8.0.1 |
+| .NET | SDK 8.0.427；host/runtime 8.0.21 |
+| 媒体工具 | mpv v0.41.0；ffmpeg/ffprobe 8.0.1 |
 | 前端工具 | Node.js 22.4.1、npm 10.8.1、pnpm 9.5.0 |
 | Windows 构建链 | Visual Studio 2022 C++ 17.10.4、Windows SDK 10.0.22000；MSBuild 从 VS 路径发现 |
 | WebView2 | 155.0.4283.62 |
 | VLC | `libvlc.dll` 3.0.19 被发现；同目录 core 与 366 个 plugins DLL 的 PE 架构均为 x64；`vlc` 命令入口未发现 |
-| Tauri + mpv | `BLOCKED`：缺 `mpv` |
-| WinUI + LibVLCSharp | `BLOCKED`：缺 `.NET SDK` |
-| 预检 summary | `BLOCKED missing=dotnet-sdk,mpv W0_NOT_RUN` |
-| Java、Gradle、adb、cmake | 未检测到；Java、Gradle、adb 不是 Windows W0 两个候选的直接构建依赖，cmake 只是可选构建工具 |
+| Tauri + mpv | `READY_FOR_PROTOTYPE`；机制原型已构建并通过空载 IPC smoke |
+| WinUI + LibVLCSharp | `READY_FOR_PROTOTYPE`；机制原型已构建并通过 LibVLC probe/app smoke |
+| 预检 summary | `READY_FOR_PROTOTYPE W0_NOT_RUN` |
+| Java、Gradle、adb、cmake | 已补齐；Java、Gradle、adb 不是 Windows W0 两个候选的直接构建依赖，cmake 只是可选构建工具 |
 
 该快照不能证明以下矩阵已经满足：
 
 - 没有 Windows 11 当前稳定版机器。
 - 没有 Intel 显卡目标设备；当前 NVIDIA 与 AMD 适配器来自同一主机，不能替代三台设备。
 - 没有进行物理单屏/双屏切换、100%/150%/200% DPI、睡眠恢复或 Wi-Fi/热点测试。
-- 没有证明现有 `ffmpeg` 或 `libvlc.dll` 可被任一原型加载，也没有确认其分发许可。
+- `libvlc.dll` 已被 LibVLCSharp probe 加载为 `3.0.19 Vetinari`，但没有证明目标媒体、双流、字幕或图形字幕能力。
+- 没有确认 mpv/FFmpeg/VLC/插件及编解码器的分发许可。
+
+### 5.1 机制验证结果
+
+| 候选 | 已验证 | 未验证 |
+| --- | --- | --- |
+| Tauri 2 + mpv | `pnpm install --frozen-lockfile`、`pnpm build`、`cargo fmt`、`cargo clippy -D warnings`、32 个 Rust tests（另 1 个真实 mpv 测试需显式启用）、真实 mpv 空载 IPC 1/1；Tauri debug exe 构建和交互会话 GUI 启动/退出 smoke | 真实 S1-S5、双流、Header 实际播放、30 分钟、seek、DPI、GPU、网络、许可证 |
+| WinUI 3 + LibVLCSharp | .NET restore/build（0 warnings/errors）、91 个 xUnit tests、LibVLC 3.0.19 probe（含 audio slave/Header 构造）、Windows App SDK self-contained app smoke、loopback 双源 GUI 机制 smoke | 真实 S1-S5、真实 Bilibili 双流、跨源重定向、30 分钟、seek、音画差、DPI、GPU、网络、许可证 |
+
+两个结果都只证明代码、依赖、窗口/进程生命周期和基础探针可工作，不能替代播放器级验收。Tauri 已隔离 mpv 环境变量、使用 128 位随机命名管道、校验管道服务端 PID、将 capability 权限收紧为空，并实现有界 IPC 请求、`start-file`/`file-loaded`/`end-file` 状态和超时强杀清理；仍需完成完整 DACL/SID/session 对端信任、Windows Job Object 清理、sidecar 身份校验和重定向策略。WinUI 已实现 `Referer`/`User-Agent` media option 与音频 slave，但 LibVLC 3.0.19 不能安全表达 `Origin`/`Accept`/`Accept-Language` 或两流不同 Header，因此这些场景必须拒绝。
+
+`fixtures/synthetic/` 中已有 H.264/AAC、H.264/E-AC-3、HEVC Main10/FLAC 三个合成样本，并通过 `ffprobe` 与 mpv 空输出解码检查；真实 S2 E-AC-3 样本仍未提供。`fixtures/header-range-server.py` 和 `check-header-range.ps1` 已通过 HEAD 200、100-byte Range 206、416、缺失 Header 403 和 mpv HTTP Header 注入检查。合成样本只验证机制，不关闭 S1-S5。
+
+```powershell
+.\fixtures\synthetic\check-fixtures.ps1
+.\fixtures\check-header-range.ps1
+```
 
 ## 6. S1-S5 测试项
 
@@ -189,11 +206,12 @@ S4/S5 结果只能在脱敏记录中保留样本 ID、host:port、状态码、Ra
 
 ## 8. 尚未执行
 
-- 未创建 Tauri 或 WinUI 原型工程。
-- 未安装 `mpv` 或 `.NET SDK`，也未安装任何 NuGet、crate 或大型依赖。
-- 未运行 `cargo build/test`、`dotnet build/test` 或任何不存在的项目命令。
 - 未执行 S1-S5 的实际播放、解码、字幕、Header、双流或 fallback 测试。
 - 未执行 30 分钟连续播放、20 次随机 seek、音画差测量或 DPI/多显示器矩阵。
+- 未在 Windows 11、Intel GPU、真实双屏/混合 DPI 或睡眠恢复环境验证。
+- 未验证真实 Bilibili 双流、源 URL 过期、地区错误、单流 403 或 Wi-Fi/热点切换。
+- 未完成 Tauri 完整 DACL/SID/session 管道对端信任、Job Object 强制退出清理、sidecar 身份校验和重定向策略。
+- WinUI 只支持对两路源同时生效的 `Referer`/`User-Agent`；`Origin`、`Accept`、`Accept-Language`、两流不同 Header、跨源重定向和真实 Bilibili 双流均未验收。
 - 未完成两个候选的许可证与发布义务复核。
 
 W0 的结论只能在上述证据形成后写入 ADR；当前 ADR 状态保持 `Proposed / 待真机验证`。

@@ -31,8 +31,7 @@ type PlaybackSubtitleSessionAccess struct {
 	Device  *models.Device
 }
 
-var playbackSubtitleMigrationStatements = []string{
-	`CREATE TABLE IF NOT EXISTS playback_subtitle_sessions (
+const playbackSubtitleSessionsTableDefinition = `CREATE TABLE IF NOT EXISTS playback_subtitle_sessions (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		capability_hash TEXT NOT NULL,
 		ticket_id TEXT NOT NULL REFERENCES playback_tickets(ticket_id) ON DELETE CASCADE,
@@ -41,7 +40,7 @@ var playbackSubtitleMigrationStatements = []string{
 		file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
 		purpose TEXT NOT NULL DEFAULT 'playback' CHECK(purpose = 'playback'),
 		transport TEXT NOT NULL CHECK(transport IN (
-			'direct-http','server-proxy','server-hls'
+			'direct-http','direct-dash','server-proxy','server-hls'
 		)),
 		subtitle_id INTEGER NOT NULL REFERENCES subtitles(id) ON DELETE CASCADE,
 		state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','expired','revoked')),
@@ -53,7 +52,10 @@ var playbackSubtitleMigrationStatements = []string{
 		absolute_expires_at TIMESTAMP NOT NULL CHECK(idle_expires_at <= absolute_expires_at),
 		updated_at TIMESTAMP NOT NULL,
 		revoked_at TIMESTAMP
-	)`,
+	)`
+
+var playbackSubtitleMigrationStatements = []string{
+	playbackSubtitleSessionsTableDefinition,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_playback_subtitle_sessions_capability
 		ON playback_subtitle_sessions(capability_hash)`,
 	`CREATE INDEX IF NOT EXISTS idx_playback_subtitle_sessions_binding
@@ -104,12 +106,31 @@ const playbackSubtitleSessionColumns = `id, ticket_id, user_id, device_id,
 	created_at, last_used_at, idle_expires_at, absolute_expires_at, updated_at,
 	revoked_at`
 
+const playbackSubtitleSessionMigrationColumns = `id, capability_hash, ticket_id,
+	user_id, device_id, file_id, purpose, transport, subtitle_id, state,
+	start_seconds, version, created_at, last_used_at, idle_expires_at,
+	absolute_expires_at, updated_at, revoked_at`
+
 // CreatePlaybackSubtitleSession issues a separate short-lived capability for
 // one subtitle already granted to the ticket. Only the SHA-256 hash is stored.
 func (s *Store) CreatePlaybackSubtitleSession(
 	req models.PlaybackSubtitleSessionRequest,
 	now time.Time,
 ) (*models.PlaybackSubtitleSessionGrant, error) {
+	return s.CreatePlaybackSubtitleSessionContext(
+		context.Background(), req, now)
+}
+
+// CreatePlaybackSubtitleSessionContext is CreatePlaybackSubtitleSession with
+// cancellation covering the shared writer wait and the subtitle grant insert.
+func (s *Store) CreatePlaybackSubtitleSessionContext(
+	ctx context.Context,
+	req models.PlaybackSubtitleSessionRequest,
+	now time.Time,
+) (*models.PlaybackSubtitleSessionGrant, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	now = playbackTime(now)
 	req, err := normalizePlaybackSubtitleSessionRequest(req)
 	if err != nil {
@@ -119,95 +140,99 @@ func (s *Store) CreatePlaybackSubtitleSession(
 	if err != nil {
 		return nil, err
 	}
-
-	tx, err := s.DB.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	if err := lockPlaybackTicketTx(tx, req.Ticket); err != nil {
-		return nil, err
-	}
-	ticket, err := loadPlaybackTicketTx(tx, req.Ticket)
-	if err != nil {
-		return nil, err
-	}
-	if err := requirePlaybackTransportAllowedTx(tx, ticket.DeviceID, req.Transport); err != nil {
-		return nil, err
-	}
-	switch ticket.State {
-	case models.PlaybackTicketExpired:
-		return nil, ErrPlaybackTicketExpired
-	case models.PlaybackTicketRevoked:
-		return nil, ErrPlaybackTicketRevoked
-	case models.PlaybackTicketConsuming:
-	default:
-		return nil, ErrPlaybackTicketConflict
-	}
-	if !now.Before(ticket.ExpiresAt) {
-		expired, err := expirePlaybackTicketTx(tx, ticket, now)
-		if err != nil {
-			return nil, err
-		}
-		if !expired {
-			return nil, ErrPlaybackTicketConflict
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		return nil, ErrPlaybackTicketExpired
-	}
-	if ticket.SelectedTransport != req.Transport ||
-		!playbackTicketGrantsSubtitle(ticket, req.SubtitleID) {
-		return nil, ErrInvalidPlaybackSubtitleSession
-	}
-	var fileID int64
-	err = tx.QueryRow(`SELECT file_id FROM subtitles WHERE id = ?`,
-		req.SubtitleID).Scan(&fileID)
-	if errors.Is(err, sql.ErrNoRows) || (err == nil && fileID != ticket.FileID) {
-		return nil, ErrInvalidPlaybackSubtitleSession
-	}
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	absoluteExpiresAt := now.Add(models.PlaybackSubtitleSessionAbsoluteTTL)
-	idleExpiresAt := now.Add(models.PlaybackSubtitleSessionIdleTTL)
-	if idleExpiresAt.After(absoluteExpiresAt) {
-		idleExpiresAt = absoluteExpiresAt
-	}
-	res, err := tx.Exec(`INSERT INTO playback_subtitle_sessions
-		(capability_hash, ticket_id, user_id, device_id, file_id, purpose,
-		 transport, subtitle_id, state, start_seconds, version, created_at,
-		 idle_expires_at, absolute_expires_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		hashPlaybackCapability(capability), req.Ticket.TicketID,
-		req.Ticket.UserID, req.Ticket.DeviceID, req.Ticket.FileID,
-		models.PlaybackPurposePlayback, req.Transport, req.SubtitleID,
-		models.PlaybackSubtitleSessionActive, req.StartSeconds, 1, now,
-		idleExpiresAt, absoluteExpiresAt, now)
+	var grant *models.PlaybackSubtitleSessionGrant
+	err = s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return lockPlaybackTicketTxContext(ctx, tx, req.Ticket)
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			ticket, err := loadPlaybackTicketTxContext(ctx, tx, req.Ticket)
+			if err != nil {
+				return false, err
+			}
+			if err := requirePlaybackTransportAllowedTxContext(
+				ctx, tx, ticket.DeviceID, req.Transport); err != nil {
+				return false, err
+			}
+			switch ticket.State {
+			case models.PlaybackTicketExpired:
+				return false, ErrPlaybackTicketExpired
+			case models.PlaybackTicketRevoked:
+				return false, ErrPlaybackTicketRevoked
+			case models.PlaybackTicketConsuming:
+			default:
+				return false, ErrPlaybackTicketConflict
+			}
+			if !now.Before(ticket.ExpiresAt) {
+				expired, err := expirePlaybackTicketTxContext(ctx, tx, ticket, now)
+				if err != nil {
+					return false, err
+				}
+				if !expired {
+					return false, ErrPlaybackTicketConflict
+				}
+				return true, ErrPlaybackTicketExpired
+			}
+			if ticket.SelectedTransport != req.Transport ||
+				!playbackTicketGrantsSubtitle(ticket, req.SubtitleID) {
+				return false, ErrInvalidPlaybackSubtitleSession
+			}
+			var fileID int64
+			err = tx.QueryRowContext(ctx, `SELECT file_id FROM subtitles WHERE id = ?`,
+				req.SubtitleID).Scan(&fileID)
+			if errors.Is(err, sql.ErrNoRows) || (err == nil && fileID != ticket.FileID) {
+				return false, ErrInvalidPlaybackSubtitleSession
+			}
+			if err != nil {
+				return false, err
+			}
+
+			absoluteExpiresAt := now.Add(models.PlaybackSubtitleSessionAbsoluteTTL)
+			idleExpiresAt := now.Add(models.PlaybackSubtitleSessionIdleTTL)
+			if idleExpiresAt.After(absoluteExpiresAt) {
+				idleExpiresAt = absoluteExpiresAt
+			}
+			res, err := tx.ExecContext(ctx, `INSERT INTO playback_subtitle_sessions
+				(capability_hash, ticket_id, user_id, device_id, file_id, purpose,
+				 transport, subtitle_id, state, start_seconds, version, created_at,
+				 idle_expires_at, absolute_expires_at, updated_at)
+				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				hashPlaybackCapability(capability), req.Ticket.TicketID,
+				req.Ticket.UserID, req.Ticket.DeviceID, req.Ticket.FileID,
+				models.PlaybackPurposePlayback, req.Transport, req.SubtitleID,
+				models.PlaybackSubtitleSessionActive, req.StartSeconds, 1, now,
+				idleExpiresAt, absoluteExpiresAt, now)
+			if err != nil {
+				return false, err
+			}
+			id, err := res.LastInsertId()
+			if err != nil {
+				return false, err
+			}
+			session := &models.PlaybackSubtitleSession{
+				ID: id, TicketID: req.Ticket.TicketID, UserID: req.Ticket.UserID,
+				DeviceID: req.Ticket.DeviceID, FileID: req.Ticket.FileID,
+				Purpose: models.PlaybackPurposePlayback, Transport: req.Transport,
+				SubtitleID: req.SubtitleID, State: models.PlaybackSubtitleSessionActive,
+				StartSeconds: req.StartSeconds, Version: 1, CreatedAt: now,
+				IdleExpiresAt: idleExpiresAt, AbsoluteExpiresAt: absoluteExpiresAt,
+				UpdatedAt: now,
+			}
+			grant = &models.PlaybackSubtitleSessionGrant{
+				Session: session, Capability: capability,
+			}
+			return true, nil
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	session := &models.PlaybackSubtitleSession{
-		ID: id, TicketID: req.Ticket.TicketID, UserID: req.Ticket.UserID,
-		DeviceID: req.Ticket.DeviceID, FileID: req.Ticket.FileID,
-		Purpose: models.PlaybackPurposePlayback, Transport: req.Transport,
-		SubtitleID: req.SubtitleID, State: models.PlaybackSubtitleSessionActive,
-		StartSeconds: req.StartSeconds, Version: 1, CreatedAt: now,
-		IdleExpiresAt: idleExpiresAt, AbsoluteExpiresAt: absoluteExpiresAt,
-		UpdatedAt: now,
-	}
-	return &models.PlaybackSubtitleSessionGrant{
-		Session: session, Capability: capability,
-	}, nil
+	return grant, nil
 }
 
 // AuthorizePlaybackSubtitleSession resolves a capability and rechecks the live
@@ -218,150 +243,170 @@ func (s *Store) AuthorizePlaybackSubtitleSession(
 	requireEmailVerification bool,
 	now time.Time,
 ) (*PlaybackSubtitleSessionAccess, error) {
+	return s.AuthorizePlaybackSubtitleSessionContext(
+		context.Background(), capability, requireEmailVerification, now)
+}
+
+// AuthorizePlaybackSubtitleSessionContext is
+// AuthorizePlaybackSubtitleSession with cancellation covering the shared writer
+// wait and the authorization CAS.
+func (s *Store) AuthorizePlaybackSubtitleSessionContext(
+	ctx context.Context,
+	capability string,
+	requireEmailVerification bool,
+	now time.Time,
+) (*PlaybackSubtitleSessionAccess, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	now = playbackTime(now)
 	if strings.TrimSpace(capability) == "" {
 		return nil, ErrPlaybackSubtitleSessionNotFound
 	}
-	tx, err := s.DB.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	if err := lockPlaybackSubtitleSessionTx(tx, capability); err != nil {
-		return nil, err
-	}
+	var access *PlaybackSubtitleSessionAccess
+	err := s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return lockPlaybackSubtitleSessionTxContext(ctx, tx, capability)
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			session, err := scanPlaybackSubtitleSession(tx.QueryRowContext(ctx, `SELECT `+
+				playbackSubtitleSessionColumns+`
+				FROM playback_subtitle_sessions WHERE capability_hash = ?`,
+				hashPlaybackCapability(capability)))
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, ErrPlaybackSubtitleSessionNotFound
+			}
+			if err != nil {
+				return false, err
+			}
+			switch session.State {
+			case models.PlaybackSubtitleSessionRevoked:
+				return false, ErrPlaybackSubtitleSessionRevoked
+			case models.PlaybackSubtitleSessionExpired:
+				return false, ErrPlaybackSubtitleSessionExpired
+			case models.PlaybackSubtitleSessionActive:
+			default:
+				return false, ErrPlaybackSubtitleSessionConflict
+			}
+			if !now.Before(session.IdleExpiresAt) || !now.Before(session.AbsoluteExpiresAt) {
+				res, err := tx.ExecContext(ctx, `UPDATE playback_subtitle_sessions
+					SET state = ?, version = version + 1, updated_at = ?
+					WHERE id = ? AND version = ? AND state = ?
+						AND (idle_expires_at <= ? OR absolute_expires_at <= ?)`,
+					models.PlaybackSubtitleSessionExpired, now, session.ID,
+					session.Version, models.PlaybackSubtitleSessionActive, now, now)
+				if err != nil {
+					return false, err
+				}
+				n, err := res.RowsAffected()
+				if err != nil {
+					return false, err
+				}
+				if n != 1 {
+					return false, ErrPlaybackSubtitleSessionConflict
+				}
+				return true, ErrPlaybackSubtitleSessionExpired
+			}
 
-	session, err := scanPlaybackSubtitleSession(tx.QueryRow(`SELECT `+
-		playbackSubtitleSessionColumns+`
-		FROM playback_subtitle_sessions WHERE capability_hash = ?`,
-		hashPlaybackCapability(capability)))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrPlaybackSubtitleSessionNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	switch session.State {
-	case models.PlaybackSubtitleSessionRevoked:
-		return nil, ErrPlaybackSubtitleSessionRevoked
-	case models.PlaybackSubtitleSessionExpired:
-		return nil, ErrPlaybackSubtitleSessionExpired
-	case models.PlaybackSubtitleSessionActive:
-	default:
-		return nil, ErrPlaybackSubtitleSessionConflict
-	}
-	if !now.Before(session.IdleExpiresAt) || !now.Before(session.AbsoluteExpiresAt) {
-		res, err := tx.Exec(`UPDATE playback_subtitle_sessions
-			SET state = ?, version = version + 1, updated_at = ?
-			WHERE id = ? AND version = ? AND state = ?
-				AND (idle_expires_at <= ? OR absolute_expires_at <= ?)`,
-			models.PlaybackSubtitleSessionExpired, now, session.ID,
-			session.Version, models.PlaybackSubtitleSessionActive, now, now)
-		if err != nil {
-			return nil, err
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return nil, err
-		}
-		if n != 1 {
-			return nil, ErrPlaybackSubtitleSessionConflict
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		return nil, ErrPlaybackSubtitleSessionExpired
-	}
+			var ticketState, selectedTransport string
+			err = tx.QueryRowContext(ctx, `SELECT state, selected_transport
+				FROM playback_tickets
+				WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?`,
+				session.TicketID, session.UserID, session.DeviceID, session.FileID).
+				Scan(&ticketState, &selectedTransport)
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, ErrPlaybackTicketNotFound
+			}
+			if err != nil {
+				return false, err
+			}
+			if ticketState == models.PlaybackTicketRevoked {
+				return false, ErrPlaybackTicketRevoked
+			}
+			if selectedTransport != session.Transport {
+				return false, ErrPlaybackSubtitleSessionNotFound
+			}
 
-	var ticketState string
-	err = tx.QueryRow(`SELECT state FROM playback_tickets
-		WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?`,
-		session.TicketID, session.UserID, session.DeviceID, session.FileID).
-		Scan(&ticketState)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrPlaybackTicketNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	if ticketState == models.PlaybackTicketRevoked {
-		return nil, ErrPlaybackTicketRevoked
-	}
+			var (
+				user          models.User
+				emailVerified int
+				device        models.Device
+				deviceRevoked sql.NullTime
+			)
+			err = tx.QueryRowContext(ctx, `SELECT
+				u.id, u.name, u.status, u.email, u.email_verified,
+				d.id, d.public_id, d.user_id, d.name, d.platform, d.client_version,
+				d.created_at, d.last_seen_at, d.revoked_at
+				FROM users u JOIN devices d ON d.user_id = u.id
+				WHERE u.id = ? AND d.id = ?`,
+				session.UserID, session.DeviceID).
+				Scan(&user.ID, &user.Name, &user.Status, &user.Email, &emailVerified,
+					&device.ID, &device.PublicID, &device.UserID, &device.Name,
+					&device.Platform, &device.ClientVersion, &device.CreatedAt,
+					&device.LastSeenAt, &deviceRevoked)
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, ErrDeviceUserUnavailable
+			}
+			if err != nil {
+				return false, err
+			}
+			user.EmailVerified = emailVerified != 0
+			if !deviceAuthUserAllowed(
+				user.Status, user.Email, user.EmailVerified, requireEmailVerification) {
+				return false, ErrDeviceUserUnavailable
+			}
+			if deviceRevoked.Valid {
+				return false, ErrDeviceRevoked
+			}
+			overrides, err := loadDeviceFeatureOverridesContext(ctx, tx, device.ID)
+			if err != nil {
+				return false, err
+			}
+			if overrides.DisablesPlaybackTickets() ||
+				overrides.DisablesPlaybackTransport(session.Transport) {
+				return false, ErrDevicePlaybackDisabled
+			}
 
-	var (
-		user          models.User
-		emailVerified int
-		device        models.Device
-		deviceRevoked sql.NullTime
+			idleExpiresAt := now.Add(models.PlaybackSubtitleSessionIdleTTL)
+			if idleExpiresAt.After(session.AbsoluteExpiresAt) {
+				idleExpiresAt = session.AbsoluteExpiresAt
+			}
+			res, err := tx.ExecContext(ctx, `UPDATE playback_subtitle_sessions
+				SET last_used_at = ?, idle_expires_at = ?, version = version + 1,
+					updated_at = ?
+				WHERE id = ? AND version = ? AND state = ?
+					AND idle_expires_at > ? AND absolute_expires_at > ?`,
+				now, idleExpiresAt, now, session.ID, session.Version,
+				models.PlaybackSubtitleSessionActive, now, now)
+			if err != nil {
+				return false, err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return false, err
+			}
+			if n != 1 {
+				return false, ErrPlaybackSubtitleSessionConflict
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE devices SET last_seen_at = ?
+				WHERE id = ? AND revoked_at IS NULL`, now, device.ID); err != nil {
+				return false, err
+			}
+			session.LastUsedAt = timePointer(now)
+			session.IdleExpiresAt = idleExpiresAt
+			session.Version++
+			session.UpdatedAt = now
+			access = &PlaybackSubtitleSessionAccess{
+				Session: session, User: &user, Device: &device,
+			}
+			return true, nil
+		},
 	)
-	err = tx.QueryRow(`SELECT
-		u.id, u.name, u.status, u.email, u.email_verified,
-		d.id, d.public_id, d.user_id, d.name, d.platform, d.client_version,
-		d.created_at, d.last_seen_at, d.revoked_at
-		FROM users u JOIN devices d ON d.user_id = u.id
-		WHERE u.id = ? AND d.id = ?`,
-		session.UserID, session.DeviceID).
-		Scan(&user.ID, &user.Name, &user.Status, &user.Email, &emailVerified,
-			&device.ID, &device.PublicID, &device.UserID, &device.Name,
-			&device.Platform, &device.ClientVersion, &device.CreatedAt,
-			&device.LastSeenAt, &deviceRevoked)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrDeviceUserUnavailable
-	}
 	if err != nil {
 		return nil, err
 	}
-	user.EmailVerified = emailVerified != 0
-	if !deviceAuthUserAllowed(user.Status, user.Email, user.EmailVerified, requireEmailVerification) {
-		return nil, ErrDeviceUserUnavailable
-	}
-	if deviceRevoked.Valid {
-		return nil, ErrDeviceRevoked
-	}
-	overrides, err := loadDeviceFeatureOverrides(tx, device.ID)
-	if err != nil {
-		return nil, err
-	}
-	if overrides.DisablesPlaybackTickets() ||
-		overrides.DisablesPlaybackTransport(session.Transport) {
-		return nil, ErrDevicePlaybackDisabled
-	}
-
-	idleExpiresAt := now.Add(models.PlaybackSubtitleSessionIdleTTL)
-	if idleExpiresAt.After(session.AbsoluteExpiresAt) {
-		idleExpiresAt = session.AbsoluteExpiresAt
-	}
-	res, err := tx.Exec(`UPDATE playback_subtitle_sessions
-		SET last_used_at = ?, idle_expires_at = ?, version = version + 1,
-			updated_at = ?
-		WHERE id = ? AND version = ? AND state = ?
-			AND idle_expires_at > ? AND absolute_expires_at > ?`,
-		now, idleExpiresAt, now, session.ID, session.Version,
-		models.PlaybackSubtitleSessionActive, now, now)
-	if err != nil {
-		return nil, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return nil, err
-	}
-	if n != 1 {
-		return nil, ErrPlaybackSubtitleSessionConflict
-	}
-	if _, err := tx.Exec(`UPDATE devices SET last_seen_at = ?
-		WHERE id = ? AND revoked_at IS NULL`, now, device.ID); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	session.LastUsedAt = timePointer(now)
-	session.IdleExpiresAt = idleExpiresAt
-	session.Version++
-	session.UpdatedAt = now
-	return &PlaybackSubtitleSessionAccess{
-		Session: session, User: &user, Device: &device,
-	}, nil
+	return access, nil
 }
 
 // RevokePlaybackSubtitleSession revokes one capability with a version CAS.
@@ -370,60 +415,78 @@ func (s *Store) RevokePlaybackSubtitleSession(
 	expectedVersion int64,
 	now time.Time,
 ) (*models.PlaybackSubtitleSession, error) {
+	return s.RevokePlaybackSubtitleSessionContext(
+		context.Background(), capability, expectedVersion, now)
+}
+
+// RevokePlaybackSubtitleSessionContext is RevokePlaybackSubtitleSession with
+// cancellation covering the shared writer wait and the version CAS.
+func (s *Store) RevokePlaybackSubtitleSessionContext(
+	ctx context.Context,
+	capability string,
+	expectedVersion int64,
+	now time.Time,
+) (*models.PlaybackSubtitleSession, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	now = playbackTime(now)
 	if strings.TrimSpace(capability) == "" || expectedVersion <= 0 {
 		return nil, ErrPlaybackSubtitleSessionConflict
 	}
-	tx, err := s.DB.Begin()
+	var revoked *models.PlaybackSubtitleSession
+	err := s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return lockPlaybackSubtitleSessionTxContext(ctx, tx, capability)
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			session, err := scanPlaybackSubtitleSession(tx.QueryRowContext(ctx, `SELECT `+
+				playbackSubtitleSessionColumns+`
+				FROM playback_subtitle_sessions WHERE capability_hash = ?`,
+				hashPlaybackCapability(capability)))
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, ErrPlaybackSubtitleSessionNotFound
+			}
+			if err != nil {
+				return false, err
+			}
+			switch session.State {
+			case models.PlaybackSubtitleSessionRevoked:
+				return false, ErrPlaybackSubtitleSessionRevoked
+			case models.PlaybackSubtitleSessionExpired:
+				return false, ErrPlaybackSubtitleSessionExpired
+			}
+			if session.Version != expectedVersion {
+				return false, ErrPlaybackSubtitleSessionConflict
+			}
+			res, err := tx.ExecContext(ctx, `UPDATE playback_subtitle_sessions
+				SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
+				WHERE id = ? AND version = ? AND state = ?`,
+				models.PlaybackSubtitleSessionRevoked, now, now, session.ID,
+				expectedVersion, models.PlaybackSubtitleSessionActive)
+			if err != nil {
+				return false, err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return false, err
+			}
+			if n != 1 {
+				return false, ErrPlaybackSubtitleSessionConflict
+			}
+			session.State = models.PlaybackSubtitleSessionRevoked
+			session.RevokedAt = timePointer(now)
+			session.Version++
+			session.UpdatedAt = now
+			revoked = session
+			return true, nil
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
-	if err := lockPlaybackSubtitleSessionTx(tx, capability); err != nil {
-		return nil, err
-	}
-	session, err := scanPlaybackSubtitleSession(tx.QueryRow(`SELECT `+
-		playbackSubtitleSessionColumns+`
-		FROM playback_subtitle_sessions WHERE capability_hash = ?`,
-		hashPlaybackCapability(capability)))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrPlaybackSubtitleSessionNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	switch session.State {
-	case models.PlaybackSubtitleSessionRevoked:
-		return nil, ErrPlaybackSubtitleSessionRevoked
-	case models.PlaybackSubtitleSessionExpired:
-		return nil, ErrPlaybackSubtitleSessionExpired
-	}
-	if session.Version != expectedVersion {
-		return nil, ErrPlaybackSubtitleSessionConflict
-	}
-	res, err := tx.Exec(`UPDATE playback_subtitle_sessions
-		SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
-		WHERE id = ? AND version = ? AND state = ?`,
-		models.PlaybackSubtitleSessionRevoked, now, now, session.ID,
-		expectedVersion, models.PlaybackSubtitleSessionActive)
-	if err != nil {
-		return nil, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return nil, err
-	}
-	if n != 1 {
-		return nil, ErrPlaybackSubtitleSessionConflict
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	session.State = models.PlaybackSubtitleSessionRevoked
-	session.RevokedAt = timePointer(now)
-	session.Version++
-	session.UpdatedAt = now
-	return session, nil
+	return revoked, nil
 }
 
 // RevokePlaybackSubtitleSessionsForTransport is used by emergency feature
@@ -432,19 +495,50 @@ func (s *Store) RevokePlaybackSubtitleSessionsForTransport(
 	transport string,
 	now time.Time,
 ) (int64, error) {
+	return s.RevokePlaybackSubtitleSessionsForTransportContext(
+		context.Background(), transport, now)
+}
+
+// RevokePlaybackSubtitleSessionsForTransportContext is
+// RevokePlaybackSubtitleSessionsForTransport using the shared playback writer
+// budget.
+func (s *Store) RevokePlaybackSubtitleSessionsForTransportContext(
+	ctx context.Context,
+	transport string,
+	now time.Time,
+) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if !validPlaybackTransport(transport) {
 		return 0, ErrInvalidPlaybackTransport
 	}
 	now = playbackTime(now)
-	res, err := s.DB.Exec(`UPDATE playback_subtitle_sessions
-		SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
-		WHERE transport = ? AND state = ?`,
-		models.PlaybackSubtitleSessionRevoked, now, now, transport,
-		models.PlaybackSubtitleSessionActive)
+	var revoked int64
+	err := s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `UPDATE playback_subtitle_sessions
+				SET version = version WHERE transport = ?`, transport)
+			return err
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			res, err := tx.ExecContext(ctx, `UPDATE playback_subtitle_sessions
+				SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
+				WHERE transport = ? AND state = ?`,
+				models.PlaybackSubtitleSessionRevoked, now, now, transport,
+				models.PlaybackSubtitleSessionActive)
+			if err != nil {
+				return false, err
+			}
+			revoked, err = res.RowsAffected()
+			return err == nil, err
+		},
+	)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	return revoked, nil
 }
 
 // RevokePlaybackSubtitleSessionsForTicket revokes active subtitle capabilities
@@ -455,6 +549,22 @@ func (s *Store) RevokePlaybackSubtitleSessionsForTicket(
 	transport string,
 	now time.Time,
 ) (int64, error) {
+	return s.RevokePlaybackSubtitleSessionsForTicketContext(
+		context.Background(), binding, transport, now)
+}
+
+// RevokePlaybackSubtitleSessionsForTicketContext is
+// RevokePlaybackSubtitleSessionsForTicket using the shared playback writer
+// budget.
+func (s *Store) RevokePlaybackSubtitleSessionsForTicketContext(
+	ctx context.Context,
+	binding models.PlaybackTicketBinding,
+	transport string,
+	now time.Time,
+) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if err := validatePlaybackTicketBinding(binding); err != nil {
 		return 0, err
 	}
@@ -462,30 +572,79 @@ func (s *Store) RevokePlaybackSubtitleSessionsForTicket(
 		return 0, ErrInvalidPlaybackTransport
 	}
 	now = playbackTime(now)
-	res, err := s.DB.Exec(`UPDATE playback_subtitle_sessions
-		SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
-		WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?
-			AND transport = ? AND state = ?`,
-		models.PlaybackSubtitleSessionRevoked, now, now, binding.TicketID,
-		binding.UserID, binding.DeviceID, binding.FileID, transport,
-		models.PlaybackSubtitleSessionActive)
+	var revoked int64
+	err := s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `UPDATE playback_subtitle_sessions
+				SET version = version
+				WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?
+					AND transport = ?`,
+				binding.TicketID, binding.UserID, binding.DeviceID, binding.FileID,
+				transport)
+			return err
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			res, err := tx.ExecContext(ctx, `UPDATE playback_subtitle_sessions
+				SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
+				WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?
+					AND transport = ? AND state = ?`,
+				models.PlaybackSubtitleSessionRevoked, now, now, binding.TicketID,
+				binding.UserID, binding.DeviceID, binding.FileID, transport,
+				models.PlaybackSubtitleSessionActive)
+			if err != nil {
+				return false, err
+			}
+			revoked, err = res.RowsAffected()
+			return err == nil, err
+		},
+	)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	return revoked, nil
 }
 
 // RevokeAllPlaybackSubtitleSessions is the global playback emergency stop.
 func (s *Store) RevokeAllPlaybackSubtitleSessions(now time.Time) (int64, error) {
+	return s.RevokeAllPlaybackSubtitleSessionsContext(
+		context.Background(), now)
+}
+
+// RevokeAllPlaybackSubtitleSessionsContext is
+// RevokeAllPlaybackSubtitleSessions using the shared playback writer budget.
+func (s *Store) RevokeAllPlaybackSubtitleSessionsContext(
+	ctx context.Context,
+	now time.Time,
+) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	now = playbackTime(now)
-	res, err := s.DB.Exec(`UPDATE playback_subtitle_sessions
-		SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
-		WHERE state = ?`, models.PlaybackSubtitleSessionRevoked, now, now,
-		models.PlaybackSubtitleSessionActive)
+	var revoked int64
+	err := s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `UPDATE playback_subtitle_sessions
+				SET version = version`)
+			return err
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			res, err := tx.ExecContext(ctx, `UPDATE playback_subtitle_sessions
+				SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
+				WHERE state = ?`, models.PlaybackSubtitleSessionRevoked, now, now,
+				models.PlaybackSubtitleSessionActive)
+			if err != nil {
+				return false, err
+			}
+			revoked, err = res.RowsAffected()
+			return err == nil, err
+		},
+	)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	return revoked, nil
 }
 
 func normalizePlaybackSubtitleSessionRequest(
@@ -617,7 +776,16 @@ func scanPlaybackSubtitleSession(
 // authorizations serialize with each other and with ticket/device revocation.
 // The version assignment is deliberately a no-op; the real CAS follows.
 func lockPlaybackSubtitleSessionTx(tx *sql.Tx, capability string) error {
-	_, err := tx.Exec(`UPDATE playback_subtitle_sessions SET version = version
+	return lockPlaybackSubtitleSessionTxContext(
+		context.Background(), tx, capability)
+}
+
+func lockPlaybackSubtitleSessionTxContext(
+	ctx context.Context,
+	tx *sql.Tx,
+	capability string,
+) error {
+	_, err := tx.ExecContext(ctx, `UPDATE playback_subtitle_sessions SET version = version
 		WHERE capability_hash = ?`, hashPlaybackCapability(capability))
 	return err
 }

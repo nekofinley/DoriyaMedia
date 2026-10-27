@@ -34,6 +34,10 @@ jobs:
       - name: go test
         run: go test ./...
 
+      - name: Protocol contract
+        shell: pwsh
+        run: ./scripts/check-protocol.ps1
+
       # 编译目标平台，确保发布用的交叉编译路径不会挂
       - name: Build (linux/amd64)
         env:

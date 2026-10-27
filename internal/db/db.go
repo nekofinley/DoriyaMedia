@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -18,11 +19,13 @@ import (
 )
 
 type Store struct {
-	DB *sql.DB
+	DB               *sql.DB
+	playbackWriteSem chan struct{}
 }
 
 var (
 	ErrBangumiJobLeaseLost = errors.New("bangumi sync job lease lost")
+	ErrMediaFileChanged    = errors.New("media file generation changed")
 	// ErrAuthStateChanged means a credential was verified against an account
 	// snapshot that changed before its dependent session could be committed.
 	ErrAuthStateChanged = errors.New("authentication state changed")
@@ -78,7 +81,10 @@ func Open(path string) (*Store, error) {
 	// rather than the file. With room to open a second connection, a statement
 	// that cannot get a usable one has another to try.
 	db.SetMaxOpenConns(4)
-	s := &Store{DB: db}
+	s := &Store{
+		DB:               db,
+		playbackWriteSem: make(chan struct{}, 1),
+	}
 	if err := s.migrate(); err != nil {
 		return nil, err
 	}
@@ -198,6 +204,12 @@ func (s *Store) migrate() error {
 			convertible INTEGER DEFAULT 1,
 			UNIQUE(file_id, path, stream_idx)
 		)`,
+		`CREATE TRIGGER IF NOT EXISTS trg_files_generation_clears_subtitles
+		AFTER UPDATE OF size, mtime ON files
+		WHEN OLD.size IS NOT NEW.size OR OLD.mtime IS NOT NEW.mtime
+		BEGIN
+			DELETE FROM subtitles WHERE file_id = NEW.id;
+		END`,
 		`CREATE TABLE IF NOT EXISTS progress (
 			user_id INTEGER NOT NULL,
 			file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -298,6 +310,9 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.MigratePlaybackTransportClaims(); err != nil {
+		return err
+	}
+	if err := s.MigratePlaybackDirectDASHTransports(); err != nil {
 		return err
 	}
 	if err := s.migrateBangumiSyncJobs(); err != nil {
@@ -1814,7 +1829,11 @@ func (s *Store) UpsertFile(f *models.MediaFile) (id int64, err error) {
 			item_id=excluded.item_id,
 			size=excluded.size,
 			mtime=excluded.mtime,
-			probe=CASE WHEN excluded.probe <> '' THEN excluded.probe ELSE files.probe END`,
+			probe=CASE
+				WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime THEN ''
+				WHEN excluded.probe <> '' THEN excluded.probe
+				ELSE files.probe
+			END`,
 		f.ItemID, f.SourceID, f.Path, f.Size, f.MTime, f.Probe, time.Now())
 	if err != nil {
 		return 0, err
@@ -1936,6 +1955,130 @@ func firstPathSegment(path string) string {
 func (s *Store) UpdateFileProbe(id int64, probe string) error {
 	_, err := s.DB.Exec(`UPDATE files SET probe=? WHERE id=?`, probe, id)
 	return err
+}
+
+// UpdateFileProbeForVersion refuses to overwrite a rescan's metadata with a
+// probe that started against an older size/mtime generation.
+func (s *Store) UpdateFileProbeForVersion(
+	id, size, mtime int64,
+	probe string,
+) error {
+	res, err := s.DB.Exec(`UPDATE files SET probe=?
+		WHERE id=? AND size=? AND mtime=?`, probe, id, size, mtime)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		var currentSize, currentMTime int64
+		err := s.DB.QueryRow(`SELECT size, mtime FROM files WHERE id = ?`, id).
+			Scan(&currentSize, &currentMTime)
+		if errors.Is(err, sql.ErrNoRows) {
+			// Some callers use transient file records without a database row.
+			// There is nothing to overwrite, so preserve the historical no-op.
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return ErrMediaFileChanged
+	}
+	return nil
+}
+
+// UpdateFileProbeAndEmbeddedSubtitlesForVersionContext atomically stores a
+// probe and the embedded subtitle rows it discovered. The file generation CAS
+// guards both writes; external/driver subtitle rows are left untouched.
+func (s *Store) UpdateFileProbeAndEmbeddedSubtitlesForVersionContext(
+	ctx context.Context,
+	id, size, mtime int64,
+	probe string,
+	subtitles []models.Subtitle,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for _, sub := range subtitles {
+		if sub.FileID != id || !sub.Embedded {
+			return fmt.Errorf("invalid embedded subtitle for file %d", id)
+		}
+	}
+
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx, `UPDATE files SET probe=?
+		WHERE id=? AND size=? AND mtime=?`, probe, id, size, mtime)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		var currentSize, currentMTime int64
+		err := tx.QueryRowContext(ctx,
+			`SELECT size, mtime FROM files WHERE id = ?`, id).
+			Scan(&currentSize, &currentMTime)
+		if errors.Is(err, sql.ErrNoRows) {
+			// Keep the historical no-op for transient file records.
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return ErrMediaFileChanged
+	}
+
+	if len(subtitles) == 0 {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM subtitles WHERE file_id=? AND embedded=1`, id); err != nil {
+			return err
+		}
+	} else {
+		values := make([]string, 0, len(subtitles))
+		args := make([]any, 0, len(subtitles)*2+1)
+		for range subtitles {
+			values = append(values, "(?,?)")
+		}
+		for _, sub := range subtitles {
+			args = append(args, sub.Path, sub.StreamIdx)
+		}
+		args = append(args, id)
+		query := `WITH kept(path, stream_idx) AS (VALUES ` +
+			strings.Join(values, ",") + `)
+			DELETE FROM subtitles
+			WHERE file_id=? AND embedded=1 AND NOT EXISTS (
+				SELECT 1 FROM kept
+				WHERE kept.path=subtitles.path
+					AND kept.stream_idx=subtitles.stream_idx
+			)`
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return err
+		}
+	}
+
+	for _, sub := range subtitles {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO subtitles
+			(file_id, path, lang, title, format, embedded, stream_idx, convertible)
+			VALUES (?,?,?,?,?,?,?,?)
+			ON CONFLICT(file_id, path, stream_idx) DO UPDATE SET
+				lang=excluded.lang, title=excluded.title, format=excluded.format,
+				embedded=excluded.embedded, convertible=excluded.convertible
+			WHERE subtitles.embedded = 1`,
+			sub.FileID, sub.Path, sub.Lang, sub.Title, sub.Format,
+			sub.Embedded, sub.StreamIdx, sub.Convertible); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // FilesWithoutProbe returns playable files of a library that have no cached

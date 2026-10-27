@@ -19,6 +19,7 @@ import (
 type Engine struct {
 	Store  *db.Store
 	Cfg    *config.Config
+	toolMu sync.RWMutex
 	prober *Prober
 	ffmpeg *FFMpeg
 	// egressTrust is the explicit administrator-configured private-origin
@@ -32,7 +33,7 @@ type Engine struct {
 	resolveMu    sync.Mutex
 	resolveCache map[string]resolveEntry
 	// resolveLocks serialises link resolution per file (see resolveTarget).
-	resolveLocks map[string]*sync.Mutex
+	resolveLocks map[string]*keyedMutex
 
 	// partsCache holds resolved multi-stream inputs (see parts.go). Same TTL and
 	// the same per-file lock as the single-target cache above.
@@ -49,6 +50,13 @@ type Engine struct {
 	// (/api/play → polling) and the synchronous fallback (HLS/subtitles).
 	probeMu   sync.Mutex
 	probeJobs map[int64]*probeJob
+	// ticketProbes are read-only probes for playback-ticket finalization. They
+	// deliberately do not join probeJobs because that legacy path persists
+	// files.probe and embedded subtitles before the ticket transaction commits.
+	ticketProbeMu    sync.Mutex
+	ticketProbeJobs  map[ticketProbeKey]*ticketProbeJob
+	ticketProbeWake  chan struct{}
+	ticketProbeSlots chan struct{}
 
 	// background pre-probe queue (cache warming after a scan)
 	pre preProbeQueue
@@ -99,48 +107,98 @@ func NewEngine(store *db.Store, cfg *config.Config) *Engine {
 		prober.AnalyzeSec = cfg.Playback.ProbeAnalyzeSec
 	}
 	e := &Engine{
-		Store:        store,
-		Cfg:          cfg,
-		prober:       prober,
-		ffmpeg:       &FFMpeg{Path: cfg.FFmpeg, egress: trust},
-		egressTrust:  trust,
-		subCache:     map[string][]byte{},
-		resolveCache: map[string]resolveEntry{},
-		resolveLocks: map[string]*sync.Mutex{},
-		partsCache:   map[string]partsEntry{},
-		keyCache:     map[string]keyframeEntry{},
-		probeJobs:    map[int64]*probeJob{},
-		pre:          preProbeQueue{queued: map[int64]bool{}},
-		stream:       map[int64]*streamProgress{},
-		sessions:     map[sessionKey]*Session{},
+		Store:            store,
+		Cfg:              cfg,
+		prober:           prober,
+		ffmpeg:           &FFMpeg{Path: cfg.FFmpeg, egress: trust},
+		egressTrust:      trust,
+		subCache:         map[string][]byte{},
+		resolveCache:     map[string]resolveEntry{},
+		resolveLocks:     map[string]*keyedMutex{},
+		partsCache:       map[string]partsEntry{},
+		keyCache:         map[string]keyframeEntry{},
+		probeJobs:        map[int64]*probeJob{},
+		ticketProbeJobs:  map[ticketProbeKey]*ticketProbeJob{},
+		ticketProbeWake:  make(chan struct{}),
+		ticketProbeSlots: make(chan struct{}, ticketProbeMaxConcurrent),
+		pre:              preProbeQueue{queued: map[int64]bool{}},
+		stream:           map[int64]*streamProgress{},
+		sessions:         map[sessionKey]*Session{},
 		execProbe: func(ctx context.Context, p *Prober, target string, headers map[string]string, proxy string) (*Probe, error) {
 			return p.ProbeFileVia(ctx, target, headers, proxy)
 		},
 	}
 	// Resolved through e so a hot-reloaded ffmpeg path (SetBins) is picked up.
 	e.runStream = func(ctx context.Context, args []string, out io.Writer) error {
-		return e.ffmpeg.RunStream(ctx, args, out)
+		return e.currentFFMpeg().RunStream(ctx, args, out)
 	}
 	return e
 }
 
-// SetBins updates tool paths after config changes (hot reload).
+// SetBins updates tool paths while preserving the currently published probe
+// window. Callers that also have a new window should use SetTools.
 func (e *Engine) SetBins(ffmpeg, ffprobe string) {
+	if e == nil {
+		return
+	}
+	e.toolMu.Lock()
+	defer e.toolMu.Unlock()
+	probeSizeMB, probeAnalyzeSec := 0, 0
+	if e.prober != nil {
+		probeSizeMB = e.prober.ProbeSizeMB
+		probeAnalyzeSec = e.prober.AnalyzeSec
+	}
+	e.publishToolsLocked(ffmpeg, ffprobe, probeSizeMB, probeAnalyzeSec)
+}
+
+// SetTools atomically publishes tool paths and the probe window snapshot.
+func (e *Engine) SetTools(
+	ffmpeg, ffprobe string,
+	probeSizeMB, probeAnalyzeSec int,
+) {
+	if e == nil {
+		return
+	}
+	e.toolMu.Lock()
+	defer e.toolMu.Unlock()
+	e.publishToolsLocked(ffmpeg, ffprobe, probeSizeMB, probeAnalyzeSec)
+}
+
+func (e *Engine) publishToolsLocked(
+	ffmpeg, ffprobe string,
+	probeSizeMB, probeAnalyzeSec int,
+) {
 	if e.egressTrust == nil {
 		e.egressTrust = newEgressTrust()
 	}
 	prober := NewProber(ffprobe)
 	prober.egress = e.egressTrust
-	if e.Cfg != nil {
-		if e.Cfg.Playback.ProbeSizeMB > 0 {
-			prober.ProbeSizeMB = e.Cfg.Playback.ProbeSizeMB
-		}
-		if e.Cfg.Playback.ProbeAnalyzeSec > 0 {
-			prober.AnalyzeSec = e.Cfg.Playback.ProbeAnalyzeSec
-		}
+	if probeSizeMB > 0 {
+		prober.ProbeSizeMB = probeSizeMB
+	}
+	if probeAnalyzeSec > 0 {
+		prober.AnalyzeSec = probeAnalyzeSec
 	}
 	e.prober = prober
 	e.ffmpeg = &FFMpeg{Path: ffmpeg, egress: e.egressTrust}
+}
+
+func (e *Engine) currentProber() *Prober {
+	e.toolMu.RLock()
+	defer e.toolMu.RUnlock()
+	return e.prober
+}
+
+func (e *Engine) currentFFMpeg() *FFMpeg {
+	e.toolMu.RLock()
+	defer e.toolMu.RUnlock()
+	return e.ffmpeg
+}
+
+func (e *Engine) currentTools() (*Prober, *FFMpeg) {
+	e.toolMu.RLock()
+	defer e.toolMu.RUnlock()
+	return e.prober, e.ffmpeg
 }
 
 // resolveTTL is how long one minted source link is reused before a new one is
@@ -149,7 +207,32 @@ func (e *Engine) SetBins(ffmpeg, ffprobe string) {
 const resolveTTL = 10 * time.Minute
 
 func resolveKey(file *models.MediaFile) string {
-	return fmt.Sprintf("%d|%s", file.SourceID, file.Path)
+	return fmt.Sprintf("%d|%d|%d|%s",
+		file.SourceID, file.Size, file.MTime, file.Path)
+}
+
+// InvalidateSourceCaches drops links and parts resolved for one source without
+// discarding the per-file locks that serialise future resolutions.
+func (e *Engine) InvalidateSourceCaches(sourceID int64) {
+	if e == nil || sourceID <= 0 {
+		return
+	}
+	prefix := fmt.Sprintf("%d|", sourceID)
+	e.resolveMu.Lock()
+	for key := range e.resolveCache {
+		if strings.HasPrefix(key, prefix) {
+			delete(e.resolveCache, key)
+		}
+	}
+	e.resolveMu.Unlock()
+
+	e.partsMu.Lock()
+	for key := range e.partsCache {
+		if strings.HasPrefix(key, prefix) {
+			delete(e.partsCache, key)
+		}
+	}
+	e.partsMu.Unlock()
 }
 
 // ProbeTarget resolves a file into an ffprobe-able target (cached, TTL resolveTTL).
@@ -172,7 +255,10 @@ func (e *Engine) ProbeTarget(ctx context.Context, file *models.MediaFile, drv so
 func (e *Engine) resolveTarget(ctx context.Context, file *models.MediaFile, drv source.Driver, rejected string) (string, map[string]string, error) {
 	key := resolveKey(file)
 	mu := e.resolveLock(key)
-	mu.Lock()
+	defer e.releaseResolveLock(mu)
+	if err := mu.LockContext(ctx); err != nil {
+		return "", nil, err
+	}
 	defer mu.Unlock()
 
 	e.resolveMu.Lock()
@@ -227,19 +313,69 @@ func (e *Engine) leaseResolvedTarget(
 	e.egressTrust.leaseDriverTarget(drv, target)
 }
 
+// keyedMutex is a mutex whose wait can be bounded by a caller's context.
+type keyedMutex struct {
+	token chan struct{}
+	// refs is protected by Engine.resolveMu and includes callers waiting for the
+	// token, so an active entry is never pruned and recreated under a waiter.
+	refs int
+}
+
+func newKeyedMutex() *keyedMutex {
+	mu := &keyedMutex{token: make(chan struct{}, 1)}
+	mu.token <- struct{}{}
+	return mu
+}
+
+func (m *keyedMutex) Lock() {
+	<-m.token
+}
+
+func (m *keyedMutex) Unlock() {
+	m.token <- struct{}{}
+}
+
+func (m *keyedMutex) LockContext(ctx context.Context) error {
+	select {
+	case <-m.token:
+		if err := ctx.Err(); err != nil {
+			m.token <- struct{}{}
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // resolveLock returns the mutex guarding one file's link resolution.
-func (e *Engine) resolveLock(key string) *sync.Mutex {
+func (e *Engine) resolveLock(key string) *keyedMutex {
 	e.resolveMu.Lock()
 	defer e.resolveMu.Unlock()
 	if mu, ok := e.resolveLocks[key]; ok {
+		mu.refs++
 		return mu
 	}
-	if len(e.resolveLocks) > 1024 {
-		e.resolveLocks = map[string]*sync.Mutex{}
+	if len(e.resolveLocks) >= 1024 {
+		for candidateKey, candidate := range e.resolveLocks {
+			if candidate.refs == 0 {
+				delete(e.resolveLocks, candidateKey)
+			}
+		}
 	}
-	mu := &sync.Mutex{}
+	mu := newKeyedMutex()
+	mu.refs = 1
 	e.resolveLocks[key] = mu
 	return mu
+}
+
+func (e *Engine) releaseResolveLock(mu *keyedMutex) {
+	e.resolveMu.Lock()
+	defer e.resolveMu.Unlock()
+	mu.refs--
+	if mu.refs < 0 {
+		panic("media: negative resolve lock reference count")
+	}
 }
 
 // DriverFor resolves the right driver for a file (URL files use URLDriver).
@@ -266,24 +402,39 @@ func isHTTPPath(p string) bool {
 // when one exists, so the async (/api/play) and synchronous (HLS/subtitles)
 // paths never probe the same file twice.
 
-func (e *Engine) RegisterEmbeddedSubs(file *models.MediaFile, probe *Probe) {
-	for i, s := range probe.SubtitleStreams() {
+// EmbeddedSubtitleRows returns the embedded subtitle rows implied by one probe
+// without touching the database. Playback tickets use it to build a transaction
+// input; legacy discovery still goes through RegisterEmbeddedSubs.
+func EmbeddedSubtitleRows(fileID int64, probe *Probe) []models.Subtitle {
+	if fileID <= 0 || probe == nil {
+		return nil
+	}
+	rows := make([]models.Subtitle, 0, len(probe.SubtitleStreams()))
+	for _, s := range probe.SubtitleStreams() {
 		conv := false
 		switch s.CodecName {
 		case "subrip", "ass", "ssa", "mov_text", "webvtt", "text":
 			conv = true
 		}
-		sub := &models.Subtitle{
-			FileID:      file.ID,
+		rows = append(rows, models.Subtitle{
+			FileID:      fileID,
 			Lang:        s.Language(),
 			Title:       s.Title(),
 			Format:      s.CodecName,
 			Embedded:    true,
 			StreamIdx:   s.Index,
 			Convertible: conv,
-		}
-		_ = e.Store.UpsertSubtitle(sub)
-		_ = i
+		})
+	}
+	return rows
+}
+
+func (e *Engine) RegisterEmbeddedSubs(file *models.MediaFile, probe *Probe) {
+	if e == nil || e.Store == nil || file == nil {
+		return
+	}
+	for _, sub := range EmbeddedSubtitleRows(file.ID, probe) {
+		_ = e.Store.UpsertSubtitle(&sub)
 	}
 }
 
@@ -510,7 +661,7 @@ func (e *Engine) ExtractEmbeddedSubtitle(ctx context.Context, file *models.Media
 	args := []string{"-hide_banner", "-loglevel", "error"}
 	args = HeaderArgs(args, headers)
 	args = append(args, "-i", target, "-map", fmt.Sprintf("0:s:%d", ordinal), "-f", "ass", "pipe:1")
-	if err := e.ffmpeg.RunStream(ctx, args, writerFunc(buf.WriteString)); err != nil {
+	if err := e.currentFFMpeg().RunStream(ctx, args, writerFunc(buf.WriteString)); err != nil {
 		return nil, err
 	}
 	data := ASSToVTT([]byte(buf.String()))

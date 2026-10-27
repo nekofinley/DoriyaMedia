@@ -26,12 +26,12 @@
     "preferred_transports": {
       "type": "array",
       "minItems": 1,
-      "maxItems": 3,
+      "maxItems": 4,
       "uniqueItems": true,
       "items": {
         "$ref": "playback-transport-kind.schema.json"
       },
-      "description": "May reorder eligible S3 transports. It cannot add eligibility or force a disabled transport."
+      "description": "May reorder eligible v1 transports. It cannot add eligibility, enable direct-dash without the matching client capability, or force a disabled transport."
     }
   }
 }

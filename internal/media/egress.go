@@ -45,6 +45,8 @@ import (
 type egressIPLookup func(context.Context, string) ([]net.IPAddr, error)
 type egressDialFunc func(context.Context, string, string) (net.Conn, error)
 
+const egressConnectHandshakeLimit = 15 * time.Second
+
 type egressTrust struct {
 	mu         sync.RWMutex
 	origins    map[string]struct{}
@@ -839,6 +841,17 @@ func dialHTTPProxyBridge(
 	if err != nil {
 		return nil, err
 	}
+	finishHandshake, err := egressWatchConnectHandshake(ctx, conn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	handshakeFinished := false
+	defer func() {
+		if !handshakeFinished {
+			_ = finishHandshake()
+		}
+	}()
 	var request strings.Builder
 	request.WriteString("CONNECT ")
 	request.WriteString(target)
@@ -856,23 +869,67 @@ func dialHTTPProxyBridge(
 	request.WriteString("\r\n")
 	if _, err := io.WriteString(conn, request.String()); err != nil {
 		_ = conn.Close()
-		return nil, err
+		return nil, egressConnectHandshakeError(ctx, err)
 	}
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 	if err != nil {
 		_ = conn.Close()
-		return nil, err
+		return nil, egressConnectHandshakeError(ctx, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
 		_ = conn.Close()
 		return nil, fmt.Errorf("media egress proxy status %d", resp.StatusCode)
 	}
+	handshakeFinished = true
+	if err := finishHandshake(); err != nil {
+		_ = resp.Body.Close()
+		_ = conn.Close()
+		return nil, err
+	}
 	if br.Buffered() > 0 {
 		return &egressBufferedConn{Conn: conn, reader: br}, nil
 	}
 	return conn, nil
+}
+
+func egressConnectHandshakeError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return err
+}
+
+func egressWatchConnectHandshake(
+	ctx context.Context,
+	conn net.Conn,
+) (func() error, error) {
+	deadline := time.Now().Add(egressConnectHandshakeLimit)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
+
+	watchDone := make(chan struct{})
+	stopWatch := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		close(watchDone)
+	})
+	return func() error {
+		if !stopWatch() {
+			<-watchDone
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return conn.SetDeadline(time.Time{})
+	}, nil
 }
 
 type egressBufferedConn struct {

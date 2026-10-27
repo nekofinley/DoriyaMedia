@@ -55,38 +55,86 @@ func (e *Engine) PartsFor(ctx context.Context, file *models.MediaFile, drv sourc
 		return nil, nil
 	}
 	key := partsForKey(file, drv)
-	mu := e.resolveLock(key)
-	mu.Lock()
-	defer mu.Unlock()
-
-	e.partsMu.Lock()
-	if ent, ok := e.partsCache[key]; ok {
-		switch {
-		case rejected == "" && time.Since(ent.at) < partsTTL:
-			e.partsMu.Unlock()
-			return ent.parts, nil
-		case rejected != "" && leadURL(ent.parts) != rejected:
-			e.partsMu.Unlock()
-			return ent.parts, nil
-		}
-		delete(e.partsCache, key)
+	bypassCache := false
+	if bypass, ok := drv.(source.BypassPartsCache); ok {
+		bypassCache = bypass.BypassPartsCache()
 	}
-	e.partsMu.Unlock()
-
-	parts, err := mp.Parts(ctx, file.Path)
-	if err != nil {
+	mu := e.resolveLock(key)
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			e.releaseResolveLock(mu)
+		}
+	}()
+	if err := mu.LockContext(ctx); err != nil {
 		return nil, err
 	}
-	parts = orderParts(parts)
+	releaseLock := true
+	defer func() {
+		if releaseLock {
+			mu.Unlock()
+		}
+	}()
+
+	if !bypassCache {
+		e.partsMu.Lock()
+		if ent, ok := e.partsCache[key]; ok {
+			switch {
+			case rejected == "" && time.Since(ent.at) < partsTTL:
+				e.partsMu.Unlock()
+				return ent.parts, nil
+			case rejected != "" && leadURL(ent.parts) != rejected:
+				e.partsMu.Unlock()
+				return ent.parts, nil
+			}
+			delete(e.partsCache, key)
+		}
+		e.partsMu.Unlock()
+	}
+
+	type partsResult struct {
+		parts []source.Part
+		err   error
+	}
+	resultCh := make(chan partsResult, 1)
+	go func() {
+		parts, err := mp.Parts(ctx, file.Path)
+		resultCh <- partsResult{parts: parts, err: err}
+	}()
+	var result partsResult
+	select {
+	case result = <-resultCh:
+	case <-ctx.Done():
+		// A driver that ignores cancellation still owns the per-file lock. Hand
+		// the unlock and reference to its watcher so a retry cannot use the driver
+		// concurrently and the registry cannot prune the live lock entry.
+		releaseLock = false
+		handedOff = true
+		go func() {
+			<-resultCh
+			mu.Unlock()
+			e.releaseResolveLock(mu)
+		}()
+		return nil, ctx.Err()
+	}
+	if result.err != nil {
+		return nil, result.err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	parts := orderParts(result.parts)
 	if len(parts) == 0 {
 		return nil, fmt.Errorf("源没有给出可播放的流")
 	}
-	e.partsMu.Lock()
-	if len(e.partsCache) > 512 {
-		e.partsCache = map[string]partsEntry{}
+	if !bypassCache {
+		e.partsMu.Lock()
+		if len(e.partsCache) > 512 {
+			e.partsCache = map[string]partsEntry{}
+		}
+		e.partsCache[key] = partsEntry{parts: parts, at: time.Now()}
+		e.partsMu.Unlock()
 	}
-	e.partsCache[key] = partsEntry{parts: parts, at: time.Now()}
-	e.partsMu.Unlock()
 	return parts, nil
 }
 
@@ -128,6 +176,8 @@ func partsProbe(parts []source.Part) *Probe {
 			CodecName:      part.Codec,
 			CodecTagString: part.Tag,
 			Profile:        part.Profile,
+			BitDepth:       part.BitDepth,
+			HDR:            part.HDR,
 			Width:          part.Width,
 			Height:         part.Height,
 			Channels:       part.Channels,
@@ -156,6 +206,9 @@ func (e *Engine) ProbeFor(ctx context.Context, file *models.MediaFile, drv sourc
 	if file == nil || drv == nil {
 		return nil, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if _, ok := drv.(source.MultiPart); ok {
 		parts, err := e.PartsFor(ctx, file, drv, "")
 		if err != nil {
@@ -164,7 +217,13 @@ func (e *Engine) ProbeFor(ctx context.Context, file *models.MediaFile, drv sourc
 		if len(parts) == 0 {
 			return nil, fmt.Errorf("源没有给出可播放的流")
 		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return partsProbe(parts), nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return ProbeFromCache(file), nil
 }

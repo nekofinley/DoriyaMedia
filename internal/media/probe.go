@@ -18,6 +18,8 @@ type ProbeStream struct {
 	CodecTagString string            `json:"codec_tag_string"`
 	CodecTag       string            `json:"codec_tag"`
 	Profile        string            `json:"profile"`
+	BitDepth       int               `json:"bit_depth,omitempty"`
+	HDR            bool              `json:"hdr,omitempty"`
 	Width          int               `json:"width"`
 	Height         int               `json:"height"`
 	Channels       int               `json:"channels"`

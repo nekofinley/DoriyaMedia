@@ -31,7 +31,7 @@
     },
     "remaining_transports": {
       "type": "array",
-      "maxItems": 3,
+      "maxItems": 4,
       "uniqueItems": true,
       "items": {
         "$ref": "playback-transport-kind.schema.json"
@@ -43,11 +43,7 @@
       "maxLength": 2048
     },
     "failure_code": {
-      "type": "string",
-      "enum": [
-        "source_unavailable",
-        "unsupported_media"
-      ]
+      "$ref": "playback-failure-code.schema.json"
     }
   },
   "allOf": [
@@ -110,7 +106,12 @@
         ],
         "properties": {
           "failure_code": {
-            "const": "source_unavailable"
+            "enum": [
+              "source_unavailable",
+              "probe_timeout",
+              "probe_interrupted",
+              "probe_finalize_failed"
+            ]
           }
         }
       }
@@ -204,6 +205,28 @@
         ],
         "properties": {
           "media": true
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "not": {
+              "enum": [
+                "unsupported",
+                "failed"
+              ]
+            }
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": false
         }
       }
     }

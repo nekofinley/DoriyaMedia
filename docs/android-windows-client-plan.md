@@ -1,25 +1,30 @@
 # Android / Windows 客户端开发规划
 
-> 状态：S0 工具/脚本已完成但真实矩阵待执行；S1-S3 已完成；S4 服务端加固主体已落地，验收门禁尚未全部关闭；S5/W0/A0 尚未开始
+> 状态：S0 工具/脚本已完成但真实矩阵待执行；S1-S3 已完成；S4 服务端加固主体、专项自动测试、协议契约和 race 门禁已落地，但真实矩阵尚未全部关闭；S5 direct-dash 服务端契约、默认关闭实现及进程级 HTTP E2E 已落地，但真实 Bilibili 双流、客户端本地合流、Windows/Android 真机与网络矩阵尚未验收，因此 S5 未关闭；W0 两个候选和 A0 Media3 机制原型已落地并通过本机构建、启动/探针冒烟，但真实媒体与真机矩阵未验收，因此 W0/A0 未关闭；local-relay 尚未实现
 > 基线日期：2026-10-27
-> 最近更新：2026-10-27
+> 最近更新：2026-10-28
 > 目标：把后续工作拆成可由不同 Agent 独立领取、验证和回滚的任务
 
 ## 0. 当前实施进度
 
-截至 2026-10-27，当前分支已落地以下服务端基础：
+截至 2026-10-28，当前分支已落地以下服务端基础和客户端机制原型：
 
 - S0：样本矩阵脚本、dry-run 与报告目录已建立；真机和真实来源矩阵仍需现场执行。
 - S1：`/api/v1/meta`、稳定错误模型、OpenAPI/JSON Schema/golden fixtures 与校验脚本已完成。
 - S2：设备授权、PKCE、access/refresh 轮换、设备列表/吊销、feature flag fail-closed 已实现；改密/重置与 token 撤销已绑定 `auth_epoch`。
 - S3：播放票据、`direct-http`、`server-proxy`、`server-hls`、TTL、refresh、字幕 capability 和私网 SSRF 边界已实现。
-- S4：Range/HEAD/`bytes=0-0`/416/If-Range、206 精确范围校验、跨源 Header 剥除、源站错误脱敏和固定字段播放遥测已实现并通过本机自动测试；FFmpeg 出站代理已覆盖 DNS/IP 固定、重定向/嵌套资源、CONNECT 凭据隔离和本地 HLS/DASH fail-closed。`LocalDriver` 的 `Open/List/Serve` 已改为句柄操作，v1 本地流也复用安全打开的句柄。
-- S4 尚未关闭：FFmpeg/FFprobe 仍按普通路径重开，hardlink、根目录父级 ACL 和文件原地改写未完全闭环；异步 probe 只能缩小竞态窗口，并非完全事务化。30 分钟真实 direct、真实 HLS 解码、网络切换及 Windows/Android 真机矩阵尚未完成，不能宣称 S4 全量验收通过。
-- S5：`direct-dash` 与本机中继尚未开始。
+- S4：Range/HEAD/`bytes=0-0`/416/If-Range、严格 206 校验、跨源 Header 剥除、源站错误脱敏、阶段超时和固定字段播放遥测已实现并通过本机自动测试；本地强 validator 改为文件系统版本。播放票 TTL、文件代际 CAS、字幕 discovery watchdog、metadata/embedded subtitle 原子提交、audio-only 识别、探测工具快照、source cache invalidation，以及 ticket probe registry/执行并发上限均已接入。probe 失败按真实父 context 区分，单流与 MultiPart 解析锁等待可取消，非协作 MultiPart driver 不再阻塞 ticket probe slot；播放/字幕 cleanup 使用有界 Context。OpenAPI/Schema 已同步 media/HLS 响应矩阵、Range/OWS、206、ETag/If-Range 和公开 failure code，protocolcheck 自测包含 mutation 覆盖。FFmpeg 出站代理已覆盖 DNS/IP 固定、重定向/嵌套资源、CONNECT 凭据隔离和本地 HLS/DASH fail-closed。`LocalDriver` 的 `Open/List/Serve` 已改为句柄操作，v1 本地流也复用安全打开的句柄。
+- S4 尚未关闭：仍须用真实 OpenList/Bilibili 来源验证 30 分钟 direct、真实 HLS 解码、20 次随机 seek、网络切换和 Windows/Android 真机矩阵。`go test -race ./...` 已于 2026-10-28 在本机通过。FFmpeg/FFprobe 的普通路径重开、hardlink、根目录父级 ACL 和文件原地改写，以及 `size + mtime` 代际碰撞、subtitle row ID 快照和协作式 driver 取消仍有残余风险，不能宣称 S4 全量验收通过。
+- S5：`direct-dash` 服务端契约、默认关闭实现和进程级 HTTP E2E 已落地；只有服务端 flag、设备策略、多流来源资格和客户端 `supports_dash_merge=true` 同时满足时才会签发。E2E 已通过真实 admin API 建源/扫描、能力省略/false/true、全局 flag、设备级禁用与恢复、跨设备隔离、双流签发、签发阶段非法 Header 原子回退和 HLS 关闭 fail-closed 的确定性 fixture 验证。真实 Bilibili 双流、客户端本地合流、Windows/Android 真机与网络矩阵尚未验收，因此 S5 未关闭。`local-relay` 尚未实现，仅保留发现 flag。
+- W0：`spikes/windows-player/` 已形成 Tauri 2 + mpv 与 WinUI 3 + LibVLCSharp 两个隔离原型。Tauri 通过 pnpm/Rust 检查、32 个 Rust tests（另 1 个真实 mpv 测试需显式启用）、真实 mpv 空载 JSON IPC 1/1、debug exe 构建和交互会话 GUI 启动/退出 smoke；已实现 mpv 最小环境隔离、128 位随机命名管道、管道服务端 PID 校验、空 Tauri capability、固定 5 秒 IPC 响应期限、`start-file`/`file-loaded`/`end-file` 代次状态机，以及子进程退出、控制超时和失败后的有界清理。完整 DACL/SID/session 对端信任和 Job Object 崩溃联动清理仍未完成。WinUI 通过 0 warning/error 构建、91 个 xUnit tests、LibVLC `3.0.19` probe、Windows App SDK self-contained app smoke，以及带独立 `Referer`/`User-Agent` 校验的合成 loopback 双源 smoke；已支持 `Media.AddSlave` 和 LibVLC 可安全表达的双流共享 Header。两候选都未加载真实媒体，WinUI 尚不支持逐流 Header，因此 W0 未关闭。
+- A0：`spikes/android-player/` 已形成 Kotlin + Compose + Media3 机制原型，支持单 URL、白名单 Header、逐流 Header/容器 MIME、双 URL `MergingMediaSource`、同源重定向 Header 保留与跨源 fail-closed、播放意图、控制/seek、lifecycle 暂停与 PlayerView 解绑、脱敏日志。Lint 0 error、10 warnings；24 个 JVM tests 通过；debug 与 test APK 构建通过；API 37 x86_64 ATD 上 `connectedDebugAndroidTest` 4/4 通过，覆盖 Ready、双轨、seek discontinuity、seek 后位置推进、播放/暂停、video surface、逐流输入和生产 MediaSource factory 独立 DataSource，APK 冷启动成功。该 ATD 的 goldfish H.264 解码器存在 Codec2 缺陷，合成 merge 测试使用 `PREFER_SOFTWARE` 仅用于隔离机制；真实 CDN 重定向链、逐流 Range、真实 API 28/31/34 真机、默认硬件解码、真实 Bilibili 双流和长时矩阵仍未执行，因此 A0 未关闭。
 
 当前验证基线：
 
 ```powershell
+Push-Location .\scripts\protocolcheck
+go test -mod=readonly ./... -count=1
+Pop-Location
 .\scripts\check-protocol.ps1
 go test ./...
 go vet ./...
@@ -27,7 +32,9 @@ go vet ./...
 .\scripts\playback-e2e.ps1
 ```
 
-2026-10-27 本机通过 `go test ./...`、`go vet ./...`、协议校验、设备授权 E2E 和播放 E2E。最新一次播放 E2E 为 `passed=85 failed=0 skipped=0`：它用合成 MP4 实际获取并解码了 local server-HLS segment；但不覆盖 OpenList/Bilibili 真实来源、30 分钟 direct、网络切换或真机播放器，CI 也不运行该脚本。当前机器缺少 CGO/GCC，`go test -race` 尚未执行；真实 30 分钟 direct、真实来源 HLS 解码和真机矩阵仍无结果。
+2026-10-28 本机通过 `go mod verify`、根模块 `go test ./...`、`go vet ./...`、`go test -race ./...`、带 `playbacke2e` tag 的源码编译测试、protocolcheck 自测、协议校验（36 schemas / 49 fixtures / 237 refs）、设备授权 E2E 和播放 E2E；`internal/api` 的 windows/linux/darwin amd64 测试二进制交叉编译通过。最新一次播放 E2E 为 `passed=217 failed=0 skipped=0`：它用 `-tags playbacke2e` 构建服务端，通过真实 admin source/library/scan API 创建确定性多流 fixture，并覆盖 `supports_dash_merge` 省略/false/true、全局 flag、设备级禁用/恢复、跨设备隔离、合法 video/audio 双流、白名单 Header、无 media session、签发阶段非法 Header 原子回退 server-HLS，以及 HLS 关闭时 `unsupported`/refresh `410 ticket_expired`/GET 可查询状态。脚本仍验证固定 `media_response` 字段、HEAD/playlist 零字节计数、ticket ID 与源 URL/Header 不泄漏，用合成 MP4 实际获取并解码 local server-HLS segment；还通过本机标准 `207 Multi-Status` WebDAV fixture 覆盖远程 server-proxy 的 GET/HEAD、Range、416、If-Range、上游忽略 Range、畸形 206、源站 5xx 和敏感响应头剥离。这些 fixture 结果不能替代真实 Bilibili 双流或客户端本地合流；E2E 仍不覆盖 OpenList/Bilibili 真实来源、30 分钟 direct、网络切换或真机播放器，CI 也不运行该脚本。真实 30 分钟 direct、真实来源 HLS 解码、真实 Bilibili 双流和真机矩阵仍无结果。
+
+客户端机制基线同日见 `docs/adr/0002-windows-player-engine.md` 和 `docs/adr/0003-android-player-engine.md`。这些结果只证明原型构建、输入边界、窗口/播放器生命周期和合成合流可运行；不证明真实媒体、默认硬件解码、Bilibili 双流、30 分钟、20 次 seek、音画差、DPI 或网络矩阵通过。
 
 ## 1. 结论先行
 
@@ -97,7 +104,7 @@ DoriyaMedia/
 2. 同时做 Windows 与 Android 的能力 Spike，但不写正式 UI。
 3. 用 Windows 做第一条完整产品纵切，因为 mpv 能最快验证 Header、MKV、双流和字幕边界。
 4. 协议和失败语义稳定后，再完成 Android 产品线。
-5. 最后启用 `direct-dash`、本机中继和双内核兼容策略，并完成发布门禁。
+5. `direct-dash` 的服务端契约与默认关闭实现现已落地；最后阶段完成真实双流与客户端合流验收、生产启用、本机中继和双内核兼容策略，并完成发布门禁。
 
 这不是“Windows 永远优先”。如果 Android 有明确业务优先级，A0 Spike 仍应与 W0 并行，只是正式产品化应等待同一版协议稳定。
 
@@ -125,7 +132,7 @@ DoriyaMedia/
 
 ## 3. Legacy `/api` 实现事实与 v1 边界
 
-以下条目除非明确标注 v1，否则描述 legacy `/api` 现状，不能直接套用到 `/api/v1`。v1 当前传输为 `direct-http / server-proxy / server-hls / unsupported`，并使用固定安全 Header DTO、票据和 media session。
+以下条目除非明确标注 v1，否则描述 legacy `/api` 现状，不能直接套用到 `/api/v1`。v1 当前可签发 `direct-http / server-proxy / server-hls`，并在默认关闭的 S5 分支中支持 `direct-dash`；没有可用 v1 transport 时进入 `unsupported`。所有 v1 传输都使用固定安全 Header DTO 和票据，server-proxy/server-HLS 另用 media session。
 
 这些事实决定了协议不能只是给旧接口加一个客户端壳：
 
@@ -162,17 +169,21 @@ DoriyaMedia/
 
 ## 4. 传输模型
 
-### 4.1 五种固定传输策略
+### 4.1 四种 v1 传输与未来 local-relay
 
-| `transport` | 字节路径 | 使用场景 | 是否允许 Header | 必须保留的兜底 |
-| --- | --- | --- | --- | --- |
-| `direct-http` | 客户端 → 源站 | 单 URL、客户端可解码、Header 可安全下发 | 仅白名单 Header | `server-proxy`、`server-hls` |
-| `direct-dash` | 客户端分别 → 视频/音频源站，本地合流 | Bilibili 等双流源 | 仅白名单 Header | `server-hls` |
-| `local-relay` | 客户端播放器 → `127.0.0.1` 中继 → 源站 | 播放内核无法注入 Header，或需要自动刷新 URL | 中继内部注入 | `server-proxy`、`server-hls` |
-| `server-proxy` | 客户端 → 服务器 → 源站 | 客户端可解码但源站不允许安全直连 | 不向客户端下发源凭据 | `server-hls` |
-| `server-hls` | 客户端 → 服务器 HLS → ffmpeg 拉源 | 容器/音频/双流/图形字幕不兼容 | 不向客户端下发源凭据 | `unsupported` |
+概念上有五种策略，但当前 contract version 1 只定义四种传输；`local-relay` 尚未实现，也不是当前可签发的 transport。
 
-`local-relay` 不是服务器中转。它只监听 loopback，使用随机端口和一次性票据，绝不能绑定 `0.0.0.0`，也不能成为开放代理或 SSRF 跳板。
+| `transport` | 当前状态 | 字节路径 | 使用场景 | 是否允许 Header | 必须保留的兜底 |
+| --- | --- | --- | --- | --- | --- |
+| `direct-http` | v1 已实现 | 客户端 → 源站 | 单 URL、客户端可解码、Header 可安全下发 | 仅白名单 Header | `server-proxy`、启用的 `server-hls` |
+| `direct-dash` | v1 additive 已实现，默认关闭 | 客户端分别 → 视频/音频源站，本地合流 | Bilibili 等双流源 | 仅白名单 Header | 启用的 `server-hls` |
+| `local-relay` | 未实现，仅保留发现 flag | 客户端播放器 → `127.0.0.1` 中继 → 源站 | 播放内核无法注入 Header，或需要自动刷新 URL | 中继内部注入 | `server-proxy`、启用的 `server-hls` |
+| `server-proxy` | v1 已实现 | 客户端 → 服务器 → 源站 | 客户端可解码但源站不允许安全直连 | 不向客户端下发源凭据 | 启用的 `server-hls` |
+| `server-hls` | v1 已实现 | 客户端 → 服务器 HLS → ffmpeg 拉源 | 容器/音频/双流/图形字幕不兼容 | 不向客户端下发源凭据 | `unsupported` |
+
+`direct-dash` 只有在 `direct_dash_enabled=true`、设备级策略允许、来源是多流且客户端显式声明 `supports_dash_merge=true` 时才可能签发；省略该能力等价于 false。真实 Bilibili 双流与客户端本地合流尚未验收，不能把该实现状态写成 S5 已关闭。
+
+`local-relay` 尚未开始实现。未来落地时，它不是服务器中转，只监听 loopback，使用随机端口和一次性票据，绝不能绑定 `0.0.0.0`，也不能成为开放代理或 SSRF 跳板。
 
 ### 4.2 “像 302”不是继续返回 HTTP 302
 
@@ -190,14 +201,19 @@ DoriyaMedia/
 推荐统一顺序：
 
 ```text
-direct-http / direct-dash
+direct-http
   -> 重新签发一次票据（源 URL 可能过期或出口变化）
   -> server-proxy
-  -> server-hls
+  -> server-hls（仅 server_hls_v1_enabled=true）
+  -> unsupported（显示可操作原因）
+
+direct-dash
+  -> 重新签发一次票据（源 URL 可能过期或出口变化）
+  -> server-hls（仅 server_hls_v1_enabled=true）
   -> unsupported（显示可操作原因）
 ```
 
-`local-relay` 是可选的引擎适配层，不是额外内容来源。它失败后同样进入 `server-proxy`。
+`direct-dash` 不创建 media session，当前不能回退到 `server-proxy`。`local-relay` 是尚未实现的引擎适配层，不是额外内容来源；未来落地后其失败路径才进入 `server-proxy`。
 
 客户端必须避免回退循环：
 
@@ -279,7 +295,8 @@ Turnstile 不应被原生 UA 绕过。设备授权页复用现有 Turnstile 和�
     "audio_codecs": ["aac", "eac3", "flac"],
     "subtitle_codecs": ["text", "ass", "pgs"],
     "supports_range": true,
-    "supports_headers": true
+    "supports_headers": true,
+    "supports_dash_merge": false
   },
   "preferred_transports": [
     "direct-http",
@@ -291,7 +308,7 @@ Turnstile 不应被原生 UA 绕过。设备授权页复用现有 Turnstile 和�
 
 客户端能力只作为决策输入，不能被客户端用来突破账号权限。服务端仍执行用户、设备、文件权限和源站安全检查。
 
-当前 S3 请求模型不包含 `supports_dash_merge`，解析器会拒绝未知字段；该能力属于 S5 启用 `direct-dash` 时另行版本化的契约变更。
+当前 contract version 1 的请求模型已包含可选 `supports_dash_merge`，省略等价于 false。仅声明 true 不会让 `direct-dash` 变成可用；还必须同时满足 `direct_dash_enabled`、设备策略和多流来源资格。真实双流与客户端合流尚未验收。
 
 ### 5.4 票据响应
 
@@ -332,7 +349,7 @@ Turnstile 不应被原生 UA 绕过。设备授权页复用现有 Turnstile 和�
 约定：
 
 - 当前状态集合为 `probing / ready / consuming / unsupported / failed / expired / revoked / exhausted`；只有 `consuming` 的一次性签发响应携带 `transport`，`probing` 返回 `202` 且不携带资源描述。
-- `direct-dash` 尚未进入当前 S3 契约；S5 实现后才允许 `streams` 以 `video` 和 `audio` 两个角色表达双流。
+- `direct-dash` 已作为 contract version 1 的 additive transport 进入契约，默认关闭且受 `supports_dash_merge` 等条件限制；`streams` 必须以 `video` 和 `audio` 两个角色表达双流。真实 Bilibili 双流和客户端合流尚未验收，不能把它视为已验收播放路径。
 - `server-proxy` 和 `server-hls` 必须有独立 media session，不与 5 分钟决策票共用 TTL。
 - media session 建议 15 分钟空闲过期、6 小时绝对上限；HLS playlist 子资源只认同会话。
 - 当前 API 不含 `fallback_order`；客户端使用 `remaining_transports` 判断剩余候选顺序。
@@ -466,7 +483,7 @@ libmpv，仅通过 feature flag 和独立播放引擎适配层启用
   - S2 OpenList MKV H.264/EAC3。
   - S3 MKV HEVC 10-bit/FLAC，带 ASS/PGS。
   - S4 真实 Bilibili 视频/音频双 URL。
-  - S5 需要 Referer/Authorization、Range 行为异常的 mock URL。
+  - S5 使用 Referer/UA 双流成功样本，以及 Authorization 等非白名单 Header、Range 行为异常和单流失败的负向回退样本。
 - 报告记录文件 ID、来源、容器、编码、客户端网络、出口地区、结果和失败阶段，不记录真实凭据。
 - 本地命令：
 
@@ -520,7 +537,7 @@ git diff --check
 
 - `/api/v1/meta` 返回 `contract_version`、`server_version`、`minimum_client_versions`、`features`。
 - 错误码至少覆盖 `client_upgrade_required`、`device_revoked`、`ticket_expired`、`unsupported_media`、`source_unavailable`、`rate_limited`。
-- fixtures 覆盖 `meta`、`probing`、`unsupported`、`direct-http`、`server-proxy`、`server-hls` 和主要错误；`direct-dash` fixture 属于 S5，不纳入当前 S1 完成证据。
+- fixtures 覆盖 `meta`、`probing`、`unsupported`、`direct-http`、`server-proxy`、`server-hls`、`direct-dash` 和主要错误；`ticket-direct-dash.json` 证明静态 additive 契约与校验通过，`playback-e2e.ps1` 另行覆盖确定性进程级签发/回退，但两者都不代表真实双流、客户端合流或 S5 验收完成。
 - 校验命令：
 
 ```powershell
@@ -648,7 +665,7 @@ git diff --check
 
 **设备/网络矩阵**
 
-- S1/S2/S5 样本。
+- S3 样本；S1/S2 仅作回归基线。
 - 同网出口、手机热点、不同地区出口。
 - 源 URL 主动 403、过期和源站 5xx 的故障注入。
 
@@ -692,16 +709,36 @@ git diff --check
 - v1 server-proxy、本地媒体和字幕的 `HEAD` 不返回 body，并保留正确的 `Content-Length`/`Content-Range`。
 - v1 server-proxy/本地媒体的 `GET Range: bytes=0-0` 返回 206 且恰好一个字节。
 - v1 单段 Range 支持闭区间和开放区间；v1 明确拒绝多段和后缀 Range。legacy 继续保留其既有后缀 Range 行为。
-- 不可满足范围返回 416；坏 upstream 206、越界 206 和缺失 `Content-Range` 映射为 502。
-- v1 local 会严格比较 `If-Range` 的强 ETag/精确时间；server-proxy 把条件交给源站，只能依据源站返回的 validator 拒绝冲突 206。源站返回 206 却省略 validator 时，代理无法独立证明条件匹配。
+- Range 只接受 ASCII 数字和最外层 SP/HTAB OWS：畸形客户端 Range 返回 400，缺失或不满足的范围返回 416；坏 upstream 206、越界 206、畸形上游 `Content-Range` 映射为 502，缺失 416 `Content-Range` 仍按 RFC 走探测回退。
+- v1 local 只发送基于 volume/file identity/change time（Linux 为 dev/inode/ctime）的强 ETag，并且 `If-Range` 只接受精确强 ETag；日期、弱 ETag、旧 ETag 或无法取得可靠版本时回退完整 200。server-proxy 把条件交给源站，只能依据源站返回的 validator 拒绝冲突 206；源站返回 206 却省略 validator 时，代理无法独立证明条件匹配。
 - v1 HLS playlist/segment 按契约只接受 GET，`HEAD` 返回 405；不能把 server-proxy 的 HEAD 语义外推到 HLS。
+- OpenAPI 静态契约已声明 stream GET/HEAD 的 `200/206/400/403/404/408/410/416/429/500/502/504` 与 HLS GET 的 `200/400/403/404/408/410/415/500/502/504`；HEAD 所有响应必须 bodyless，206/416 的 `Content-Range` 必填。Range 外层 SP/HTAB OWS、闭区间/开放区间、拒绝后缀/倒序/多段/重复 Header，以及强 ETag/If-Range 语义均有 protocolcheck mutation test。公开 failure code 使用闭合 schema 和 3 个新增 failed fixtures；未知内部 failed code 收敛为 `source_unavailable`。
 - `LocalDriver.Open/List/Serve` 使用 `os.OpenInRoot` 和已打开句柄；v1 本地媒体也复用已打开句柄并对其执行 Range/HEAD。
-- 媒体响应遥测使用固定字段：`surface`、`transport`、`asset`、`outcome`、`failure_stage`、`status`、`response_bytes`、`server_media_bytes`、`duration_ms`；不记录票据、URL、query、Header 或本地路径。HEAD 不计响应/媒体字节，playlist/subtitle 不计 `server_media_bytes`。v1 subtitle 当前只有普通访问日志，尚未接入 `media_response` telemetry；legacy subtitle 已接入。
+- 媒体响应遥测使用固定字段：`surface`、`transport`、`asset`、`outcome`、`failure_stage`、`status`、`response_bytes`、`server_media_bytes`、`duration_ms`；不记录票据、URL、query、Header 或本地路径。HEAD 不计响应/媒体字节，playlist/subtitle 不计 `server_media_bytes`。v1/legacy subtitle 均已接入 `media_response` telemetry。
+- 有效 TTL：播放决策票绝对 TTL 为 5 分钟，transport claim 为 30 秒；media session 和 subtitle session 均为 15 分钟 idle TTL、6 小时 absolute TTL；ticket transient probe 的成功或普通失败结果缓存 30 秒。最终 ticket CAS 使用取得写锁后重新计算的 effective time，等待写锁不会顺带延长票据有效期。
+- 文件代际：数据库 probe 代际目前由 `size + mtime` 构成。代际变化时 `UpsertFile` 清空旧 probe，数据库 trigger `trg_files_generation_clears_subtitles` 删除该文件全部 subtitle 行（包括 external/driver 行）。非空 probe metadata 必须携带 `FileVersion`，metadata 事务内再次核对当前 size/mtime，旧代际不得写入。
+- 字幕清理 trigger：同一代际内，后台 probe 只替换并清理本次 probe 发现的 embedded 行，保留 external/driver 行。ticket finalize 对本次候选字幕执行 upsert 并生成 grant ID 快照，但不会删除已消失的外部或 embedded 候选，这是后续待收敛项。
+- ticket metadata 原子提交：finalize 在同一个播放写事务内完成 `files.probe`、本次候选字幕 upsert、`subtitle_ids_json` grant 快照和 ticket state/version CAS。事务先锁票并校验 state、version、expiry；撤销若先取得 writer lock，则不会留下 probe 或字幕缓存副作用；ticket CAS 失败时 metadata 一并回滚。
+- 后台 probe 原子写入：`doProbe` 使用单事务同时写 `files.probe` 和 embedded subtitle 行，并以开始 probe 时的 `size + mtime` 做 CAS。代际已变化时整体不写，也不更新内存旧 probe；`ErrMediaFileChanged` 不进入 30 秒失败冷却。普通缓存持久化错误只记录脱敏日志，本次已成功的播放 probe 仍保持可用。
+- 阶段预算：Create 只读预检 20 秒、后台 probe 总预算 150 秒、finalize 20 秒、失败收敛清理 3 秒；外部字幕 discovery watchdog 为 5 秒。watchdog 到期时省略 external/driver 字幕并继续 finalize，父 context 取消或超时仍是致命错误。非协作 driver 留下的 goroutine 无法强制终止，重复请求可能积累 goroutine/连接。
+- audio-only 与 failure code：transient probe 可以返回非空 audio-only probe 加 `errNoVideoStream`，finalize 最终收敛为 `unsupported/unsupported_media`。公开 failed code 包括 `source_unavailable`、`probe_timeout`、`probe_interrupted`、`probe_finalize_failed`；未知内部 failed code 收敛为 `source_unavailable`，避免泄漏内部细节。
+- 工具快照：`SetTools` 在 `toolMu` 下原子发布 ffmpeg、ffprobe 和 probe window；`SetBins` 保持兼容并保留当前 window。`currentProber`/`currentFFMpeg` 返回不可变发布快照，probe 热路径不直接读取可变的 `Cfg.Playback`。
+- 缓存失效：源配置更新、Bilibili 登录成功和 refresh token 更新成功后调用 `InvalidateSourceCaches(sourceID)`，按 source 清除 resolve/parts 缓存并保留 per-file 解析锁；该函数不清 keyframe cache，也不重建 source list/driver 实例。
+- ticket probe 上限：纯 probe registry 以 `fileID + size + mtime` 为键，同 key 单飞，内存条目最多 1024；真正执行 ticket ffprobe 的并发最多 4。registry 满且仍有可淘汰的已完成项时只淘汰最旧一项；全为 in-flight 时调用者等待容量或自身 context 结束，不绕过 registry。调用者自身取消会删除 job 并让 live follower 重新选主；driver 在仍有效的调用者 context 下返回 `Canceled/DeadlineExceeded` 按普通失败缓存 30 秒，不触发热重试。
+- Create 在写票前执行只读 `ProbeFor` 预检：请求取消返回 408、deadline 返回 504，且不创建 ticket；非 context 的源 probe 失败仍创建 ticket 并返回 `201 failed/source_unavailable`。`ProbeFor` 成功时同步 finalize；需要 ffprobe 时返回 `202 probing`。
+- finalize HTTP/status 语义：普通 finalize 失败返回 500，但已设置的 `Location` 指向终态 ticket；status GET 返回 200，ticket 为 `failed/probe_finalize_failed`。请求取消和超时分别返回 408/504，并尽力将 ticket 收敛为 `probe_interrupted`/`probe_timeout`；若 3 秒收敛本身失败，ticket 可能保留 `probing` 到 TTL。
+- 播放写事务由单一 writer 信号量串行化；10 秒预算覆盖信号量、连接池、`BeginTx`、SQLite 锁等待和业务函数。专用连接临时将 `busy_timeout` 设为 0 并做 1-25 ms 指数退避，成功后恢复 `busy_timeout=10000` 再提交；rollback/恢复失败会丢弃连接。deadline/canceled 在 API 层分别映射为 504/408。
+- 出站连接设置 TLS handshake 15 秒、ResponseHeader 60 秒、CONNECT 握手 15 秒（或更早的请求 deadline），不设置会截断长媒体流的整请求总超时。
+- ticket probe 与字幕发现改为纯读；启动时未过期的遗留 `probing` ticket 收敛为 `failed/probe_interrupted` 并 bump version，已过期的转为 `expired`，使旧 worker 无法完成且恢复幂等。
 - `request_issuance_fallback_count` 只表示当前签发调用内已经发生的服务端候选回退；`remaining_transports` 表示当前仍可尝试的候选；`ticket_attempt_ordinal` 与 `last_claimed_transport` 用于识别跨 refresh 的 claim/传输顺序变化。`last_claimed_transport` 证明上一轮 claim 选择，不证明客户端已成功播放；没有客户端失败报告时，不能把“传输序号变化”直接判定为客户端 playback fallback。
 - 本机验证命令：
 
 ```powershell
 Set-Location C:\Users\Administrator\DoriyaMedia
+Push-Location .\scripts\protocolcheck
+go test -mod=readonly ./... -count=1
+go vet -mod=readonly ./...
+Pop-Location
 .\scripts\check-protocol.ps1
 go test ./internal/api ./internal/db ./internal/source ./internal/media -count=1
 go vet ./internal/api ./internal/db ./internal/source ./internal/media
@@ -711,9 +748,9 @@ go test ./... -count=1
 git diff --check
 ```
 
-`go test -race ./internal/api ./internal/media` 仍是验收命令，但当前 Windows 机器为 `CGO_ENABLED=0` 且没有 GCC，尚未执行。
+`go test -race ./internal/api ./internal/media` 仍是验收命令；本机已安装 GCC，并于 2026-10-28 通过根模块 `go test -race ./...`。
 
-`playback-e2e.ps1` 使用确定性 probe 元数据；本机有 ffmpeg 时会生成合成 MP4，并实际获取 HLS playlist/segment、校验 MPEG-TS 字节后用 ffmpeg 解码，缺少 ffmpeg 时该段计为 1 个 skip。它仍不覆盖真实 OpenList/Bilibili 来源、30 分钟持续播放、网络切换或客户端播放器，当前 GitHub Actions 也不运行该脚本，因此不能替代真实媒体验收。
+`playback-e2e.ps1` 使用确定性 probe 元数据；本机有 ffmpeg 时会生成合成 MP4，并实际获取 HLS playlist/segment、校验 MPEG-TS 字节后用 ffmpeg 解码，缺少 ffmpeg 时该段计为 1 个 skip。脚本还验证 `media_response` 固定字段、HEAD/playlist 字节口径、HLS capability 的 query 拒绝与同 capability segment URI，以及 ticket ID 不入日志。远程分支使用运行时生成的标准 `207 Multi-Status` WebDAV fixture 和 WebDAV source，覆盖 server-proxy 完整 GET、HEAD、Range 206、416、matching/stale If-Range、上游忽略 Range、畸形 206、源站 5xx，以及 Headers 和 ContentHeaders 中的 Authorization、Cookie、Set-Cookie、WWW-Authenticate、Location、X-Source-* 等 canary 不泄露。direct-dash 分支以 `-tags playbacke2e` 构建服务端，通过真实 admin source/library/scan API 创建确定性多流 source，验证能力与 flag 矩阵、设备级禁用/恢复、跨设备隔离、双流 DTO、白名单 Header、签发阶段非法 Header 原子回退和 HLS 关闭 fail-closed；它不验证真实 Bilibili URL、客户端合流或音画同步。脚本仍不覆盖真实 OpenList/Bilibili 来源、30 分钟持续播放、网络切换或客户端播放器，当前 GitHub Actions 也不运行该脚本，因此不能替代真实媒体验收。
 
 **待真机/真实媒体验收**
 
@@ -724,9 +761,16 @@ git diff --check
 
 **残余限制**
 
+- DB 文件代际仅由 `size + mtime` 构成，同大小且 mtime 未变化或恢复为原值的原地替换仍可绕过；本地 HTTP 的 volume/file identity/change time 强 ETag 不能替代数据库 probe 代际。
+- ticket subtitle grant 保存的是可变 subtitle row ID，而不是签发时内容快照；字幕行后续更新没有内容哈希或版本绑定。ticket metadata 对已消失的外部/同图片段候选只 upsert，不清理旧候选。
+- 非协作 MultiPart driver 若永久不返回，其调用 goroutine、同 key 解析锁和锁注册表引用会保留，以阻止同 key 并发驱动；调用方和 ticket probe slot 仍可按 context 退出。
+- 非协作 subtitle driver 的超时 goroutine 无法强制结束，重复请求可能积累 goroutine/连接；finalize 的 3 秒失败收敛若也失败，ticket 可能停留 `probing` 到 TTL。
 - FFmpeg/FFprobe 仍接收普通本地路径并在子进程内重开；hardlink containment、根目录父级 ACL 和文件原地改写无法由当前句柄化完全保证。
 - 已验证的是本地打开句柄跨 rename/替换稳定；probe→FFmpeg/HTTP 重开期间的路径替换、hardlink 和父目录 ACL 变化仍未验证。
-- 异步 probe 使用状态复核缩小撤销后的写入窗口，但 `StartProbe` 不是与签发/撤销共用同一事务，不能承诺撤销后零副作用。后台 probe 仅存在于进程内，没有持久化任务恢复；进程重启后 `probing` ticket 只能等待 TTL 或维护任务过期。
+- 启动收敛假设单个服务进程独占 SQLite 数据库；多实例共享同一数据库时仍需持久化 probe owner/lease，不能用“启动即失败全部 probing”替代代际协议。
+- ticket ffprobe 的 4 路限制只覆盖 `ProbeTransient`；legacy `EnsureProbe`、后台 pre-probe 和 FFmpeg 子进程有各自执行路径，不能把该数字理解为全进程所有媒体子进程总上限。
+- Playback probe runner 使用包级测试 seam；现有相关测试不得加 `t.Parallel()` 并发覆盖该 seam。
+- media/HLS 响应矩阵目前由 OpenAPI + protocolcheck 静态/mutation test 校验，尚未为每个状态码搭建独立 HTTP 集成矩阵；更新后的 GitHub Actions workflow 也尚未在远端实际运行。
 - 服务端只保证其代理和 DTO 不把敏感 Header 带到跨源目标；`direct-http` 客户端后续重定向的 Header 剥除必须由原生客户端实现并测试。
 - 当前 refresh 没有客户端失败原因上报，服务端只能观察签发顺序，不能单独计算“客户端实际播放失败后发生 fallback”的播放占比；该指标需要后续固定枚举的客户端遥测和稳定 trace 关联。
 
@@ -740,21 +784,30 @@ git diff --check
 
 ### S5：`direct-dash` 与中继授权边界
 
+**当前状态**
+
+- `direct-dash` 服务端契约、默认关闭实现、协议样例、自动测试和进程级 HTTP E2E 已落地。
+- E2E 使用确定性多流 fixture 验证签发、能力/flag/设备策略矩阵、跨设备隔离与恢复、Header 白名单、签发阶段原子回退与 HLS 关闭 fail-closed；它不代表真实 Bilibili 双流或客户端合流通过。
+- 真实 Bilibili 双流、客户端本地合流、Windows/Android 真机与网络矩阵均未执行，S5 未关闭。
+- `local-relay` 尚未开始实现，仅保留 `local_relay_enabled` 发现 flag。
+
 **目标**
 
-- 为双流源签发 `direct-dash` ticket，明确 video/audio URL、Header、轨道和同步信息。
-- 支持 `local-relay` 所需的短期刷新能力，但不让中继读取主账号凭据。
-- 保留 `server-hls` 为强制兜底。
+- 完成 `direct-dash` 从真实双流源签发到客户端本地合流的端到端验收，明确 video/audio URL、Header、轨道和同步信息。
+- 只在服务端 flag、设备策略、多流来源资格和客户端 `supports_dash_merge=true` 全部满足时签发。
+- 保留 `server-hls` 兜底能力，但仅当 `server_hls_v1_enabled=true` 时可用。
+- 保留未来 `local-relay` 的短期刷新和凭据隔离边界设计，不让中继读取主账号凭据。
 
 **非目标**
 
 - 不在服务器端做客户端本地合流。
 - 不承诺 Bilibili 在所有网络和地区都能直连。
 - 不允许中继接受任意目标 URL 或绑定公网地址。
+- 不在当前收尾中实现 `local-relay`；它未开始且不属于当前可签发 transport。
 
 **依赖**
 
-- S3、S4；W0/A0 至少一个双流 Spike 已通过。
+- S3、S4；W0/A0 至少一个双流 Spike 已通过。W0/A0 当前已有机制原型，但都尚未完成真实双流、同步、seek 和长时验收，因此 S5 端到端验收仍被阻塞；服务端默认关闭实现可以保留合并，但不能据此宣称 S5 关闭。
 
 **目标目录**
 
@@ -765,9 +818,11 @@ git diff --check
 
 **完成与验证**
 
-- 双流响应包含两个明确角色，不把视频 URL 冒充完整播放源。
-- 票据不含 Bilibili Cookie；Header 只含白名单 referer/UA 等。
-- 关闭 `direct_dash_enabled` 时，同一文件立即回到 `server-hls`。
+- 服务端双流响应包含两个明确角色，不把视频 URL 冒充完整播放源。
+- 票据不含 Bilibili Cookie；Header 只含白名单 Referer/UA 等。
+- 省略 `supports_dash_merge` 或显式设为 false 时，不得签发 `direct-dash`；为 true 时仍需服务端 flag、设备策略和多流来源资格全部通过。
+- 关闭 `direct_dash_enabled` 时，同一文件只能选择仍启用的候选；若 `server_hls_v1_enabled=true` 则回退 `server-hls`，否则继续到其他候选或 `unsupported`。
+- 进程级 HTTP E2E 已覆盖以上确定性 fixture 分支；真实 Bilibili 视频/音频双流、客户端本地合流、30 分钟连续播放、20 次随机 seek 和音画同步仍待验收。
 - 验证命令：
 
 ```powershell
@@ -780,13 +835,14 @@ git diff --check
 
 **设备/网络矩阵**
 
-- S4 真实 Bilibili 双流，至少 30 分钟和 20 次随机 seek。
-- 大陆、港澳台、海外出口各测一次。
-- URL 过期、地区失败、单流 403、双流时长不一致各测一次。
+- 当前均未执行：S5 真实 Bilibili 双流，Windows 与 Android 客户端本地合流，至少 30 分钟和 20 次随机 seek。
+- 当前均未执行：大陆、港澳台、海外出口各测一次。
+- 当前均未执行：URL 过期、地区失败、单流 403、双流时长不一致各测一次。
 
 **回滚**
 
-- 默认关闭 `direct_dash_enabled` 和 `local_relay_enabled`；客户端收到不支持或直接使用 server-hls。
+- 默认关闭 `direct_dash_enabled`；客户端只能使用其他已启用候选。只有 `server_hls_v1_enabled=true` 时才可使用 server-HLS，否则显示明确的 `unsupported`/重试原因。
+- `local_relay_enabled` 继续保持 false；因为 local-relay 尚未实现，关闭它不会改变当前播放路径。
 
 **日志禁区**
 
@@ -808,7 +864,7 @@ git diff --check
 
 **依赖**
 
-- S0；S5 的 Bilibili 样本可先用本地 mock 替代。
+- S0；`ticket-direct-dash.json` 双流协议样本已存在。W0 的 Tauri 与 WinUI 机制原型已创建并通过本机构建/冒烟，但真实媒体、逐流 Header、双流同步和稳定性验证尚未开始。
 
 **目标目录**
 
@@ -817,16 +873,25 @@ git diff --check
 
 **完成与验证**
 
+- 当前状态：Tauri 已通过构建、32 个 Rust tests（另 1 个真实 mpv 测试需显式启用）、真实 mpv 空载 IPC、debug exe 构建和交互会话 GUI 启动/退出 smoke，并已实现最小环境继承、128 位随机管道名、服务端 PID 校验、空 capability、固定 5 秒 IPC 响应期限、`start-file`/`file-loaded`/`end-file` 代次状态机，以及子进程退出、控制超时和失败后的有界清理；完整 DACL/SID/session 对端信任和 Job Object 崩溃联动清理仍未完成。WinUI 已通过 0 warning/error 构建、91 个 xUnit tests、LibVLC `3.0.19` probe、app smoke 和合成 loopback 双源 smoke，支持 `Media.AddSlave` 与 LibVLC 可安全表达的双流共享 Header。两者均未加载真实媒体，WinUI 尚不支持逐流 Header，因此 W0 未关闭。
 - 两个候选方案至少各完成 S1、S2、S3、S4、S5 的可行性测试。
 - 通过标准：30 分钟无花屏；20 次 seek 正常；音画差不超过 100 ms；全屏和多显示器正常。
 - 许可证结论明确到 mpv、FFmpeg、使用的解码器和 HEVC/AAC 分发义务。
 - 验证命令（原型形成后执行）：
 
 ```powershell
-Set-Location C:\Users\Administrator\DoriyaMedia\spikes\windows-player
+Set-Location C:\Users\Administrator\DoriyaMedia\spikes\windows-player\tauri-mpv
+pnpm install --frozen-lockfile
+pnpm build
+Set-Location .\src-tauri
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+
+Set-Location C:\Users\Administrator\DoriyaMedia\spikes\windows-player\winui-libvlcsharp
+.\verify.ps1
+
+Set-Location C:\Users\Administrator\DoriyaMedia
 git diff --check
 ```
 
@@ -932,7 +997,7 @@ git diff --check
 
 **完成与验证**
 
-- S1、S2、S5 全部可播放；直连 30 分钟时服务端 media 出站接近 0。
+- S1、S2、S3、S4 全部可播放；直连 30 分钟时服务端 media 出站接近 0。W2 不负责 `direct-dash` 合流。
 - mpv 进程崩溃后应用仍存活，并能提示回退。
 - 验证命令：
 
@@ -946,7 +1011,7 @@ cargo test --workspace
 pnpm tauri build --debug
 ```
 
-- 手工执行 S1/S2/S5 样本：起播、20 次随机 seek、暂停恢复、字幕切换、全屏和断网恢复。
+- 手工执行 S1/S2/S3/S4 样本：起播、20 次随机 seek、暂停恢复、字幕切换、全屏和断网恢复；S5 由 W3 验收。
 
 **设备/网络矩阵**
 
@@ -1012,7 +1077,7 @@ pnpm tauri build --debug
 
 **回滚**
 
-- 分别关闭 `local_relay_enabled` 和 `direct_dash_enabled`，恢复 mpv 直接 Header 或 server-hls。
+- 分别关闭 `local_relay_enabled` 和 `direct_dash_enabled`；恢复 mpv 直接 Header，或仅在 `server_hls_v1_enabled=true` 时使用 server-HLS。local-relay 尚未实现，关闭其 flag 不改变当前路径。
 - relay 监听异常时应用立即退出中继并回到服务端兜底。
 
 **日志禁区**
@@ -1092,7 +1157,7 @@ git diff --check
 
 **依赖**
 
-- S0；S5 的双流 fixture。
+- S0；`ticket-direct-dash.json` 双流 fixture 已存在。A0 的 Media3 机制原型已创建并通过 API 37 x86_64 ATD 的合成双流、逐流 DataSource 和重定向策略测试，但真实双流、真机和默认解码路径验证尚未开始。
 
 **目标目录**
 
@@ -1101,13 +1166,14 @@ git diff --check
 
 **完成与验证**
 
-- S1-S5 在 API 28/31/34 真机上的结果表。
+- 当前状态：单 URL、白名单 Header、逐流 Header/容器 MIME、双 URL `MergingMediaSource`、同源重定向 Header 保留与跨源 fail-closed、播放意图、控制/seek、lifecycle 暂停与 PlayerView 解绑、脱敏日志已实现；lint 0 error/10 warnings、24 个 JVM tests、debug/test APK 构建、API 37 ATD `connectedDebugAndroidTest` 4/4 和冷启动冒烟通过。connected 测试覆盖 Ready、双轨、seek discontinuity、seek 后位置推进、播放/暂停、video surface、逐流输入和生产 MediaSource factory 独立 DataSource。ATD 的 goldfish H.264 解码缺陷使合成测试使用 `PREFER_SOFTWARE`，不能替代真机/默认硬件路径；真实 CDN 重定向链和逐流 Range 尚无端到端结果，真实 API 28/31/34 真机、默认硬件解码、真实 Bilibili 双流和长时矩阵仍未验收。
+- S1-S5 在 API 28/31/34 真机上的结果表；当前尚未执行。
 - 记录起播、seek、字幕、音画同步、CPU、电量和内存。
 - 验证命令：
 
 ```powershell
 Set-Location C:\Users\Administrator\DoriyaMedia\spikes\android-player
-.\gradlew.bat :app:lintDebug :app:testDebugUnitTest :app:assembleDebug
+.\gradlew.bat :app:lintDebug :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest
 .\gradlew.bat :app:connectedDebugAndroidTest
 git diff --check
 ```
@@ -1204,7 +1270,7 @@ git diff --check
 
 **完成与验证**
 
-- S1/S2/S5 起播、暂停、seek、音轨、字幕。
+- S1/S2/S3/S4 起播、暂停、seek、音轨、字幕；A2 不负责 `direct-dash` 合流，S5 由 A3 验收。
 - 403 刷新 ticket 后从当前位置继续。
 - 验证命令：
 
@@ -1278,7 +1344,7 @@ git diff --check
 **回滚**
 
 - `libmpv_fallback_enabled=false` 时只保留 Media3。
-- `direct_dash_enabled=false` 时强制 server-hls。
+- `direct_dash_enabled=false` 时停止签发 `direct-dash`；仅当 `server_hls_v1_enabled=true` 时强制 server-HLS，否则显示明确的不可用/重试原因。
 - 双内核状态异常时使用独立进程/独立播放会话并回到 Media3。
 
 **日志禁区**
@@ -1429,7 +1495,7 @@ git diff --check
 - S2：OpenList MKV H.264/EAC3。
 - S3：HEVC 10-bit/FLAC，带 ASS/PGS。
 - S4：真实 Bilibili 视频/音频 DASH 双流。
-- S5：mock URL，必须带 Referer/Authorization，且含 200/206/416/过期/重定向异常。
+- S5：Referer/UA 双流成功样本，以及 Authorization 等非白名单 Header、200/206/416、过期、重定向异常和单流失败的负向回退样本。
 
 真实 URL 放在环境变量或 CI secret 中，测试失败只输出样本 ID 和错误类别。
 
@@ -1451,20 +1517,23 @@ git diff --check
 - `ticket-direct-http.json`
 - `ticket-server-proxy.json`
 - `ticket-server-hls.json`
+- `ticket-direct-dash.json`
 - `error-device-revoked.json`
 - `error-ticket-expired.json`
 - `error-rate-limited.json`
 
-`ticket-direct-dash.json` 仅在 S5 实现后加入，不能作为当前 S1-S4 的已完成 fixture。
+`ticket-direct-dash.json` 已加入并通过静态校验，`playback-e2e.ps1` 也已覆盖确定性双流签发与回退；它们仍不代表真实 Bilibili 双流、客户端本地合流或 S5 验收完成。
 
 ## 10. 验收门禁
 
 ### 10.1 服务端
 
-- `go vet ./...`、`go test ./...`、关键包 race test 全绿；当前 race test 因本机缺少 CGO/GCC 尚未执行，门禁未关闭。
-- OpenAPI/Schema 和 fixture 校验全绿。
+- `go vet ./...`、`go test ./...`、关键包 race test 全绿；本机于 2026-10-28 通过 `go test -race ./...`。
+- OpenAPI/Schema 和 fixture 校验全绿，包含 media/HLS 精确响应矩阵、HEAD bodyless、Range/OWS、206 `Content-Range`、ETag/If-Range 和公开 failure code 的 mutation test；`check-protocol.ps1` 必须先执行 protocolcheck 自测。
 - 票据跨用户、跨设备、跨文件、跨用途、过期重放全部拒绝。
 - server-proxy/本地/字幕 HEAD、v1 单段 Range、416、坏 upstream 206 的低层测试全绿；HLS HEAD 的 405 例外符合契约。
+- 异步 probe 的撤销后零副作用、metadata+ticket 原子提交、旧 worker 失效和启动收敛幂等测试全绿。
+- ticket probe registry 满额等待、单条最旧缓存淘汰、4 路执行上限、driver context 失败 TTL 和调用者取消重新选主测试全绿。
 - 旧 `/api` 自动回归测试通过；Web 页面手工播放回归尚未执行。
 - direct 播放 30 分钟，服务器 media 出站字节为 0；控制 API 请求不计入。
 - 遥测能区分 `response_bytes` 与 `server_media_bytes`，并用 `request_issuance_fallback_count`、`ticket_attempt_ordinal`、`last_claimed_transport` 区分请求内回退和跨 refresh 的 claim/传输变化。
@@ -1472,8 +1541,9 @@ git diff --check
 
 ### 10.2 客户端
 
-- Windows：S1-S5 在 Windows 10/11、Intel/NVIDIA/AMD、单/多屏和 DPI 矩阵通过。
-- Android：S1-S5 在 Android 9/12/14 和 Qualcomm/MediaTek 真机通过。
+- Windows：S1-S5 在 Windows 10/11、Intel/NVIDIA/AMD、单/多屏和 DPI 矩阵通过；当前尚未执行。
+- Android：S1-S5 在 Android 9/12/14 和 Qualcomm/MediaTek 真机通过；当前尚未执行。
+- 真实 Bilibili 双流、客户端本地合流以及 Windows/Android 网络矩阵当前均无结果，因此 S5 门禁未关闭。
 - 直连失败在 5 秒内进入服务端兜底，或给出可操作的地区/网络原因。
 - 30 分钟连续播放无花屏；20 次随机 seek 成功率 100%；音画差不超过 100 ms。
 - 后台、锁屏、音频焦点、PiP（Android）和睡眠恢复、媒体键（Windows）通过。
@@ -1508,7 +1578,8 @@ git diff --check
 降级顺序：
 
 ```text
-direct-http/direct-dash -> server-proxy -> server-hls -> unsupported
+direct-http -> server-proxy -> server-hls（仅 server_hls_v1_enabled=true）-> unsupported
+direct-dash -> server-hls（仅 server_hls_v1_enabled=true）-> unsupported
 ```
 
 不是：
@@ -1525,13 +1596,13 @@ direct-http/direct-dash -> server-proxy -> server-hls -> unsupported
 - 新路由按 `client_v1_enabled`、`playback_ticket_enabled` 和设备级 flag 控制。
 - `direct_http_enabled`、`server_proxy_v1_enabled`、`server_hls_v1_enabled`、`direct_dash_enabled` 可以独立关闭。
 - ticket/media session 只保存哈希和状态，不依赖客户端缓存才能失效。
-- 发生异常时退回旧 Web 播放链路或 server-hls。
+- 发生异常时退回旧 Web 播放链路；v1 的 `direct-dash` 仅在 `server_hls_v1_enabled=true` 时回退到 server-HLS，不能回退到 `server-proxy`。
 
 ### 12.2 客户端
 
 - 保留原生播放器的 feature flag。
 - Windows 可以打开 Web 播放器 fallback。
-- Android 可以关闭 libmpv、直连和 DASH，走 Media3 + server-hls。
+- Android 可以关闭 libmpv、直连和 DASH；仅当 `server_hls_v1_enabled=true` 时走 Media3 + server-HLS，否则显示明确的不可用/重试原因。
 - 安装器/APK 永远允许回到上一个已签名版本；更新清单禁止降级到未知版本。
 
 ### 12.3 发布

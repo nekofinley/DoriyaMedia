@@ -339,16 +339,107 @@ func biliPlayurlFixture() string {
 	    {"quality":16,"new_description":"360P 流畅","display_desc":"360P"}
 	  ],
 	  "dash":{"duration":1440,"video":[
-	    {"id":125,"baseUrl":"v125hdr","codecs":"hvc1.2.4.H150.90","width":3840,"height":2160,"bandwidth":9000000},
-	    {"id":120,"baseUrl":"v120avc","codecs":"avc1.640033","width":1920,"height":1080,"bandwidth":5400000},
-	    {"id":120,"baseUrl":"v120hevc","codecs":"hev1.1.6.L153.90","width":1920,"height":1080,"bandwidth":4000000},
-	    {"id":32,"baseUrl":"v32avc","codecs":"avc1.64001F","width":852,"height":480,"bandwidth":700000},
-	    {"id":32,"baseUrl":"v32hevc","codecs":"hev1.1.6.L120.90","width":852,"height":480,"bandwidth":600000},
-	    {"id":16,"baseUrl":"v16avc","codecs":"avc1.64001E","width":640,"height":360,"bandwidth":400000}
+	    {"id":125,"baseUrl":"https://cdn.example.test/v125hdr","mimeType":"video/mp4","codecs":"hvc1.2.4.H150.90","width":3840,"height":2160,"bandwidth":9000000},
+	    {"id":120,"baseUrl":"https://cdn.example.test/v120avc","mimeType":"video/mp4","codecs":"avc1.640033","width":1920,"height":1080,"bandwidth":5400000},
+	    {"id":120,"baseUrl":"https://cdn.example.test/v120hevc","mimeType":"video/mp4","codecs":"hev1.1.6.L153.90","width":1920,"height":1080,"bandwidth":4000000},
+	    {"id":32,"baseUrl":"https://cdn.example.test/v32avc","mimeType":"video/mp4","codecs":"avc1.64001F","width":852,"height":480,"bandwidth":700000},
+	    {"id":32,"baseUrl":"https://cdn.example.test/v32hevc","mimeType":"video/mp4","codecs":"hev1.1.6.L120.90","width":852,"height":480,"bandwidth":600000},
+	    {"id":16,"baseUrl":"https://cdn.example.test/v16avc","mimeType":"video/mp4","codecs":"avc1.64001E","width":640,"height":360,"bandwidth":400000}
 	  ],"audio":[
-	    {"id":30280,"baseUrl":"a320","codecs":"mp4a.40.2","bandwidth":192000}
+	    {"id":30280,"baseUrl":"https://cdn.example.test/a320","mimeType":"audio/mp4","codecs":"mp4a.40.2","bandwidth":192000}
 	  ]}
 	}}`
+}
+
+func TestBilibiliPartsExposeSafeIndependentDASHStreams(t *testing.T) {
+	resetBiliCache()
+	defer resetBiliCache()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/pgc/player/web/playurl" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(biliPlayurlFixture()))
+	}))
+	defer srv.Close()
+
+	oldAPI := biliAPI
+	biliAPI = srv.URL
+	defer func() { biliAPI = oldAPI }()
+
+	const epID = 700002
+	biliCacheMu.Lock()
+	biliCache[fmt.Sprintf("epid:%d", epID)] = biliCacheItem{
+		val: biliEpisodeRef{SeasonID: 700, Cid: 701, Aid: 702, Duration: 1440000},
+		at:  time.Now(),
+	}
+	biliCacheMu.Unlock()
+
+	d := &BilibiliDriver{codec: "avc", client: srv.Client()}
+	path := fmt.Sprintf(
+		"/某番 [series 700]/第一季 [season 700]/第1话 [ep%d].mp4", epID)
+	parts, err := d.Parts(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Parts: %v", err)
+	}
+	if len(parts) != 2 {
+		t.Fatalf("parts = %#v, want video and audio", parts)
+	}
+	video, audio := parts[0], parts[1]
+	if video.Kind != "video" || video.URL != "https://cdn.example.test/v120avc" ||
+		video.MIME != "video/mp4" || video.Codec != "h264" ||
+		video.Profile != "High" || video.BitDepth != 8 || video.HDR ||
+		video.Duration != 1440 {
+		t.Fatalf("video part = %#v", video)
+	}
+	if audio.Kind != "audio" || audio.URL != "https://cdn.example.test/a320" ||
+		audio.MIME != "audio/mp4" || audio.Codec != "aac" ||
+		audio.Duration != 1440 {
+		t.Fatalf("audio part = %#v", audio)
+	}
+	for _, part := range parts {
+		if part.Headers["Referer"] != biliReferer {
+			t.Errorf("%s referer = %q", part.Kind, part.Headers["Referer"])
+		}
+		for _, unsafe := range []string{"Cookie", "Authorization", "Proxy-Authorization"} {
+			if _, ok := part.Headers[unsafe]; ok {
+				t.Errorf("%s leaked %s", part.Kind, unsafe)
+			}
+		}
+	}
+	video.Headers["Referer"] = "https://mutated.example/"
+	if audio.Headers["Referer"] != biliReferer {
+		t.Fatal("video and audio share one mutable header map")
+	}
+}
+
+func TestBilibiliPartBitDepthAndHDRMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		profile string
+		want    int
+	}{
+		{"High", 8},
+		{"High 10", 10},
+		{"Main 10", 10},
+		{"Main 12", 12},
+		{"", 0},
+	} {
+		if got := bitDepthOfProfile(tc.profile); got != tc.want {
+			t.Errorf("bitDepthOfProfile(%q) = %d, want %d",
+				tc.profile, got, tc.want)
+		}
+	}
+	if !(biliRep{ID: biliQNHDR}).isHDR() {
+		t.Error("HDR quality rung was not marked as HDR")
+	}
+	if !(biliRep{Codecs: "dvh1.05.06"}).isHDR() {
+		t.Error("Dolby Vision codec was not marked as HDR")
+	}
+	if (biliRep{Codecs: "avc1.640028"}).isHDR() {
+		t.Error("SDR AVC representation was marked as HDR")
+	}
 }
 
 func TestPickAudio(t *testing.T) {

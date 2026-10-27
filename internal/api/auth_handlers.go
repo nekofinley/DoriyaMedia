@@ -416,7 +416,12 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 		return
 	}
 	if s.Engine != nil {
-		s.Engine.SetBins(s.Cfg.FFmpeg, s.Cfg.FFProbe)
+		s.Engine.SetTools(
+			s.Cfg.FFmpeg,
+			s.Cfg.FFProbe,
+			s.Cfg.Playback.ProbeSizeMB,
+			s.Cfg.Playback.ProbeAnalyzeSec,
+		)
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }

@@ -185,15 +185,20 @@ func serveV1ProxyMedia(w http.ResponseWriter, r *http.Request, target string, he
 			writeV1ProxyError(w, r, http.StatusBadGateway, V1ErrorSourceUnavailable, v1ProxyBadUpstreamMsg)
 			return
 		}
-		total, ok := int64(0), false
+		var total int64
+		var ok bool
 		if len(contentRangeValues) == 1 {
 			total, ok = parseV1ProxyUnsatisfiedContentRange(contentRangeValues[0])
+			if !ok {
+				logV1ProxyUpstreamFailure(upstreamHost, resp.StatusCode)
+				writeV1ProxyError(w, r, http.StatusBadGateway, V1ErrorSourceUnavailable, v1ProxyBadUpstreamMsg)
+				return
+			}
+		} else if hasRange {
+			total, _, ok = probeSizeByRange(r.Context(), target, headers, client)
 		}
 		if !hasRange {
 			ok = false
-		}
-		if !ok && hasRange {
-			total, _, ok = probeSizeByRange(r.Context(), target, headers, client)
 		}
 		if !ok || wantRange.start < total {
 			logV1ProxyUpstreamFailure(upstreamHost, resp.StatusCode)
@@ -449,27 +454,14 @@ func safeV1ProxyContentType(raw string) string {
 }
 
 func v1ProxyContentLength(resp *http.Response) int64 {
-	if resp == nil {
+	length, ok := legacyProxyContentLength(resp)
+	if !ok {
 		return -1
 	}
-	values := resp.Header.Values("Content-Length")
-	if len(values) > 1 {
-		return -1
+	if length >= 0 {
+		return length
 	}
-	if len(values) == 1 {
-		n, err := strconv.ParseInt(strings.TrimSpace(values[0]), 10, 64)
-		if err != nil || n < 0 {
-			return -1
-		}
-		if resp.ContentLength > 0 && resp.ContentLength != n {
-			return -1
-		}
-		return n
-	}
-	if resp.ContentLength > 0 {
-		return resp.ContentLength
-	}
-	if resp.ContentLength == 0 {
+	if resp != nil && resp.ContentLength == 0 {
 		return 0
 	}
 	return -1
@@ -510,20 +502,7 @@ func proxyIfRangeMatchesResponse(ifRange string, resp *http.Response) bool {
 }
 
 func parseV1ProxyUnsatisfiedContentRange(value string) (int64, bool) {
-	value = strings.TrimSpace(value)
-	const prefix = "bytes */"
-	if !strings.HasPrefix(strings.ToLower(value), prefix) {
-		return 0, false
-	}
-	raw := strings.TrimSpace(value[len(prefix):])
-	if raw == "" {
-		return 0, false
-	}
-	total, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || total < 0 {
-		return 0, false
-	}
-	return total, true
+	return parseUnsatisfiedByteContentRange(value)
 }
 
 func logV1ProxyUpstreamFailure(host string, status int) {

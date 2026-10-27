@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DirectDASHStream",
+  "description": "One of the two independent direct-dash streams. The URL is HTTPS with no userinfo, headers use only the fixed safe whitelist, and range support is not claimed in the first revision.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "role",
+    "url",
+    "mime",
+    "headers",
+    "range"
+  ],
+  "properties": {
+    "role": {
+      "type": "string",
+      "enum": [
+        "video",
+        "audio"
+      ]
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "minLength": 9,
+      "maxLength": 4096,
+      "pattern": "^https://[^/@?#\\s]+(?:/[^?#\\s]*)?(?:\\?[^#\\s]*)?$"
+    },
+    "mime": {
+      "type": "string",
+      "enum": [
+        "video/mp4",
+        "audio/mp4"
+      ]
+    },
+    "headers": {
+      "$ref": "stream-headers.schema.json"
+    },
+    "range": {
+      "const": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "role": {
+            "const": "video"
+          }
+        },
+        "required": [
+          "role"
+        ]
+      },
+      "then": {
+        "properties": {
+          "mime": {
+            "const": "video/mp4"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "role": {
+            "const": "audio"
+          }
+        },
+        "required": [
+          "role"
+        ]
+      },
+      "then": {
+        "properties": {
+          "mime": {
+            "const": "audio/mp4"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+{
+  "ticket_id": "pt_example_direct_dash",
+  "state": "consuming",
+  "contract_version": 1,
+  "expires_at": "2026-10-26T12:05:00Z",
+  "transport": {
+    "kind": "direct-dash",
+    "streams": [
+      {
+        "role": "video",
+        "url": "https://video.example/dash/example-video.m4s",
+        "mime": "video/mp4",
+        "headers": {
+          "Referer": "https://www.example.com/watch/example",
+          "User-Agent": "DoriyaMedia/0.1"
+        },
+        "range": false
+      },
+      {
+        "role": "audio",
+        "url": "https://audio.example/dash/example-audio.m4s",
+        "mime": "audio/mp4",
+        "headers": {
+          "Referer": "https://www.example.com/watch/example",
+          "User-Agent": "DoriyaMedia/0.1"
+        },
+        "range": false
+      }
+    ]
+  },
+  "media": {
+    "container": "mp4",
+    "duration": 1440.0,
+    "video": {
+      "codec": "h264",
+      "width": 1920,
+      "height": 1080,
+      "bit_depth": 8
+    },
+    "audio": [
+      {
+        "codec": "aac",
+        "channels": 2
+      }
+    ]
+  },
+  "remaining_transports": [
+    "server-hls"
+  ]
+}

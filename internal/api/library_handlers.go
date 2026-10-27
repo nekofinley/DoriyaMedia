@@ -93,7 +93,7 @@ func (s *Server) handleCreateSource(w http.ResponseWriter, r *http.Request, user
 		fail(w, 400, "名称不能为空")
 		return
 	}
-	if req.Type != "local" && req.Type != "webdav" && req.Type != "openlist" && req.Type != "bilibili" {
+	if !source.SupportedSourceType(req.Type) {
 		fail(w, 400, "类型必须是 local/webdav/openlist/bilibili")
 		return
 	}
@@ -156,6 +156,9 @@ func (s *Server) handleUpdateSource(w http.ResponseWriter, r *http.Request, user
 	if err := s.Store.UpdateSource(src); err != nil {
 		fail(w, 500, err.Error())
 		return
+	}
+	if s.Engine != nil {
+		s.Engine.InvalidateSourceCaches(src.ID)
 	}
 	writeJSON(w, 200, toSourceDTO(*src))
 }

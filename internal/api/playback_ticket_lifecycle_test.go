@@ -161,6 +161,126 @@ func TestPlaybackStoreErrorMapsContextCancellation(t *testing.T) {
 	}
 }
 
+func TestPlaybackMediaSessionErrorMapsContextErrors(t *testing.T) {
+	const internalDetail = "database detail must not leak"
+	tests := []struct {
+		name   string
+		err    error
+		status int
+		code   V1ErrorCode
+		action string
+	}{
+		{
+			name:   "deadline",
+			err:    context.DeadlineExceeded,
+			status: http.StatusGatewayTimeout,
+			code:   V1ErrorInternal,
+			action: "retry",
+		},
+		{
+			name:   "canceled",
+			err:    context.Canceled,
+			status: http.StatusRequestTimeout,
+			code:   V1ErrorInvalidRequest,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			err := errors.Join(errors.New(internalDetail), tc.err)
+			writeV1PlaybackMediaSessionError(rec, err)
+
+			body := append([]byte(nil), rec.Body.Bytes()...)
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d; body %s",
+					rec.Code, tc.status, body)
+			}
+			var envelope v1ErrorEnvelope
+			if err := json.NewDecoder(bytes.NewReader(body)).Decode(&envelope); err != nil {
+				t.Fatalf("decode media session error: %v", err)
+			}
+			if envelope.Error.Code != tc.code {
+				t.Fatalf("error code = %q, want %q", envelope.Error.Code, tc.code)
+			}
+			if tc.action != "" && envelope.Error.Details["action"] != tc.action {
+				t.Fatalf("error action = %v, want %q",
+					envelope.Error.Details["action"], tc.action)
+			}
+			if bytes.Contains(body, []byte(internalDetail)) {
+				t.Fatalf("error body leaked the internal error: %s", body)
+			}
+		})
+	}
+}
+
+func TestPlaybackMediaStreamMapsAuthorizationRequestContext(t *testing.T) {
+	f := newPlaybackAPIFixture(t)
+	f.server.Cfg.Client = playbackLifecycleFeatures(
+		true, true, true, false, true, false,
+	)
+	capability := "ms_" + strings.Repeat("a", 43)
+	tests := []struct {
+		name       string
+		newContext func() (context.Context, context.CancelFunc)
+		status     int
+		code       V1ErrorCode
+		action     string
+	}{
+		{
+			name: "deadline",
+			newContext: func() (context.Context, context.CancelFunc) {
+				return context.WithDeadline(
+					context.Background(), time.Now().Add(-time.Second))
+			},
+			status: http.StatusGatewayTimeout,
+			code:   V1ErrorInternal,
+			action: "retry",
+		},
+		{
+			name: "canceled",
+			newContext: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, cancel
+			},
+			status: http.StatusRequestTimeout,
+			code:   V1ErrorInvalidRequest,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := tc.newContext()
+			req := httptest.NewRequest(
+				http.MethodGet,
+				"/api/v1/playback/media-sessions/"+capability+"/stream",
+				nil,
+			).WithContext(ctx)
+			req.SetPathValue("id", capability)
+			rec := httptest.NewRecorder()
+
+			f.server.handleV1PlaybackMediaStream(rec, req)
+			cancel()
+
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d; body %s",
+					rec.Code, tc.status, rec.Body.String())
+			}
+			var envelope v1ErrorEnvelope
+			if err := json.NewDecoder(rec.Body).Decode(&envelope); err != nil {
+				t.Fatalf("decode media stream error: %v", err)
+			}
+			if envelope.Error.Code != tc.code {
+				t.Fatalf("error code = %q, want %q; body %s",
+					envelope.Error.Code, tc.code, rec.Body.String())
+			}
+			if tc.action != "" && envelope.Error.Details["action"] != tc.action {
+				t.Fatalf("error action = %v, want %q",
+					envelope.Error.Details["action"], tc.action)
+			}
+		})
+	}
+}
+
 func playbackLifecycleCreateTicket(
 	t *testing.T,
 	f playbackAPIFixture,
@@ -175,15 +295,16 @@ func playbackLifecycleCreateTicket(
 		t.Fatalf("read playback fixture device: %v", err)
 	}
 	clientJSON, err := json.Marshal(media.NativeClientCapabilities{
-		Platform:        "windows",
-		Version:         "0.1.0",
-		Engine:          "mpv",
-		Containers:      []string{"mp4"},
-		VideoCodecs:     []string{"h264"},
-		AudioCodecs:     []string{"aac"},
-		SubtitleCodecs:  []string{"text"},
-		SupportsRange:   true,
-		SupportsHeaders: true,
+		Platform:          "windows",
+		Version:           "0.1.0",
+		Engine:            "mpv",
+		Containers:        []string{"mp4"},
+		VideoCodecs:       []string{"h264"},
+		AudioCodecs:       []string{"aac"},
+		SubtitleCodecs:    []string{"text"},
+		SupportsRange:     true,
+		SupportsHeaders:   true,
+		SupportsDASHMerge: true,
 	})
 	if err != nil {
 		t.Fatalf("marshal playback client capabilities: %v", err)
@@ -776,6 +897,248 @@ func TestPlaybackProbeFailureFinalizesWithoutRequestContext(t *testing.T) {
 	}
 }
 
+func TestPlaybackProbeRevocationDuringDiscoveryWritesNoMetadata(t *testing.T) {
+	f := newPlaybackAPIFixture(t)
+	f.server.Cfg.Client = playbackLifecycleFeatures(
+		true, true, true, false, true, true,
+	)
+	fileID := seedPlaybackAPIFile(
+		t, f.server.Store,
+		"https://cdn.example.test/library/late-probe.mp4",
+		playbackAPITestProbe,
+	)
+	ticket := playbackLifecycleCreateTicket(t, f, fileID)
+	file, err := f.server.Store.FileByID(fileID)
+	if err != nil {
+		t.Fatalf("load playback file: %v", err)
+	}
+	client, _, _, err := decodeStoredPlaybackCapabilities(ticket.ClientCapabilities)
+	if err != nil {
+		t.Fatalf("decode playback capabilities: %v", err)
+	}
+	var probe media.Probe
+	if err := jsonUnmarshal(playbackAPITestProbe, &probe); err != nil {
+		t.Fatalf("decode probe fixture: %v", err)
+	}
+	probe.Streams = append(probe.Streams, media.ProbeStream{
+		Index: 2, CodecType: "subtitle", CodecName: "subrip",
+	})
+	driver := &playbackLifecycleBlockingSubtitleDriver{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(driver.release) })
+	}
+	t.Cleanup(release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := f.server.finishV1PlaybackTicketWithProbe(
+			ctx,
+			playbackBinding(ticket),
+			ticket.Version,
+			file,
+			driver,
+			&probe,
+			client,
+			f.server.Cfg.Client,
+		)
+		result <- err
+	}()
+	select {
+	case <-driver.started:
+	case <-ctx.Done():
+		t.Fatal("probe finalization did not enter subtitle discovery")
+	}
+	if _, err := f.server.Store.RevokePlaybackTicket(
+		playbackBinding(ticket), ticket.Version, time.Now().UTC()); err != nil {
+		t.Fatalf("revoke probing ticket: %v", err)
+	}
+	release()
+	select {
+	case err := <-result:
+		if !errors.Is(err, db.ErrPlaybackTicketRevoked) {
+			t.Fatalf("late finalization error = %v, want revoked", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("probe finalization did not return after revocation")
+	}
+
+	var storedProbe string
+	if err := f.server.Store.DB.QueryRow(`SELECT probe FROM files WHERE id = ?`,
+		fileID).Scan(&storedProbe); err != nil {
+		t.Fatalf("read file probe: %v", err)
+	}
+	if storedProbe != playbackAPITestProbe {
+		t.Fatalf("revocation changed file probe: %q", storedProbe)
+	}
+	var subtitles int
+	if err := f.server.Store.DB.QueryRow(
+		`SELECT COUNT(*) FROM subtitles WHERE file_id = ?`, fileID,
+	).Scan(&subtitles); err != nil {
+		t.Fatalf("count subtitles: %v", err)
+	}
+	if subtitles != 0 {
+		t.Fatalf("revocation left %d late subtitle writes", subtitles)
+	}
+}
+
+func TestPlaybackProbeMetadataDiscoveryHonoursContextForNonCooperativeDriver(t *testing.T) {
+	f := newPlaybackAPIFixture(t)
+	f.server.Cfg.Client = playbackLifecycleFeatures(
+		true, true, true, false, true, true,
+	)
+	fileID := seedPlaybackAPIFile(
+		t, f.server.Store,
+		"https://cdn.example.test/library/timeout-probe.mp4",
+		playbackAPITestProbe,
+	)
+	ticket := playbackLifecycleCreateTicket(t, f, fileID)
+	file, err := f.server.Store.FileByID(fileID)
+	if err != nil {
+		t.Fatalf("load playback file: %v", err)
+	}
+	client, _, _, err := decodeStoredPlaybackCapabilities(ticket.ClientCapabilities)
+	if err != nil {
+		t.Fatalf("decode playback capabilities: %v", err)
+	}
+	probe := media.ProbeFromCache(file)
+	if probe == nil {
+		t.Fatal("playback fixture has no cached probe")
+	}
+	driver := &playbackLifecycleIgnoringSubtitleDriver{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	t.Cleanup(driver.close)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	started := time.Now()
+	go func() {
+		_, err := f.server.finishV1PlaybackTicketWithProbe(
+			ctx,
+			playbackBinding(ticket),
+			ticket.Version,
+			file,
+			driver,
+			probe,
+			client,
+			f.server.Cfg.Client,
+		)
+		result <- err
+	}()
+	select {
+	case <-driver.started:
+	case <-time.After(time.Second):
+		t.Fatal("probe metadata discovery did not enter the blocking driver")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("metadata discovery error = %v, want deadline", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("metadata discovery remained blocked by a context-ignoring driver")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("metadata discovery took %v, want <= 1s", elapsed)
+	}
+	var storedProbe string
+	if err := f.server.Store.DB.QueryRow(`SELECT probe FROM files WHERE id = ?`,
+		fileID).Scan(&storedProbe); err != nil {
+		t.Fatalf("read file probe: %v", err)
+	}
+	if storedProbe != playbackAPITestProbe {
+		t.Fatalf("timed-out discovery changed file probe: %q", storedProbe)
+	}
+	var subtitles int
+	if err := f.server.Store.DB.QueryRow(
+		`SELECT COUNT(*) FROM subtitles WHERE file_id = ?`, fileID,
+	).Scan(&subtitles); err != nil {
+		t.Fatalf("count subtitles: %v", err)
+	}
+	if subtitles != 0 {
+		t.Fatalf("timed-out discovery left %d subtitle writes", subtitles)
+	}
+}
+
+func TestPlaybackAudioOnlyProbeFinalizesUnsupported(t *testing.T) {
+	f := newPlaybackAPIFixture(t)
+	f.server.Cfg.Client = playbackLifecycleFeatures(
+		true, true, true, true, true, true,
+	)
+	fileID := seedPlaybackAPIFile(
+		t, f.server.Store,
+		"https://cdn.example.test/library/audio-only.m4a",
+		"",
+	)
+	var transientCalls atomic.Int32
+	usePlaybackTestProbeRunner(t, &playbackTestProbeRunner{
+		probeFor: func(
+			context.Context,
+			*models.MediaFile,
+			source.Driver,
+		) (*media.Probe, error) {
+			return nil, nil
+		},
+		probeTransient: func(
+			context.Context,
+			*models.MediaFile,
+			source.Driver,
+		) (*media.Probe, error) {
+			transientCalls.Add(1)
+			return &media.Probe{Streams: []media.ProbeStream{{
+				Index: 0, CodecType: "audio", CodecName: "aac", Channels: 2,
+			}}}, errors.New("未识别到视频流(可能是音频或图片文件)")
+		},
+	})
+
+	create := f.call(t, http.MethodPost, "/api/v1/playback/tickets",
+		playbackCreateBody(fileID, f.deviceID, models.PlaybackTransportServerProxy))
+	if create.Status != http.StatusAccepted ||
+		create.JSON["state"] != models.PlaybackTicketProbing {
+		t.Fatalf("audio-only create = %d state %v; body %s",
+			create.Status, create.JSON["state"], create.Body)
+	}
+	ticketID := v1StringField(t, create.JSON, "ticket_id")
+
+	deadline := time.Now().Add(2 * time.Second)
+	var state, failureCode string
+	for {
+		if err := f.server.Store.DB.QueryRow(`
+			SELECT state, failure_code FROM playback_tickets
+			WHERE ticket_id = ?`, ticketID).Scan(&state, &failureCode); err != nil {
+			t.Fatalf("read audio-only ticket: %v", err)
+		}
+		if state != models.PlaybackTicketProbing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("audio-only ticket remained state %q", state)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if state != models.PlaybackTicketUnsupported ||
+		failureCode != "unsupported_media" {
+		t.Fatalf("audio-only ticket = state %q code %q", state, failureCode)
+	}
+	if got := transientCalls.Load(); got != 1 {
+		t.Fatalf("ProbeTransient calls = %d, want 1", got)
+	}
+	status := f.call(t, http.MethodGet,
+		"/api/v1/playback/tickets/"+ticketID, nil)
+	if status.Status != http.StatusOK ||
+		status.JSON["failure_code"] != "unsupported_media" {
+		t.Fatalf("audio-only status = %d failure_code %v; body %s",
+			status.Status, status.JSON["failure_code"], status.Body)
+	}
+}
+
 func TestPlaybackCreateFinalizationFailureUsesOriginalVersion(t *testing.T) {
 	f := newPlaybackAPIFixture(t)
 	fileID := seedPlaybackAPIFile(
@@ -812,11 +1175,10 @@ func TestPlaybackCreateFinalizationFailureUsesOriginalVersion(t *testing.T) {
 		client,
 		f.server.Cfg.Client,
 	)
-	if err != nil {
-		t.Fatalf("finalize failed create ticket: %v", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("finalize canceled create ticket error = %v, want canceled", err)
 	}
-	if failed == nil || failed.State != models.PlaybackTicketFailed ||
-		failed.FailureCode != "source_unavailable" {
+	if failed != nil {
 		t.Fatalf("failed create finalization = %+v", failed)
 	}
 	persisted, err := f.server.Store.PlaybackTicketByID(
@@ -825,8 +1187,12 @@ func TestPlaybackCreateFinalizationFailureUsesOriginalVersion(t *testing.T) {
 		t.Fatalf("load failed create finalization: %v", err)
 	}
 	if persisted.State != models.PlaybackTicketFailed ||
-		persisted.FailureCode != "source_unavailable" {
+		persisted.FailureCode != playbackFailureFinalizeFailed {
 		t.Fatalf("persisted failed create finalization = %+v", persisted)
+	}
+	if code := playbackPublicFailureCode(persisted); code != playbackFailureFinalizeFailed {
+		t.Fatalf("public failure code = %q, want %q",
+			code, playbackFailureFinalizeFailed)
 	}
 }
 
@@ -1111,6 +1477,161 @@ func TestPlaybackTicketLifecycleActiveClaimRejectsConcurrentRefresh(t *testing.T
 	}
 }
 
+type playbackLifecycleBlockingSubtitleDriver struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+type playbackLifecycleIgnoringSubtitleDriver struct {
+	started     chan struct{}
+	release     chan struct{}
+	startOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+func (d *playbackLifecycleIgnoringSubtitleDriver) close() {
+	d.releaseOnce.Do(func() { close(d.release) })
+}
+
+func (d *playbackLifecycleIgnoringSubtitleDriver) List(
+	context.Context,
+	string,
+) ([]source.Entry, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (d *playbackLifecycleIgnoringSubtitleDriver) DirectURL(
+	context.Context,
+	string,
+) (string, map[string]string, error) {
+	return "", nil, source.ErrNoDirect
+}
+
+func (d *playbackLifecycleIgnoringSubtitleDriver) Open(
+	context.Context,
+	string,
+) (io.ReadCloser, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (d *playbackLifecycleIgnoringSubtitleDriver) ProbeURL(
+	context.Context,
+	string,
+) (string, map[string]string, error) {
+	return "", nil, source.ErrNoDirect
+}
+
+func (d *playbackLifecycleIgnoringSubtitleDriver) HasDirect() bool { return false }
+
+func (d *playbackLifecycleIgnoringSubtitleDriver) Subtitles(
+	context.Context,
+	string,
+) ([]source.SubtitleTrack, error) {
+	d.startOnce.Do(func() { close(d.started) })
+	<-d.release
+	return nil, nil
+}
+
+func (d *playbackLifecycleIgnoringSubtitleDriver) OpenSubtitle(
+	context.Context,
+	string,
+	string,
+) (io.ReadCloser, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (d *playbackLifecycleIgnoringSubtitleDriver) SubtitlePathPrefix() string {
+	return "driver:"
+}
+
+func (d *playbackLifecycleBlockingSubtitleDriver) List(
+	context.Context,
+	string,
+) ([]source.Entry, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (d *playbackLifecycleBlockingSubtitleDriver) DirectURL(
+	context.Context,
+	string,
+) (string, map[string]string, error) {
+	return "", nil, source.ErrNoDirect
+}
+
+func (d *playbackLifecycleBlockingSubtitleDriver) Open(
+	context.Context,
+	string,
+) (io.ReadCloser, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (d *playbackLifecycleBlockingSubtitleDriver) ProbeURL(
+	context.Context,
+	string,
+) (string, map[string]string, error) {
+	return "", nil, source.ErrNoDirect
+}
+
+func (d *playbackLifecycleBlockingSubtitleDriver) HasDirect() bool { return false }
+
+func (d *playbackLifecycleBlockingSubtitleDriver) Subtitles(
+	ctx context.Context,
+	_ string,
+) ([]source.SubtitleTrack, error) {
+	d.once.Do(func() { close(d.started) })
+	select {
+	case <-d.release:
+		return nil, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (d *playbackLifecycleBlockingSubtitleDriver) OpenSubtitle(
+	context.Context,
+	string,
+	string,
+) (io.ReadCloser, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (d *playbackLifecycleBlockingSubtitleDriver) SubtitlePathPrefix() string {
+	return "driver:"
+}
+
+type playbackLifecycleDASHDriver struct {
+	parts []source.Part
+	err   error
+	calls atomic.Int32
+}
+
+func (d *playbackLifecycleDASHDriver) List(context.Context, string) ([]source.Entry, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (d *playbackLifecycleDASHDriver) DirectURL(context.Context, string) (string, map[string]string, error) {
+	return "", nil, errors.New("direct-dash must use Parts, not DirectURL")
+}
+
+func (d *playbackLifecycleDASHDriver) Parts(context.Context, string) ([]source.Part, error) {
+	d.calls.Add(1)
+	if d.err != nil {
+		return nil, d.err
+	}
+	return d.parts, nil
+}
+
+func (d *playbackLifecycleDASHDriver) Open(context.Context, string) (io.ReadCloser, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (d *playbackLifecycleDASHDriver) ProbeURL(context.Context, string) (string, map[string]string, error) {
+	return "", nil, errors.New("not implemented")
+}
+
+func (d *playbackLifecycleDASHDriver) HasDirect() bool { return false }
+
 type playbackLifecycleFailedDirectDriver struct{}
 
 func (playbackLifecycleFailedDirectDriver) List(context.Context, string) ([]source.Entry, error) {
@@ -1215,6 +1736,175 @@ func TestPlaybackTicketLifecycleDirectIssuanceFallsBackAtomically(t *testing.T) 
 		len(issued.AttemptedTransports) != 2 ||
 		issued.AttemptedTransports[0] != models.PlaybackTransportDirectHTTP ||
 		issued.AttemptedTransports[1] != models.PlaybackTransportServerProxy {
+		t.Fatalf("issued ticket = %#v", issued)
+	}
+}
+
+func playbackLifecycleDASHParts() []source.Part {
+	return []source.Part{
+		{
+			URL: "https://video.example.test/video.m4s?token=video-secret",
+			Headers: map[string]string{
+				"Referer": "https://www.bilibili.com/",
+			},
+			MIME: "video/mp4", Kind: "video", Codec: "h264",
+			Tag: "avc1", Profile: "High", Width: 1920, Height: 1080,
+			Duration: 120,
+		},
+		{
+			URL: "https://audio.example.test/audio.m4s?token=audio-secret",
+			Headers: map[string]string{
+				"Referer": "https://www.bilibili.com/",
+			},
+			MIME: "audio/mp4", Kind: "audio", Codec: "aac",
+			Tag: "mp4a", Channels: 2, Duration: 120,
+		},
+	}
+}
+
+func TestPlaybackTicketLifecycleDirectDASHEmitsTwoStreams(t *testing.T) {
+	f := newPlaybackAPIFixture(t)
+	f.server.Cfg.Client = playbackLifecycleFeatures(
+		true, true, true, false, false, true,
+	)
+	f.server.Cfg.Client.DirectDASHEnabled = true
+	fileID := seedPlaybackAPIFile(
+		t,
+		f.server.Store,
+		"https://cdn.example.test/library/video.mp4",
+		playbackAPITestProbe,
+	)
+	ready := playbackLifecycleCreateReadyTicket(
+		t, f, fileID,
+		models.PlaybackTransportDirectDASH,
+		models.PlaybackTransportServerHLS,
+	)
+	file, err := f.server.Store.FileByID(fileID)
+	if err != nil {
+		t.Fatalf("load playback file: %v", err)
+	}
+	driver := &playbackLifecycleDASHDriver{parts: playbackLifecycleDASHParts()}
+	selection := media.NativeTransportSelection{
+		Candidates: []media.NativeTransportCandidate{
+			{Kind: media.NativeTransportDirectDASH},
+			{Kind: media.NativeTransportServerHLS},
+		},
+	}
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/playback/tickets/"+ready.TicketID+"/refresh",
+		nil,
+	)
+	issued, transport, err := f.server.claimV1PlaybackTransport(
+		req, playbackBinding(ready), ready, file, driver, selection)
+	if err != nil {
+		t.Fatalf("claim direct-dash: %v", err)
+	}
+	if issued == nil ||
+		issued.SelectedTransport != models.PlaybackTransportDirectDASH {
+		t.Fatalf("issued ticket = %#v", issued)
+	}
+	if transport == nil ||
+		transport.Kind != models.PlaybackTransportDirectDASH ||
+		transport.MediaSession != nil {
+		t.Fatalf("transport = %#v", transport)
+	}
+	encodedTransport, err := json.Marshal(transport)
+	if err != nil {
+		t.Fatalf("marshal direct-dash transport: %v", err)
+	}
+	if bytes.Contains(encodedTransport, []byte(`"media_session"`)) {
+		t.Fatalf("direct-dash transport exposed a media session: %s", encodedTransport)
+	}
+	if len(transport.Streams) != 2 {
+		t.Fatalf("streams = %#v, want video and audio", transport.Streams)
+	}
+	video, audio := transport.Streams[0], transport.Streams[1]
+	if video.Role != "video" || video.MIME != "video/mp4" ||
+		video.Headers.Referer != "https://www.bilibili.com/" || video.Range {
+		t.Fatalf("video stream = %#v", video)
+	}
+	if audio.Role != "audio" || audio.MIME != "audio/mp4" ||
+		audio.Headers.Referer != "https://www.bilibili.com/" || audio.Range {
+		t.Fatalf("audio stream = %#v", audio)
+	}
+	if driver.calls.Load() == 0 {
+		t.Fatal("direct-dash issuance did not resolve multi-part source")
+	}
+	var mediaSessions int
+	if err := f.server.Store.DB.QueryRow(
+		`SELECT COUNT(*) FROM playback_media_sessions WHERE ticket_id = ?`,
+		ready.TicketID,
+	).Scan(&mediaSessions); err != nil {
+		t.Fatalf("count direct-dash media sessions: %v", err)
+	}
+	if mediaSessions != 0 {
+		t.Fatalf("direct-dash created %d media sessions, want none", mediaSessions)
+	}
+	statusJSON, err := json.Marshal(f.server.v1PlaybackTicketStatus(
+		issued, f.server.Cfg.Client))
+	if err != nil {
+		t.Fatalf("marshal direct-dash ticket status: %v", err)
+	}
+	for _, secret := range []string{
+		"video-secret", "audio-secret", "video.example.test", "audio.example.test",
+	} {
+		if bytes.Contains(statusJSON, []byte(secret)) {
+			t.Fatalf("direct-dash ticket status leaked %q: %s", secret, statusJSON)
+		}
+	}
+}
+
+func TestPlaybackTicketLifecycleDirectDASHFallsBackToHLSAtomically(t *testing.T) {
+	f := newPlaybackAPIFixture(t)
+	f.server.Cfg.Client = playbackLifecycleFeatures(
+		true, true, true, false, false, true,
+	)
+	f.server.Cfg.Client.DirectDASHEnabled = true
+	fileID := seedPlaybackAPIFile(
+		t,
+		f.server.Store,
+		"https://cdn.example.test/library/video.mp4",
+		playbackAPITestProbe,
+	)
+	ready := playbackLifecycleCreateReadyTicket(
+		t, f, fileID,
+		models.PlaybackTransportDirectDASH,
+		models.PlaybackTransportServerHLS,
+	)
+	file, err := f.server.Store.FileByID(fileID)
+	if err != nil {
+		t.Fatalf("load playback file: %v", err)
+	}
+	parts := playbackLifecycleDASHParts()
+	parts[1].URL = "http://audio.example.test/audio.m4s"
+	driver := &playbackLifecycleDASHDriver{parts: parts}
+	selection := media.NativeTransportSelection{
+		Candidates: []media.NativeTransportCandidate{
+			{Kind: media.NativeTransportDirectDASH},
+			{Kind: media.NativeTransportServerHLS},
+		},
+	}
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/playback/tickets/"+ready.TicketID+"/refresh",
+		nil,
+	)
+	issued, transport, err := f.server.claimV1PlaybackTransport(
+		req, playbackBinding(ready), ready, file, driver, selection)
+	if err != nil {
+		t.Fatalf("claim direct-dash fallback: %v", err)
+	}
+	if transport == nil ||
+		transport.Kind != models.PlaybackTransportServerHLS ||
+		transport.MediaSession == nil {
+		t.Fatalf("transport = %#v, want server-hls fallback", transport)
+	}
+	if issued == nil ||
+		issued.SelectedTransport != models.PlaybackTransportServerHLS ||
+		len(issued.AttemptedTransports) != 2 ||
+		issued.AttemptedTransports[0] != models.PlaybackTransportDirectDASH ||
+		issued.AttemptedTransports[1] != models.PlaybackTransportServerHLS {
 		t.Fatalf("issued ticket = %#v", issued)
 	}
 }

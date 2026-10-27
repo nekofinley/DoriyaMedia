@@ -54,6 +54,7 @@ type PartialLister interface {
 type Part struct {
 	URL     string            `json:"url"`
 	Headers map[string]string `json:"-"`
+	MIME    string            `json:"mime"`
 	Kind    string            `json:"kind"` // "video" | "audio"
 	// Codec is the ffprobe codec name (h264, hevc, av1, aac…), Tag the
 	// codec_tag_string (hvc1 / hev1 / avc1) and Profile the H.264 profile — the
@@ -61,6 +62,8 @@ type Part struct {
 	Codec    string `json:"codec"`
 	Tag      string `json:"tag,omitempty"`
 	Profile  string `json:"profile,omitempty"`
+	BitDepth int    `json:"bit_depth,omitempty"`
+	HDR      bool   `json:"hdr,omitempty"`
 	Width    int    `json:"width,omitempty"`
 	Height   int    `json:"height,omitempty"`
 	Channels int    `json:"channels,omitempty"`
@@ -77,6 +80,14 @@ type Part struct {
 // direct link.
 type MultiPart interface {
 	Parts(ctx context.Context, path string) ([]Part, error)
+}
+
+// BypassPartsCache is an optional, test-build-only seam. Production drivers
+// must not implement it; the playbacke2e fixture uses it to exercise the
+// claim-time direct-dash fallback without the normal per-file parts cache
+// hiding the fixture's second answer.
+type BypassPartsCache interface {
+	BypassPartsCache() bool
 }
 
 // Quality is one picture rung a source can serve during playback: an id the
@@ -250,6 +261,9 @@ func NewDriver(src *models.Source) (Driver, error) {
 			return nil, fmt.Errorf("source %d config: %w", src.ID, err)
 		}
 	}
+	if drv, handled, err := newPlaybackE2EDriver(src, cfg); handled {
+		return drv, err
+	}
 	switch src.Type {
 	case "local":
 		return NewLocal(cfg.Root), nil
@@ -263,6 +277,17 @@ func NewDriver(src *models.Source) (Driver, error) {
 		return &URLDriver{}, nil
 	default:
 		return nil, fmt.Errorf("unknown source type %q", src.Type)
+	}
+}
+
+// SupportedSourceType reports whether the admin source form may create this
+// driver type. The playbacke2e extension is compiled only into E2E binaries.
+func SupportedSourceType(sourceType string) bool {
+	switch sourceType {
+	case "local", "webdav", "openlist", "bilibili":
+		return true
+	default:
+		return playbackE2ESourceTypeSupported(sourceType)
 	}
 }
 

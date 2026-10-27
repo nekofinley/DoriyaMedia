@@ -21,43 +21,233 @@ func (f legacyProxyRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, er
 
 func TestParseRequestRange(t *testing.T) {
 	cases := []struct {
+		name  string
 		in    string
 		start int64
 		end   int64
 		ok    bool
 	}{
-		{"bytes=100-199", 100, 199, true},
-		{"bytes=100-", 100, -1, true},
-		{"bytes=0-0", 0, 0, true},
-		{"Bytes=5-10", 5, 10, true},
-		{"bytes=100-199,300-399", 0, 0, false}, // multipart: not worth handling
-		{"bytes=-500", 0, 0, false},            // suffix range
-		{"bytes=", 0, 0, false},
-		{"items=0-10", 0, 0, false},
-		{"bytes=abc-def", 0, 0, false},
-		{"bytes=200-100", 0, 0, false},
-		{"", 0, 0, false},
+		{name: "closed", in: "bytes=100-199", start: 100, end: 199, ok: true},
+		{name: "open ended", in: "bytes=100-", start: 100, end: -1, ok: true},
+		{name: "zero", in: "bytes=0-0", start: 0, end: 0, ok: true},
+		{name: "case insensitive unit", in: "Bytes=5-10", start: 5, end: 10, ok: true},
+		{name: "leading zeros", in: "bytes=0005-0010", start: 5, end: 10, ok: true},
+		{name: "outer OWS", in: " \tbytes=5-10\t ", start: 5, end: 10, ok: true},
+		{name: "multipart", in: "bytes=100-199,300-399", ok: false},
+		{name: "suffix", in: "bytes=-500", ok: false},
+		{name: "empty spec", in: "bytes=", ok: false},
+		{name: "wrong unit", in: "items=0-10", ok: false},
+		{name: "nonnumeric", in: "bytes=abc-def", ok: false},
+		{name: "descending", in: "bytes=200-100", ok: false},
+		{name: "signed start", in: "bytes=+100-199", ok: false},
+		{name: "signed end", in: "bytes=100-+199", ok: false},
+		{name: "space after equals", in: "bytes= 100-199", ok: false},
+		{name: "space before dash", in: "bytes=100 -199", ok: false},
+		{name: "space after dash", in: "bytes=100- 199", ok: false},
+		{name: "tab before dash", in: "bytes=100\t-199", ok: false},
+		{name: "space around unit separator", in: "bytes =100-199", ok: false},
+		{name: "unicode digits", in: "bytes=\u0661\u0662-1", ok: false},
+		{name: "overflow", in: "bytes=9223372036854775808-9223372036854775809", ok: false},
+		{name: "non OWS trailing control", in: "bytes=100-199\v", ok: false},
+		{name: "empty", in: "", ok: false},
 	}
 	for _, c := range cases {
-		got, ok := parseRequestRange(c.in)
-		if ok != c.ok || (ok && (got.start != c.start || got.end != c.end)) {
-			t.Errorf("parseRequestRange(%q) = (%+v,%v), want (%d,%d,%v)", c.in, got, ok, c.start, c.end, c.ok)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := parseRequestRange(c.in)
+			if ok != c.ok || (ok && (got.start != c.start || got.end != c.end)) {
+				t.Errorf("parseRequestRange(%q) = (%+v,%v), want (%d,%d,%v)",
+					c.in, got, ok, c.start, c.end, c.ok)
+			}
+		})
+	}
+}
+
+func TestParseLegacyRequestRange(t *testing.T) {
+	cases := []struct {
+		name     string
+		values   []string
+		want     legacyRangeRequest
+		hadRange bool
+		ok       bool
+	}{
+		{name: "absent", hadRange: false, ok: true},
+		{
+			name:     "forward",
+			values:   []string{"bytes=5-10"},
+			want:     legacyRangeRequest{start: 5, end: 10},
+			hadRange: true,
+			ok:       true,
+		},
+		{
+			name:     "suffix with outer OWS",
+			values:   []string{" \tbytes=-0100\t "},
+			want:     legacyRangeRequest{suffix: 100},
+			hadRange: true,
+			ok:       true,
+		},
+		{
+			name:     "signed suffix",
+			values:   []string{"bytes=-+100"},
+			hadRange: true,
+			ok:       false,
+		},
+		{
+			name:     "suffix whitespace",
+			values:   []string{"bytes=- 100"},
+			hadRange: true,
+			ok:       false,
+		},
+		{
+			name:     "forward signed start",
+			values:   []string{"bytes=+5-10"},
+			hadRange: true,
+			ok:       false,
+		},
+		{
+			name:     "repeated",
+			values:   []string{"bytes=5-10", "bytes=20-30"},
+			hadRange: true,
+			ok:       false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, hadRange, ok := parseLegacyRequestRange(tc.values)
+			if got != tc.want || hadRange != tc.hadRange || ok != tc.ok {
+				t.Errorf("parseLegacyRequestRange(%q) = (%+v,%v,%v), want (%+v,%v,%v)",
+					tc.values, got, hadRange, ok, tc.want, tc.hadRange, tc.ok)
+			}
+		})
 	}
 }
 
 func TestParseContentRange(t *testing.T) {
-	start, end, total, ok := parseContentRange("bytes 0-99/4122738")
-	if !ok || start != 0 || end != 99 || total != 4122738 {
-		t.Fatalf("got (%d,%d,%d,%v)", start, end, total, ok)
+	cases := []struct {
+		name  string
+		in    string
+		start int64
+		end   int64
+		total int64
+		ok    bool
+	}{
+		{
+			name: "canonical", in: "bytes 0-99/4122738",
+			start: 0, end: 99, total: 4122738, ok: true,
+		},
+		{
+			name: "unknown total", in: "bytes 100-199/*",
+			start: 100, end: 199, total: -1, ok: true,
+		},
+		{
+			name: "case insensitive unit", in: "BYTES 0-99/100",
+			start: 0, end: 99, total: 100, ok: true,
+		},
+		{
+			name: "outer OWS", in: " \tbytes 0-99/100\t ",
+			start: 0, end: 99, total: 100, ok: true,
+		},
+		{
+			name: "leading zeros", in: "bytes 000-099/000100",
+			start: 0, end: 99, total: 100, ok: true,
+		},
+		{name: "empty", in: "", ok: false},
+		{name: "empty spec", in: "bytes ", ok: false},
+		{name: "missing end", in: "bytes 1-", ok: false},
+		{name: "nonnumeric", in: "bytes a-b/10", ok: false},
+		{name: "descending", in: "bytes 5-4/10", ok: false},
+		{name: "wrong unit", in: "0-99/4122738", ok: false},
+		{name: "missing slash", in: "bytes 0-99", ok: false},
+		{name: "signed start", in: "bytes +0-99/100", ok: false},
+		{name: "signed end", in: "bytes 0-+99/100", ok: false},
+		{name: "signed total", in: "bytes 0-99/+100", ok: false},
+		{name: "space before dash", in: "bytes 0 -99/100", ok: false},
+		{name: "space after dash", in: "bytes 0- 99/100", ok: false},
+		{name: "space before slash", in: "bytes 0-99 /100", ok: false},
+		{name: "space after slash", in: "bytes 0-99/ 100", ok: false},
+		{name: "extra space after unit", in: "bytes  0-99/100", ok: false},
+		{name: "tab after unit", in: "bytes\t0-99/100", ok: false},
+		{name: "unicode digits", in: "bytes \u0660-\u0669/100", ok: false},
+		{name: "overflow total", in: "bytes 0-99/9223372036854775808", ok: false},
+		{name: "non OWS trailing control", in: "bytes 0-99/100\v", ok: false},
 	}
-	if _, _, total, ok := parseContentRange("bytes 100-199/*"); !ok || total != -1 {
-		t.Errorf("an unknown total must parse as -1, got %d ok=%v", total, ok)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			start, end, total, ok := parseContentRange(tc.in)
+			if ok != tc.ok || (ok &&
+				(start != tc.start || end != tc.end || total != tc.total)) {
+				t.Errorf("parseContentRange(%q) = (%d,%d,%d,%v), want (%d,%d,%d,%v)",
+					tc.in, start, end, total, ok, tc.start, tc.end, tc.total, tc.ok)
+			}
+		})
 	}
-	for _, bad := range []string{"", "bytes ", "bytes 1-", "bytes a-b/10", "bytes 5-4/10", "0-99/4122738", "bytes 0-99"} {
-		if _, _, _, ok := parseContentRange(bad); ok {
-			t.Errorf("parseContentRange(%q) should have failed", bad)
-		}
+}
+
+func TestParseUnsatisfiedByteContentRange(t *testing.T) {
+	cases := []struct {
+		name  string
+		in    string
+		total int64
+		ok    bool
+	}{
+		{name: "canonical", in: "bytes */100", total: 100, ok: true},
+		{name: "case insensitive unit", in: "BYTES */100", total: 100, ok: true},
+		{name: "outer OWS", in: " \tbytes */100\t ", total: 100, ok: true},
+		{name: "leading zeros", in: "bytes */000100", total: 100, ok: true},
+		{name: "signed", in: "bytes */+100", ok: false},
+		{name: "space after slash", in: "bytes */ 100", ok: false},
+		{name: "extra space after unit", in: "bytes  */100", ok: false},
+		{name: "tab after unit", in: "bytes\t*/100", ok: false},
+		{name: "range response", in: "bytes 0-99/100", ok: false},
+		{name: "unknown total", in: "bytes */*", ok: false},
+		{name: "unicode digits", in: "bytes */\u0661\u0660\u0660", ok: false},
+		{name: "overflow", in: "bytes */9223372036854775808", ok: false},
+		{name: "empty", in: "", ok: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			total, ok := parseUnsatisfiedByteContentRange(tc.in)
+			if ok != tc.ok || (ok && total != tc.total) {
+				t.Errorf("parseUnsatisfiedByteContentRange(%q) = (%d,%v), want (%d,%v)",
+					tc.in, total, ok, tc.total, tc.ok)
+			}
+		})
+	}
+}
+
+func TestProxyContentLengthRequiresASCIIDigits(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  int64
+		ok    bool
+	}{
+		{name: "decimal", value: "4", want: 4, ok: true},
+		{name: "zero", value: "0", want: 0, ok: true},
+		{name: "leading zeros", value: "0004", want: 4, ok: true},
+		{name: "outer OWS", value: " \t4\t ", want: 4, ok: true},
+		{name: "positive sign", value: "+4", want: -1},
+		{name: "negative zero", value: "-0", want: -1},
+		{name: "negative", value: "-4", want: -1},
+		{name: "nonnumeric", value: "4x", want: -1},
+		{name: "empty", value: "", want: -1},
+		{name: "overflow", value: "9223372036854775808", want: -1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{
+				Header:        http.Header{"Content-Length": {tc.value}},
+				ContentLength: -1,
+			}
+			legacyLength, legacyOK := legacyProxyContentLength(resp)
+			if legacyLength != tc.want || legacyOK != tc.ok {
+				t.Errorf("legacyProxyContentLength(%q) = (%d,%v), want (%d,%v)",
+					tc.value, legacyLength, legacyOK, tc.want, tc.ok)
+			}
+			if v1Length := v1ProxyContentLength(resp); v1Length != tc.want {
+				t.Errorf("v1ProxyContentLength(%q) = %d, want %d",
+					tc.value, v1Length, tc.want)
+			}
+		})
 	}
 }
 

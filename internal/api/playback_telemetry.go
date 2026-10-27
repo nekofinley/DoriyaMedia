@@ -331,7 +331,7 @@ func safePlaybackTelemetryAsset(value string) string {
 
 func safePlaybackTelemetryTransport(value string) string {
 	switch value {
-	case "direct-http", "server-proxy", "server-hls", "legacy-stream":
+	case "direct-http", "direct-dash", "server-proxy", "server-hls", "legacy-stream":
 		return value
 	default:
 		return "unknown"

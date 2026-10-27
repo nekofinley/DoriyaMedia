@@ -7,9 +7,11 @@ This directory is the source of truth for DoriyaMedia Android and Windows client
 - S1 publishes `GET /api/v1/meta` and the shared stable error envelope.
 - S2 publishes and implements the OAuth-like device authorization, PKCE S256, rotating token, refresh-family revocation, CSRF/same-origin approval protection, email-verification gate, and device-management contract.
 - S3 publishes and implements the playback ticket, server-proxy, server-HLS, and independent subtitle-authorization contracts.
-- S3 supports exactly `direct-http`, `server-proxy`, and `server-hls`.
-- `direct-dash` and `local-relay` are outside S3. They have no transport schema or golden fixture in this revision.
-- S3.5 keeps contract version `1` and is additive. OpenAPI document revision `1.4.0` adds subtitle descriptions and their capability routes; clients that do not consume `transport.subtitles` remain compatible.
+- The S3 baseline transports are `direct-http`, `server-proxy`, and `server-hls`.
+- S5 adds `direct-dash` as a default-disabled, capability-gated additive transport under contract version `1`. It is issued only when the server flag, device policy, multipart source eligibility, and `client.supports_dash_merge=true` all agree.
+- The S5 server contract and default-off implementation are landed, but real Bilibili dual-stream playback, client-side merge, and the Windows/Android device/network matrices are not yet verified; S5 acceptance remains open.
+- `local-relay` is not implemented and remains outside this contract revision; `local_relay_enabled` is discovery-only.
+- S3.5 and S5 keep contract version `1` and are additive. OpenAPI document revision `1.5.0` adds the direct-dash schemas and fixture and records the optional `supports_dash_merge` client capability; clients that omit it remain compatible and cannot receive direct-dash.
 - Server-HLS does not expose a query-driven master playlist in this revision. It publishes a WebVTT rendition URL under the same `ms_` path, and every rendition request reauthorizes both that media session and an independent `ss_` subtitle session.
 - Existing `/api` routes and Web UI behavior are not part of this contract.
 
@@ -19,11 +21,11 @@ The values below are the contract fixture baseline. A server reports its actual 
 
 | Contract version | Windows minimum | Android minimum | Status |
 | --- | --- | --- | --- |
-| 1 | 0.1.0 | 0.1.0 | S1/S2 implemented; S3 playback plus S3.5 subtitle authorization implemented |
+| 1 | 0.1.0 | 0.1.0 | S1/S2 implemented; S3 playback and S3.5 subtitle authorization implemented; S5 direct-dash server contract implemented default-off, with client/device acceptance still open |
 
 ## Files
 
-- `openapi.yaml`: OpenAPI 3.1 description of S1, S2, and the S3 playback endpoints.
+- `openapi.yaml`: OpenAPI 3.1 description of S1, S2, the S3 playback endpoints, the S3.5 subtitle chain, and the additive S5 direct-dash schemas.
 - `schemas/meta.schema.json`: Exact `/api/v1/meta` response body.
 - `schemas/error.schema.json`: Stable error envelope and closed error-code enum.
 - `schemas/device-*.schema.json`: Device authorization requests, responses, states, and metadata.
@@ -33,11 +35,12 @@ The values below are the contract fixture baseline. A server reports its actual 
 - `schemas/playback-ticket-create-request.schema.json`: Closed ticket-create request.
 - `schemas/playback-client-capabilities.schema.json`: Client capability declaration.
 - `schemas/playback-ticket-state.schema.json`: Closed eight-state ticket state machine.
-- `schemas/playback-transport-kind.schema.json`: Closed S3 transport set.
-- `schemas/transport*.schema.json`: The three S3 transport strategies.
+- `schemas/playback-transport-kind.schema.json`: Closed v1 transport set, including the optional `direct-dash` kind.
+- `schemas/transport*.schema.json`: The four v1 transport strategies.
+- `schemas/direct-dash-stream.schema.json`: Closed per-track stream for the S5 direct video/audio pair.
 - `schemas/media-session.schema.json`: Media-session expiry metadata; no separate capability field.
 - `schemas/subtitle.schema.json`: Stable subtitle description, optional controlled WebVTT URL, and PGS-without-URL rule.
-- `schemas/stream-headers.schema.json`: Complete outbound direct-http header whitelist.
+- `schemas/stream-headers.schema.json`: Complete outbound direct-http and direct-dash header whitelist.
 - `fixtures/*.json`: Golden examples for server, Kotlin, and Rust tests.
 
 ## Meta Contract
@@ -62,7 +65,7 @@ Feature flags are all `false` in the fixture until a deployment explicitly enabl
 - `native_player_enabled`
 - `libmpv_fallback_enabled`
 
-`direct_dash_enabled` and `local_relay_enabled` remain discovery flags for future work and do not enable paths or transports in this contract.
+`direct_dash_enabled` gates the S5 direct-dash contract and defaults to false. The client must still request it with `supports_dash_merge=true`; the flag alone does not make direct-dash eligible. `local_relay_enabled` remains a discovery flag for future work and does not enable a path or transport in this contract.
 
 ## Device Auth Contract
 
@@ -142,10 +145,10 @@ The create request is closed and contains only:
 
 - `file_id`: positive integer.
 - `device_id`: consistency check; the access token remains the identity source.
-- `client`: platform, version, engine, containers, codecs, subtitle codecs, Range support, and safe-header support.
-- `preferred_transports`: a unique subset/order of `direct-http`, `server-proxy`, and `server-hls`.
+- `client`: platform, version, engine, containers, codecs, subtitle codecs, optional `supports_dash_merge`, Range support, and safe-header support.
+- `preferred_transports`: a unique subset/order of up to four transport kinds from `direct-http`, `server-proxy`, `server-hls`, and `direct-dash`.
 
-The client cannot submit a source URL, source headers, mode, burn flag, force switch, media-session capability, or access/refresh token. Preferences only reorder transports that remain eligible; server authorization and feature flags decide eligibility.
+The client cannot submit a source URL, source headers, mode, burn flag, force switch, media-session capability, or access/refresh token. Preferences only reorder transports that remain eligible; server authorization, device policy, and feature flags decide eligibility. Omitting `supports_dash_merge` is equivalent to false.
 
 ### State Machine
 
@@ -156,7 +159,7 @@ The ticket states are exactly:
 - `probing`: ticket exists; no media or transport description is available.
 - `ready`: server eligibility is known; no transport secret has been issued.
 - `consuming`: a one-time transport description was released by create or refresh.
-- `unsupported`: no S3 transport is compatible.
+- `unsupported`: no transport in the current v1 contract is compatible.
 - `failed`: probing or source preparation failed.
 - `expired`: the ticket's absolute five-minute lifetime ended.
 - `revoked`: user, device, policy, or emergency-stop state invalidated the ticket.
@@ -170,7 +173,7 @@ The ticket states are exactly:
   error envelope instead.
 - Only `state=consuming` permits a `transport` property.
 - A direct-http description contains a source URL only in this one-time response.
-- A direct URL cannot be revoked after delivery. `source_expires_at` is reserved for a known source expiry, but the current S3 server leaves it absent; clients must not depend on it.
+- A direct URL or direct-dash stream cannot be revoked after delivery. `source_expires_at` is reserved for a known source expiry, but the current server leaves it absent; clients must not depend on it.
 - `GET` uses `playback-ticket.schema.json`, which has no `transport`, `streams`, `url`, `headers`, `media_session`, `subtitles`, capability, or `source_expires_at` property.
 - `GET` never probes, claims, rebuilds, or reissues a description. It returns
   state, media summary, and `remaining_transports` even while the ticket is
@@ -202,7 +205,7 @@ The ticket states are exactly:
   restore a description that was already released.
 - `remaining_transports` never repeats the transport just issued.
 - A consuming transport may include `subtitles`. Each entry has a stable `sub_<local-id>` id, language, label, protocol format (`vtt`, `srt`, `ass`, or `pgs`), optional controlled URL, default flag, and forced flag.
-- Text tracks that can be delivered safely are converted to WebVTT and receive an independent `ss_` URL. PGS is descriptive only in S3, has no URL, and is omitted from the server-HLS subtitle list because this revision has no burn-in path.
+- Text tracks that can be delivered safely are converted to WebVTT and receive an independent `ss_` URL. PGS is descriptive only in this contract revision, has no URL, and is omitted from the server-HLS subtitle list because this revision has no burn-in path.
 
 ### Transports
 
@@ -211,8 +214,11 @@ The ticket states are exactly:
 | `direct-http` | One HTTPS `muxed` stream, allowlisted headers only |
 | `server-proxy` | Media-session expiries plus one server-hosted `/stream` URL |
 | `server-hls` | Media-session expiries plus one server-hosted `/index.m3u8` URL |
+| `direct-dash` | Exactly one HTTPS `video/mp4` stream and one HTTPS `audio/mp4` stream, each with its own allowlisted headers; no media session |
 
 Server media sessions use a 15-minute idle lifetime and a 6-hour absolute cap. Ticket expiry and media-session expiry are independent.
+
+The direct-dash MVP sets `range=false` on both streams because source Range support is not yet verified. Both URLs must be HTTPS without userinfo, and either stream failing URL, MIME, role, or header validation makes the entire candidate unavailable. The ticket can fall back to server-HLS only when `server_hls_v1_enabled=true`; otherwise it continues to the next eligible transport or `unsupported`. The client must merge the two streams locally; direct-dash never creates a media session. Client-side merge and real dual-stream playback are not yet verified, so this rule is not evidence that S5 acceptance is closed.
 
 ### Media Capability
 
@@ -228,13 +234,13 @@ Server media sessions use a 15-minute idle lifetime and a 6-hour absolute cap. T
 - Each deliverable text track receives its own `playback_subtitle_sessions` row. The database stores only the SHA-256 hash of the high-entropy `ss_` capability and binds it to ticket, user, device, file, purpose, transport, subtitle id, and `start_seconds`.
 - Subtitle sessions use a 15-minute idle lifetime and a 6-hour absolute cap with version/CAS updates. The timeline origin is fixed in the session; clients cannot change it with a query.
 - Capability routes accept only `GET` and `HEAD`. Any query string, including a bare trailing `?`, is rejected before authorization or source access.
-- Authorization rechecks the live user status, email-verification gate, device revocation, and ticket non-revoked state. Ticket revocation, device revocation, all-device revocation, feature shutdown, and user deletion fail closed.
+- Authorization rechecks the live user status, email-verification gate, device revocation, and ticket `state=ready|consuming`/non-revoked state. It also requires the ticket's current `selected_transport` to match the subtitle session's bound transport. Ticket revocation, a transport fallback or other selected-transport change, device revocation, all-device revocation, feature shutdown, and user deletion fail closed.
 - `ss_` appears only in the path and is redacted by log middleware. Source paths, source URLs, source headers, ffmpeg output, and backend errors never appear in responses or logs.
 - For server-HLS, the WebVTT rendition URL requires both the issuing `ms_` session and its matching `ss_` session. Both must agree on ticket, user, device, and file; either session expiring or being revoked fails closed.
 
 ## Header Whitelist
 
-Client-facing direct-http stream headers are limited to:
+Client-facing direct-http and direct-dash stream headers are limited to:
 
 - `Referer`
 - `Origin`
@@ -280,7 +286,7 @@ The S1 and S2 codes remain present. `authorization_pending` remains intentionall
 - `error-email-verification-required.json` demonstrates the existing `forbidden` response for device-code exchange or device Bearer access; refresh reuses the existing `refresh_token_invalid` fixture.
 - Example ticket IDs and media-session path values are obvious placeholders.
 - The safe GET status fixture contains no transport or URL shape.
-- Direct-http, server-proxy, and server-hls transports each have a `consuming` issuance fixture.
+- Direct-http, server-proxy, server-hls, and direct-dash transports each have a `consuming` issuance fixture. The direct-dash fixture proves the static additive contract only; it is not evidence of real dual-stream playback, client-side merge, or S5 acceptance.
 - `protocol/fixtures/media-samples.json` is owned by S0 and explicitly skipped by the checker.
 
 ## Validation
@@ -292,4 +298,4 @@ Run from the repository root:
 git diff --check
 ```
 
-The checker validates required schema/fixture files, the complete endpoint set, JSON Schema draft 2020-12 fixtures, `$ref` targets, S2 CSRF conditions and headers, token-lifetime bounds, email-gate mappings, S3 state/error/transport sets, safe GET projection, forbidden create-request fields, empty-audio support, media path capability, and GET/HEAD media response shape.
+The checker validates required schema/fixture files, the complete endpoint set, JSON Schema draft 2020-12 fixtures, `$ref` targets, S2 CSRF conditions and headers, token-lifetime bounds, email-gate mappings, S3/S5 state/error/transport sets, direct-dash video/audio pair constraints, safe GET projection, forbidden create-request fields, empty-audio support, media path capability, and GET/HEAD media response shape.

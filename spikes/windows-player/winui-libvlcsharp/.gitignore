@@ -1,0 +1,13 @@
+.dotnet/
+.nuget-http-cache/
+.packages/
+.tmp/
+**/bin/
+**/obj/
+.vs/
+TestResults/
+*.trx
+*.coverage
+*.binlog
+*.user
+*.suo

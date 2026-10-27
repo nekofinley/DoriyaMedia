@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: DoriyaMedia Native Client Contract
-  version: 1.4.0
+  version: 1.5.0
   license:
     name: Proprietary
     identifier: LicenseRef-DoriyaMedia-Proprietary
@@ -16,9 +16,18 @@ info:
     endpoints, and the S3.5 subtitle grant chain.
 
     The S2 device-auth and device-management endpoints are implemented.
-    S3 is a contract freeze: runtime availability is advertised through
+    Runtime availability is advertised through
     playback_ticket_enabled, direct_http_enabled, server_proxy_v1_enabled,
-    and server_hls_v1_enabled. direct-dash and local-relay are not part of S3.
+    server_hls_v1_enabled, direct_dash_enabled, and local_relay_enabled.
+
+    S5 adds direct-dash as an optional, default-disabled transport under
+    contract version 1. It is issued only when the server flag, device policy,
+    multipart source eligibility, and the client's supports_dash_merge
+    capability all agree. The S5 server contract and default-off implementation
+    are landed, but real Bilibili dual-stream playback, client-side merge, and
+    the Windows/Android device and network matrices are not yet verified, so S5
+    acceptance remains open. local-relay is not implemented and remains outside
+    this contract revision; local_relay_enabled is discovery-only.
 
     Server-HLS playlist and segment URLs are GET-only media-session
     capabilities. They accept no query parameters and no Bearer or Cookie
@@ -27,7 +36,8 @@ info:
     Text subtitles are delivered as WebVTT by an independent ss_ capability.
     For server-HLS the controlled rendition URL also contains the issuing ms_
     media capability; both sessions are reauthorized on every GET or HEAD.
-    S3 does not expose a query-driven HLS master or subtitle-selection path.
+    This revision does not expose a query-driven HLS master or
+    subtitle-selection path.
 
     Existing /api routes are intentionally not part of this OpenAPI document.
 servers:
@@ -73,7 +83,33 @@ x-playback-ticket-semantics:
       code: forbidden
       action: reauthorize
   preferredTransports: Client preferences may reorder eligible transports but cannot add eligibility or force a disabled transport.
-  directURL: A direct URL cannot be revoked after delivery. source_expires_at is reserved for a known source expiry but is not populated by the current S3 server; clients must not depend on it.
+  directURL: A direct HTTP or direct-dash URL cannot be revoked after delivery. source_expires_at is reserved for a known source expiry but is not populated by the current server; clients must not depend on it.
+x-playback-direct-dash:
+  status: server-contract-implemented
+  default_enabled: false
+  acceptance_status: open
+  s5_closed: false
+  pending_acceptance:
+    - real-bilibili-dual-stream
+    - windows-and-android-client-merge
+    - windows-and-android-device-and-network-matrix
+  contract_version: 1
+  capability: client.supports_dash_merge
+  eligibility: server-flag-and-device-policy-and-multipart-source
+  streams:
+    count: 2
+    roles:
+      - video
+      - audio
+    mime:
+      video: video/mp4
+      audio: audio/mp4
+  range: false
+  media_session: forbidden
+  fallback: server-hls
+  fallback_requires:
+    server_hls_v1_enabled: true
+  local_relay: not-implemented
 x-media-session-capability:
   location: path
   parameter: id
@@ -140,6 +176,8 @@ x-server-hls-media-session:
       - ticket_not_found
     "405":
       - invalid_request
+    "408":
+      - invalid_request
     "410":
       - media_session_expired
       - ticket_expired
@@ -149,6 +187,47 @@ x-server-hls-media-session:
       - internal_error
     "502":
       - source_unavailable
+    "504":
+      - internal_error
+x-playback-byte-ranges:
+  unit: bytes
+  request:
+    outer_ows:
+      - SP
+      - HTAB
+    accepted_forms:
+      - closed
+      - open-ended
+    rejected_forms:
+      - suffix
+      - multi-range
+      - repeated-header
+      - reversed
+    malformed_status: 400
+    malformed_code: invalid_request
+    unsatisfiable_status: 416
+    unsatisfiable_content_range_pattern: '^bytes \*/[0-9]+$'
+  response:
+    partial_status: 206
+    content_range_required: true
+    content_range_pattern: '^bytes [0-9]+-[0-9]+/[0-9]+$'
+    head_bodyless: true
+  validators:
+    local_etag: strong
+    if_range:
+      accepted: strong-etag-or-http-date
+      local_date_weak_stale_or_unavailable_status: 200
+      server_proxy_forwards_condition: true
+      conflicting_partial_status: 502
+x-playback-failure-codes:
+  failed:
+    - source_unavailable
+    - probe_timeout
+    - probe_interrupted
+    - probe_finalize_failed
+  unsupported:
+    - unsupported_media
+  unknown_internal_failed_fallback: source_unavailable
 x-auth-isolation:
   rule: Device access tokens and browser Web sessions are separate credential domains.
   deviceAccessToken: bearerAuth
@@ -753,7 +832,20 @@ paths:
         "429":
           $ref: "#/components/responses/StableError"
         "500":
-          $ref: "#/components/responses/StableError"
+          description: |
+            The ticket was created but the server could not finalize it. When
+            the ticket row exists, Location identifies the safe status endpoint
+            so the client can recover the terminal failed state.
+          headers:
+            Location:
+              description: Present when a ticket row was created before the failure.
+              schema:
+                type: string
+                pattern: "^/api/v1/playback/tickets/pt_[A-Za-z0-9_-]{8,96}$"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "504":
           description: The server could not finish the playback operation before its deadline; details.action is retry.
           $ref: "#/components/responses/StableError"
@@ -908,9 +1000,15 @@ paths:
           $ref: "#/components/responses/ServerProxyStream"
         "206":
           $ref: "#/components/responses/ServerProxyPartialContent"
+        "400":
+          description: Malformed or repeated Range, repeated If-Range alongside Range, a suffix or multi-range request, or a query string was supplied.
+          $ref: "#/components/responses/StableError"
         "403":
           $ref: "#/components/responses/StableError"
         "404":
+          $ref: "#/components/responses/StableError"
+        "408":
+          description: The client canceled the playback request before completion.
           $ref: "#/components/responses/StableError"
         "410":
           $ref: "#/components/responses/StableError"
@@ -922,6 +1020,7 @@ paths:
               schema:
                 type: string
                 pattern: "^bytes \\*/[0-9]+$"
+              x-required-on-status: 416
             Cache-Control:
               schema:
                 type: string
@@ -933,6 +1032,12 @@ paths:
         "429":
           $ref: "#/components/responses/StableError"
         "500":
+          $ref: "#/components/responses/StableError"
+        "502":
+          description: The source is unavailable or returned an invalid range response.
+          $ref: "#/components/responses/StableError"
+        "504":
+          description: The server could not finish authorization before its deadline; details.action is retry.
           $ref: "#/components/responses/StableError"
         default:
           $ref: "#/components/responses/StableError"
@@ -973,6 +1078,11 @@ paths:
               schema:
                 type: string
                 const: "private, no-store"
+            ETag:
+              description: Entity tag for this representation. Clients must use it in If-Range only when it is strong.
+              schema:
+                type: string
+              x-if-range-validator: strong-exact-only
         "206":
           description: Partial-media metadata without a response body.
           headers:
@@ -987,6 +1097,7 @@ paths:
               schema:
                 type: string
                 pattern: "^bytes [0-9]+-[0-9]+/[0-9]+$"
+              x-required-on-status: 206
             Accept-Ranges:
               schema:
                 type: string
@@ -995,10 +1106,19 @@ paths:
               schema:
                 type: string
                 const: "private, no-store"
+            ETag:
+              description: Entity tag for this representation. Clients must use it in If-Range only when it is strong.
+              schema:
+                type: string
+              x-if-range-validator: strong-exact-only
+        "400":
+          description: Malformed or repeated Range, repeated If-Range alongside Range, a suffix or multi-range request, or a query string was supplied; no HEAD body.
         "403":
           description: Transport disabled or media session revoked; no HEAD body.
         "404":
           description: Media session not found; no HEAD body.
+        "408":
+          description: The client canceled the playback request before completion; no HEAD body.
         "410":
           description: Media session expired; no HEAD body.
         "416":
@@ -1008,10 +1128,15 @@ paths:
               schema:
                 type: string
                 pattern: "^bytes \\*/[0-9]+$"
+              x-required-on-status: 416
         "429":
           description: Rate limited; no HEAD body.
         "500":
           description: Internal error; no HEAD body.
+        "502":
+          description: The source is unavailable or returned an invalid range response; no HEAD body.
+        "504":
+          description: The server could not finish authorization before its deadline; no HEAD body.
         default:
           description: Unexpected error; no HEAD body.
   /api/v1/playback/media-sessions/{id}/index.m3u8:
@@ -1062,11 +1187,17 @@ paths:
           $ref: "#/components/responses/StableError"
         "410":
           $ref: "#/components/responses/StableError"
+        "408":
+          description: The client canceled the playback request before completion.
+          $ref: "#/components/responses/StableError"
         "415":
           $ref: "#/components/responses/StableError"
         "500":
           $ref: "#/components/responses/StableError"
         "502":
+          $ref: "#/components/responses/StableError"
+        "504":
+          description: The server could not finish authorization before its deadline; details.action is retry.
           $ref: "#/components/responses/StableError"
         default:
           $ref: "#/components/responses/StableError"
@@ -1117,11 +1248,17 @@ paths:
           $ref: "#/components/responses/StableError"
         "410":
           $ref: "#/components/responses/StableError"
+        "408":
+          description: The client canceled the playback request before completion.
+          $ref: "#/components/responses/StableError"
         "415":
           $ref: "#/components/responses/StableError"
         "500":
           $ref: "#/components/responses/StableError"
         "502":
+          $ref: "#/components/responses/StableError"
+        "504":
+          description: The server could not finish authorization before its deadline; details.action is retry.
           $ref: "#/components/responses/StableError"
         default:
           $ref: "#/components/responses/StableError"
@@ -1378,8 +1515,14 @@ components:
       $ref: ./schemas/playback-ticket.schema.json
     PlaybackTicketIssuance:
       $ref: ./schemas/playback-ticket-issuance.schema.json
+    PlaybackFailureCode:
+      $ref: ./schemas/playback-failure-code.schema.json
     PlaybackTransport:
       $ref: ./schemas/transport.schema.json
+    PlaybackDirectDASHStream:
+      $ref: ./schemas/direct-dash-stream.schema.json
+    PlaybackDirectDASHTransport:
+      $ref: ./schemas/transport-direct-dash.schema.json
     PlaybackMediaSummary:
       $ref: ./schemas/media.schema.json
     PlaybackStream:
@@ -1444,20 +1587,49 @@ components:
       name: Range
       in: header
       required: false
-      description: A single forward byte range. Multipart, suffix, and multi-range requests are not part of S3.
+      description: |-
+        One bytes range covering either a closed interval or an open-ended
+        interval. Exactly one Range field value is accepted. Outer SP and HTAB
+        OWS is ignored; whitespace inside the range syntax is not. Suffix,
+        reversed, multipart/multi-range, and repeated Range fields are rejected
+        with 400 invalid_request.
       schema:
         type: string
-        pattern: "^bytes=[0-9]+-[0-9]*$"
+        pattern: '^[ \t]*[bB][yY][tT][eE][sS]=[0-9]+-(?:[0-9]+)?[ \t]*$'
+      x-single-range: true
+      x-outer-ows:
+        - SP
+        - HTAB
+      x-accepted-forms:
+        - closed
+        - open-ended
+      x-rejected-forms:
+        - suffix
+        - multi-range
+        - repeated-header
+        - reversed
+      x-malformed-status: 400
     IfRange:
       name: If-Range
       in: header
       required: false
-      description: Validator for a conditional single-range request.
+      description: |-
+        One optional conditional validator for a single-range request. Clients
+        may send a strong entity tag or an HTTP-date. The header is ignored when
+        Range is absent. Local media only matches an exact strong entity tag and
+        falls back to full 200 for a date, weak, stale, malformed, or unavailable
+        validator. Server-proxy forwards one non-empty value unchanged to the
+        source; a source response carrying a conflicting ETag or Last-Modified
+        validator is mapped to 502.
       schema:
         type: string
-        minLength: 1
-        maxLength: 256
-        pattern: "^[^\\r\\n\\x00]+$"
+      x-if-range-accepted: strong-etag-or-http-date
+      x-local-exact-strong-etag-required: true
+      x-if-range-forwarded-by-server-proxy: single-value-raw
+      x-if-range-ignored-without-range: true
+      x-if-range-repeated-status: 400
+      x-local-nonmatch-status: 200
+      x-server-proxy-conflict-status: 502
   responses:
     StableError:
       description: Stable error envelope. Clients branch on error.code, never on error.message.
@@ -1483,6 +1655,11 @@ components:
           schema:
             type: string
             const: "private, no-store"
+        ETag:
+          description: Entity tag for this representation. Clients must use it in If-Range only when it is strong.
+          schema:
+            type: string
+          x-if-range-validator: strong-exact-only
       content:
         application/octet-stream:
           schema:
@@ -1511,9 +1688,11 @@ components:
             type: integer
             minimum: 0
         Content-Range:
+          description: Required on every 206 response.
           schema:
             type: string
             pattern: "^bytes [0-9]+-[0-9]+/[0-9]+$"
+          x-required-on-status: 206
         Accept-Ranges:
           schema:
             type: string
@@ -1522,6 +1701,11 @@ components:
           schema:
             type: string
             const: "private, no-store"
+        ETag:
+          description: Entity tag for this representation. Clients must use it in If-Range only when it is strong.
+          schema:
+            type: string
+          x-if-range-validator: strong-exact-only
       content:
         application/octet-stream:
           schema:

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"doriyamedia/internal/db"
 	"doriyamedia/internal/models"
 	"doriyamedia/internal/source"
 )
@@ -49,6 +50,20 @@ type probeJob struct {
 	err   error
 }
 
+type ticketProbeJob struct {
+	done           chan struct{}
+	finished       time.Time
+	probe          *Probe
+	err            error
+	leaderCanceled bool
+}
+
+type ticketProbeKey struct {
+	fileID int64
+	size   int64
+	mtime  int64
+}
+
 // ProbeFromCache parses a stored probe when it is complete enough to decide
 // playback. Mirrors the acceptance rule used by EnsureProbe.
 func ProbeFromCache(file *models.MediaFile) *Probe {
@@ -72,6 +87,20 @@ const probeTimeout = 150 * time.Second
 // failedProbeCooldown stops repeated /api/play calls from hammering a source
 // whose probe just failed.
 const failedProbeCooldown = 30 * time.Second
+
+// ticketProbeResultTTL keeps a pure probe result long enough for a burst of
+// ticket requests to share it. It is memory-only and never populates file
+// metadata.
+const ticketProbeResultTTL = 30 * time.Second
+
+// ticketProbeMaxJobs bounds the memory-only probe registry. Callers queue for
+// an entry instead of bypassing single-flight when every entry is in flight.
+const ticketProbeMaxJobs = 1024
+
+// ticketProbeMaxConcurrent bounds actual ticket-driven ffprobe passes. The
+// larger registry still lets many callers join their per-file in-flight job
+// while only a few processes touch a source at once.
+const ticketProbeMaxConcurrent = 4
 
 // ProbeStatus reports the state of the probe job for a file.
 // A file whose probe is already persisted reports ready.
@@ -103,7 +132,13 @@ func (e *Engine) StartProbe(file *models.MediaFile, drv source.Driver) {
 	e.probeMu.Lock()
 	e.gcProbeJobsLocked()
 	if prev, ok := e.probeJobs[file.ID]; ok {
-		if prev.state == "probing" || time.Since(prev.finished) < failedProbeCooldown {
+		if prev.state == "probing" {
+			e.probeMu.Unlock()
+			return
+		}
+		retryAfterGenerationChange := errors.Is(prev.err, db.ErrMediaFileChanged)
+		if !retryAfterGenerationChange &&
+			time.Since(prev.finished) < failedProbeCooldown {
 			e.probeMu.Unlock()
 			return
 		}
@@ -153,6 +188,246 @@ func (e *Engine) EnsureProbe(ctx context.Context, file *models.MediaFile, drv so
 	}
 	e.runProbeJob(ctx, file, drv, job)
 	return job.probe, job.err
+}
+
+// ProbeTransient returns a probe for playback-ticket finalization without
+// persisting files.probe or subtitles. Concurrent callers for the same file
+// share one ffprobe pass, but never join the legacy probeJobs registry because
+// that path commits shared metadata before the ticket can check revocation.
+func (e *Engine) ProbeTransient(
+	ctx context.Context,
+	file *models.MediaFile,
+	drv source.Driver,
+) (*Probe, error) {
+	if e == nil || file == nil {
+		return nil, errors.New("media probe unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if probe := ProbeFromCache(file); probe != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return probe, nil
+	}
+	key := ticketProbeJobKey(file)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		job, leader, err := e.acquireTicketProbeJob(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		if !leader {
+			select {
+			case <-job.done:
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				// Only a leader whose own context ended is retried. A driver
+				// may return context.DeadlineExceeded or context.Canceled
+				// while its caller is still live; that is an ordinary source
+				// failure and stays cached for ticketProbeResultTTL.
+				if job.leaderCanceled {
+					continue
+				}
+				return job.probe, job.err
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		return e.runTicketProbeLeader(ctx, key, job, file, drv)
+	}
+}
+
+func (e *Engine) runTicketProbeLeader(
+	ctx context.Context,
+	key ticketProbeKey,
+	job *ticketProbeJob,
+	file *models.MediaFile,
+	drv source.Driver,
+) (*Probe, error) {
+	slots := e.ticketProbeSlotPool()
+	if err := ctx.Err(); err != nil {
+		e.finishTicketProbeJob(key, job, nil, err, true)
+		return nil, err
+	}
+	select {
+	case slots <- struct{}{}:
+		defer func() { <-slots }()
+	case <-ctx.Done():
+		err := ctx.Err()
+		e.finishTicketProbeJob(key, job, nil, err, true)
+		return nil, err
+	}
+	// ProbeFor can call a source driver (MultiPart), so it belongs inside the
+	// shared slot/registry critical section: repeated source failures then share
+	// the same TTL and cannot bypass the ticket-probe concurrency bound.
+	probe, err := e.ProbeFor(ctx, file, drv)
+	if err == nil && probe == nil {
+		probe, err = e.probeWithoutPersisting(ctx, file, drv)
+	}
+	if probe != nil && probe.Video() == nil && len(probe.Streams) > 0 {
+		err = errNoVideoStream
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		e.finishTicketProbeJob(key, job, nil, ctxErr, true)
+		return nil, ctxErr
+	}
+	leaderCanceled := false
+	e.finishTicketProbeJob(key, job, probe, err, leaderCanceled)
+	return probe, err
+}
+
+func ticketProbeJobKey(file *models.MediaFile) ticketProbeKey {
+	return ticketProbeKey{fileID: file.ID, size: file.Size, mtime: file.MTime}
+}
+
+// acquireTicketProbeJob returns an existing job, or installs the caller as its
+// leader. When the registry is full of in-flight jobs, it waits for capacity or
+// the caller's cancellation instead of bypassing the single-flight registry.
+func (e *Engine) acquireTicketProbeJob(
+	ctx context.Context,
+	key ticketProbeKey,
+) (*ticketProbeJob, bool, error) {
+	for {
+		e.ticketProbeMu.Lock()
+		if e.ticketProbeJobs == nil {
+			e.ticketProbeJobs = map[ticketProbeKey]*ticketProbeJob{}
+		}
+		if e.ticketProbeWake == nil {
+			e.ticketProbeWake = make(chan struct{})
+		}
+		if job, ok := e.ticketProbeJobs[key]; ok {
+			if job.finished.IsZero() {
+				e.ticketProbeMu.Unlock()
+				return job, false, nil
+			}
+			if !job.leaderCanceled &&
+				time.Since(job.finished) < ticketProbeResultTTL {
+				e.ticketProbeMu.Unlock()
+				return job, false, nil
+			}
+			delete(e.ticketProbeJobs, key)
+		}
+		e.gcTicketProbeJobsLocked()
+		if len(e.ticketProbeJobs) < ticketProbeMaxJobs ||
+			e.evictOldestFinishedTicketProbeJobLocked() {
+			job := &ticketProbeJob{done: make(chan struct{})}
+			e.ticketProbeJobs[key] = job
+			e.ticketProbeMu.Unlock()
+			return job, true, nil
+		}
+		wake := e.ticketProbeWake
+		e.ticketProbeMu.Unlock()
+
+		select {
+		case <-wake:
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
+	}
+}
+
+func (e *Engine) finishTicketProbeJob(
+	key ticketProbeKey,
+	job *ticketProbeJob,
+	probe *Probe,
+	err error,
+	leaderCanceled bool,
+) {
+	e.ticketProbeMu.Lock()
+	defer e.ticketProbeMu.Unlock()
+	job.probe = probe
+	job.err = err
+	job.finished = time.Now()
+	job.leaderCanceled = leaderCanceled
+	if leaderCanceled {
+		if current, ok := e.ticketProbeJobs[key]; ok && current == job {
+			delete(e.ticketProbeJobs, key)
+		}
+	}
+	close(job.done)
+	e.notifyTicketProbeWaitersLocked()
+}
+
+func (e *Engine) gcTicketProbeJobsLocked() {
+	now := time.Now()
+	for id, job := range e.ticketProbeJobs {
+		if !job.finished.IsZero() &&
+			now.Sub(job.finished) >= ticketProbeResultTTL {
+			delete(e.ticketProbeJobs, id)
+		}
+	}
+}
+
+func (e *Engine) evictOldestFinishedTicketProbeJobLocked() bool {
+	var oldestKey ticketProbeKey
+	var oldest time.Time
+	found := false
+	for key, job := range e.ticketProbeJobs {
+		if job.finished.IsZero() {
+			continue
+		}
+		if !found || job.finished.Before(oldest) ||
+			job.finished.Equal(oldest) && ticketProbeKeyLess(key, oldestKey) {
+			oldestKey, oldest, found = key, job.finished, true
+		}
+	}
+	if found {
+		delete(e.ticketProbeJobs, oldestKey)
+	}
+	return found
+}
+
+func ticketProbeKeyLess(a, b ticketProbeKey) bool {
+	if a.fileID != b.fileID {
+		return a.fileID < b.fileID
+	}
+	if a.size != b.size {
+		return a.size < b.size
+	}
+	return a.mtime < b.mtime
+}
+
+func (e *Engine) notifyTicketProbeWaitersLocked() {
+	if e.ticketProbeWake == nil {
+		e.ticketProbeWake = make(chan struct{})
+		return
+	}
+	close(e.ticketProbeWake)
+	e.ticketProbeWake = make(chan struct{})
+}
+
+func (e *Engine) ticketProbeSlotPool() chan struct{} {
+	e.ticketProbeMu.Lock()
+	defer e.ticketProbeMu.Unlock()
+	if e.ticketProbeSlots == nil {
+		e.ticketProbeSlots = make(chan struct{}, ticketProbeMaxConcurrent)
+	}
+	return e.ticketProbeSlots
+}
+
+// probeWithoutPersisting resolves and probes a source without touching the
+// store. The caller decides whether and how to commit the result.
+func (e *Engine) probeWithoutPersisting(
+	ctx context.Context,
+	file *models.MediaFile,
+	drv source.Driver,
+) (*Probe, error) {
+	target, headers, err := e.ProbeTarget(ctx, file, drv)
+	if err != nil {
+		return nil, err
+	}
+	proxy, err := sourceProxyFor(drv)
+	if err != nil {
+		return nil, err
+	}
+	return e.probeWithFallback(ctx, target, headers, proxy)
 }
 
 // acquireProbeJob returns the in-flight job for a file, or creates one and
@@ -208,17 +483,7 @@ func (e *Engine) runProbeJob(ctx context.Context, file *models.MediaFile, drv so
 
 // doProbe resolves the source, probes it and stores the result on the file row.
 func (e *Engine) doProbe(ctx context.Context, file *models.MediaFile, drv source.Driver, job *probeJob) error {
-	target, headers, err := e.ProbeTarget(ctx, file, drv)
-	if err != nil {
-		job.err = err
-		return err
-	}
-	proxy, err := sourceProxyFor(drv)
-	if err != nil {
-		job.err = err
-		return err
-	}
-	probe, err := e.probeWithFallback(ctx, target, headers, proxy)
+	probe, err := e.probeWithoutPersisting(ctx, file, drv)
 	if err != nil {
 		job.err = err
 		return err
@@ -228,11 +493,18 @@ func (e *Engine) doProbe(ctx context.Context, file *models.MediaFile, drv source
 		job.err = err
 		return err
 	}
-	if err := e.Store.UpdateFileProbe(file.ID, string(raw)); err != nil {
-		log.Printf("persist probe for file %d failed (%s)", file.ID, safeMediaLogError(err))
+	err = e.Store.UpdateFileProbeAndEmbeddedSubtitlesForVersionContext(
+		ctx, file.ID, file.Size, file.MTime, string(raw),
+		EmbeddedSubtitleRows(file.ID, probe))
+	switch {
+	case errors.Is(err, db.ErrMediaFileChanged):
+		job.err = err
+		return err
+	case err != nil:
+		log.Printf("persist probe for file %d failed (%s)",
+			file.ID, safeMediaLogError(err))
 	}
 	file.Probe = string(raw)
-	e.RegisterEmbeddedSubs(file, probe)
 
 	// Streams were found but none of them is video (an audio-only or still-file
 	// source sitting behind a video extension). Report it instead of leaving the
@@ -251,11 +523,7 @@ func (e *Engine) doProbe(ctx context.Context, file *models.MediaFile, drv source
 // the deep window when that found nothing usable — some muxes hide streams past
 // a short probe.
 func (e *Engine) probeWithFallback(ctx context.Context, target string, headers map[string]string, proxy string) (*Probe, error) {
-	quick := *e.prober
-	if e.Cfg != nil {
-		quick.ProbeSizeMB = e.Cfg.Playback.ProbeSizeMB
-		quick.AnalyzeSec = e.Cfg.Playback.ProbeAnalyzeSec
-	}
+	quick := *e.currentProber()
 	probe, err := e.execProbe(ctx, &quick, target, headers, proxy)
 	if err == nil && (probe.Video() != nil || len(probe.Streams) > 0) {
 		return probe, nil
@@ -267,7 +535,7 @@ func (e *Engine) probeWithFallback(ctx context.Context, target string, headers m
 		return nil, ctx.Err()
 	}
 
-	deep := *e.prober
+	deep := *e.currentProber()
 	deep.ProbeSizeMB, deep.AnalyzeSec = deepProbeSizeMB, deepProbeAnalyzeSec
 	deepProbe, deepErr := e.execProbe(ctx, &deep, target, headers, proxy)
 	if deepErr == nil && (deepProbe.Video() != nil || len(deepProbe.Streams) > 0) {

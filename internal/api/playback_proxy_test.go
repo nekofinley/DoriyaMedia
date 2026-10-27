@@ -250,6 +250,14 @@ func TestPlaybackProxyRejectsBadUpstreamContentRange(t *testing.T) {
 		"bytes nonsense",
 		"bytes 0-99/*",
 		"bytes 0-99/50",
+		"bytes +0-3/4",
+		"bytes 0-+3/4",
+		"bytes 0 -3/4",
+		"bytes 0- 3/4",
+		"bytes 0-3 /4",
+		"bytes 0-3/ 4",
+		"bytes 0-3/+4",
+		"bytes  0-3/4",
 	} {
 		t.Run(contentRange, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -479,23 +487,74 @@ func TestPlaybackProxyErrorDropsSourceMediaHeaders(t *testing.T) {
 }
 
 func TestPlaybackProxyRejectsInvalidClientRange(t *testing.T) {
-	called := false
-	client := &http.Client{Transport: playbackProxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
-		called = true
-		return nil, errors.New("must not be called")
-	})}
-	rec := runPlaybackProxy(t, http.MethodGet, "https://media.example.test/video.mp4", nil, client, map[string]string{
-		"Range": "bytes=200-100",
-	})
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{name: "descending", value: "bytes=200-100"},
+		{name: "signed start", value: "bytes=+100-199"},
+		{name: "signed end", value: "bytes=100-+199"},
+		{name: "space after equals", value: "bytes= 100-199"},
+		{name: "space before dash", value: "bytes=100 -199"},
+		{name: "space after dash", value: "bytes=100- 199"},
+		{name: "tab after equals", value: "bytes=\t100-199"},
+		{name: "unicode digits", value: "bytes=\u0661\u0662-199"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			client := &http.Client{Transport: playbackProxyRoundTripFunc(
+				func(*http.Request) (*http.Response, error) {
+					called = true
+					return nil, errors.New("must not be called")
+				})}
+			rec := runPlaybackProxy(t, http.MethodGet,
+				"https://media.example.test/video.mp4", nil, client,
+				map[string]string{"Range": tc.value})
 
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 for %q", rec.Code, tc.value)
+			}
+			if got := playbackProxyErrorCode(t, rec); got != V1ErrorInvalidRequest {
+				t.Errorf("error code = %q, want %q", got, V1ErrorInvalidRequest)
+			}
+			if called {
+				t.Error("invalid range reached the upstream")
+			}
+		})
 	}
-	if got := playbackProxyErrorCode(t, rec); got != V1ErrorInvalidRequest {
-		t.Errorf("error code = %q, want %q", got, V1ErrorInvalidRequest)
+}
+
+func TestPlaybackProxyAcceptsOuterOWSRange(t *testing.T) {
+	var upstreamRange string
+	client := &http.Client{Transport: playbackProxyRoundTripFunc(
+		func(req *http.Request) (*http.Response, error) {
+			upstreamRange = req.Header.Get("Range")
+			return &http.Response{
+				StatusCode: http.StatusPartialContent,
+				Status:     "206 Partial Content",
+				Header: http.Header{
+					"Content-Type":   {"video/mp4"},
+					"Content-Range":  {"bytes 2-4/10"},
+					"Content-Length": {"3"},
+				},
+				Body:          io.NopCloser(strings.NewReader("234")),
+				ContentLength: 3,
+				Request:       req,
+			}, nil
+		})}
+
+	rec := runPlaybackProxy(t, http.MethodGet,
+		"https://media.example.test/video.mp4", nil, client,
+		map[string]string{"Range": " \tbytes=2-4\t "})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206; body=%q", rec.Code, rec.Body.String())
 	}
-	if called {
-		t.Error("invalid range reached the upstream")
+	if upstreamRange != "bytes=2-4" {
+		t.Errorf("upstream Range = %q, want bytes=2-4", upstreamRange)
+	}
+	if got := rec.Body.String(); got != "234" {
+		t.Errorf("body = %q, want 234", got)
 	}
 }
 
@@ -641,6 +700,61 @@ func TestPlaybackProxyRejectsRepeatedUpstreamContentRange(t *testing.T) {
 	}
 }
 
+func TestPlaybackProxyRejectsMalformedUnsatisfiableContentRange(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{name: "signed total", value: "bytes */+10"},
+		{name: "space after slash", value: "bytes */ 10"},
+		{name: "extra space after unit", value: "bytes  */10"},
+		{name: "tab after unit", value: "bytes\t*/10"},
+		{name: "trailing non digit", value: "bytes */10x"},
+		{name: "range response", value: "bytes 0-0/10"},
+		{name: "unicode digits", value: "bytes */\u0661\u0660"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			requests := 0
+			client := &http.Client{Transport: playbackProxyRoundTripFunc(
+				func(req *http.Request) (*http.Response, error) {
+					requests++
+					return &http.Response{
+						StatusCode: http.StatusRequestedRangeNotSatisfiable,
+						Status:     "416 Range Not Satisfiable",
+						Header: http.Header{
+							"Content-Type":  {"text/plain"},
+							"Content-Range": {tc.value},
+						},
+						Body:    io.NopCloser(strings.NewReader("private upstream body")),
+						Request: req,
+					}, nil
+				})}
+
+			rec := runPlaybackProxy(t, http.MethodGet,
+				"https://media.example.test/video.mp4", nil, client,
+				map[string]string{"Range": "bytes=10-"})
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502; body=%q",
+					rec.Code, rec.Body.String())
+			}
+			if got := playbackProxyErrorCode(t, rec); got != V1ErrorSourceUnavailable {
+				t.Errorf("error code = %q, want %q",
+					got, V1ErrorSourceUnavailable)
+			}
+			if requests != 1 {
+				t.Errorf("upstream requests = %d, want no fallback probe", requests)
+			}
+			if got := rec.Header().Get("Content-Range"); got != "" {
+				t.Errorf("malformed upstream Content-Range leaked as %q", got)
+			}
+			if strings.Contains(rec.Body.String(), "private upstream body") {
+				t.Errorf("upstream body leaked: %q", rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestPlaybackProxyRejectsInvalidUpstreamContentLength(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -654,6 +768,26 @@ func TestPlaybackProxyRejectsInvalidUpstreamContentLength(t *testing.T) {
 		{
 			name: "full conflicting", status: http.StatusOK,
 			header: []string{"4", "5"},
+		},
+		{
+			name: "full positive sign", status: http.StatusOK,
+			header: []string{"+4"},
+		},
+		{
+			name: "full negative zero", status: http.StatusOK,
+			header: []string{"-0"},
+		},
+		{
+			name: "full nonnumeric", status: http.StatusOK,
+			header: []string{"4x"},
+		},
+		{
+			name: "full empty", status: http.StatusOK,
+			header: []string{""},
+		},
+		{
+			name: "full overflow", status: http.StatusOK,
+			header: []string{"9223372036854775808"},
 		},
 		{
 			name: "partial repeated", status: http.StatusPartialContent,

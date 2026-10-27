@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="light" />
+    <title>Doriya W0 / Tauri + mpv</title>
+  </head>
+  <body>
+    <div id="app" class="shell">
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">DORIYA / WINDOWS W0</p>
+          <h1>MPV<br /><span>SIDECAR LAB</span></h1>
+        </div>
+        <div class="status-seal" aria-live="polite">
+          <span class="status-seal__dot" id="status-dot"></span>
+          <span id="status-label">正在连接命令层</span>
+          <small id="runtime-mode">TAURI 2 · JSON IPC</small>
+        </div>
+      </header>
+
+      <main>
+        <section class="telemetry" aria-label="播放器状态">
+          <article class="readout readout--wide">
+            <span class="readout__label">STATE</span>
+            <strong id="metric-state">UNKNOWN</strong>
+            <small id="metric-substate">等待命令层</small>
+          </article>
+          <article class="readout">
+            <span class="readout__label">PID</span>
+            <strong id="metric-pid">—</strong>
+            <small>mpv sidecar</small>
+          </article>
+          <article class="readout">
+            <span class="readout__label">POSITION</span>
+            <strong id="metric-position">0:00</strong>
+            <small id="metric-duration">duration —</small>
+          </article>
+          <article class="readout">
+            <span class="readout__label">VOLUME</span>
+            <strong id="metric-volume">—</strong>
+            <small id="metric-paused">pause unknown</small>
+          </article>
+        </section>
+
+        <section class="workspace">
+          <div class="control-panel">
+            <div class="section-heading">
+              <span>01</span>
+              <div>
+                <p class="eyebrow">CONTROLLED INPUT</p>
+                <h2>装载媒体</h2>
+              </div>
+            </div>
+
+            <form id="load-form" autocomplete="off">
+              <label class="field field--full">
+                <span>媒体 URL <em>仅 HTTPS</em></span>
+                <input
+                  id="media-url"
+                  name="media-url"
+                  type="password"
+                  inputmode="url"
+                  spellcheck="false"
+                  autocomplete="off"
+                  placeholder="https://…"
+                  required
+                />
+              </label>
+
+              <details class="headers">
+                <summary>允许的播放 Header（Referer / UA / Origin）</summary>
+                <div class="header-grid">
+                  <label class="field field--full">
+                    <span>Referer</span>
+                    <input
+                      id="header-referer"
+                      type="password"
+                      spellcheck="false"
+                      autocomplete="off"
+                    />
+                  </label>
+                  <label class="field field--full">
+                    <span>User-Agent</span>
+                    <input
+                      id="header-user-agent"
+                      type="password"
+                      spellcheck="false"
+                      autocomplete="off"
+                    />
+                  </label>
+                  <label class="field field--full">
+                    <span>Origin</span>
+                    <input
+                      id="header-origin"
+                      type="password"
+                      spellcheck="false"
+                      autocomplete="off"
+                    />
+                  </label>
+                </div>
+              </details>
+
+              <div class="button-row">
+                <button class="button button--primary" id="load-button" type="submit">
+                  装载到 mpv
+                </button>
+                <button class="button" id="start-button" type="button">
+                  启动 Sidecar
+                </button>
+                <button class="button" id="env-button" type="button">
+                  从环境装载
+                </button>
+              </div>
+              <p class="field-note" id="env-note">
+                环境输入状态检测中。输入值不会写入 localStorage 或应用普通日志。
+              </p>
+            </form>
+
+            <div class="section-heading section-heading--controls">
+              <span>02</span>
+              <div>
+                <p class="eyebrow">ALLOWLISTED COMMANDS</p>
+                <h2>播放控制</h2>
+              </div>
+            </div>
+
+            <div class="transport">
+              <button class="transport__key" id="seek-back" type="button" aria-label="后退 10 秒">
+                −10
+              </button>
+              <button class="transport__key transport__key--accent" id="pause-button" type="button">
+                暂停 / 继续
+              </button>
+              <button class="transport__key" id="seek-forward" type="button" aria-label="前进 10 秒">
+                +10
+              </button>
+            </div>
+
+            <label class="range-control">
+              <span>音量</span>
+              <input id="volume" type="range" min="0" max="130" step="1" value="80" />
+              <output id="volume-output">80</output>
+            </label>
+
+            <div class="button-row">
+              <button class="button" id="fullscreen-button" type="button">
+                mpv 全屏切换
+              </button>
+              <button class="button button--danger" id="stop-button" type="button">
+                停止并清理
+              </button>
+            </div>
+          </div>
+
+          <aside class="event-panel">
+            <div class="event-panel__header">
+              <div>
+                <p class="eyebrow">REDACTED EVENT STREAM</p>
+                <h2>本地事件</h2>
+              </div>
+              <span class="pulse" aria-hidden="true"></span>
+            </div>
+            <ol id="event-list" class="event-list" aria-live="polite"></ol>
+            <div class="security-note">
+              <strong>日志边界</strong>
+              <p>
+                URL、query、Header 值不进入 Rust 普通日志。错误只映射为固定代码和固定说明。
+              </p>
+            </div>
+          </aside>
+        </section>
+      </main>
+
+      <footer>
+        <span>W0 MECHANISM SPIKE</span>
+        <span>NOT A RELEASE BUILD · NO PLAYBACK MATRIX CLAIM</span>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

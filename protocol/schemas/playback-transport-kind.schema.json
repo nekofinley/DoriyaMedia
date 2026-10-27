@@ -1,11 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PlaybackTransportKind",
-  "description": "Closed S3 transport set. direct-dash and local-relay are intentionally excluded from this contract revision.",
+  "description": "Closed v1 transport set. direct-dash is an S5 additive, capability-gated transport. local-relay is intentionally excluded from this contract revision.",
   "type": "string",
   "enum": [
     "direct-http",
     "server-proxy",
-    "server-hls"
+    "server-hls",
+    "direct-dash"
   ]
 }

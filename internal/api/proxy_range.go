@@ -84,11 +84,11 @@ func (r legacyRangeRequest) bounds(total int64) (start, end int64, ok bool) {
 // "bytes=100-"). Multi-range requests are rejected: they are vanishingly rare
 // from media players and would need multipart handling to answer correctly.
 func parseRequestRange(v string) (byteRange, bool) {
-	v = strings.TrimSpace(v)
+	v = trimHTTPOWS(v)
 	if !strings.HasPrefix(strings.ToLower(v), "bytes=") {
 		return byteRange{}, false
 	}
-	spec := strings.TrimSpace(v[len("bytes="):])
+	spec := v[len("bytes="):]
 	if strings.Contains(spec, ",") {
 		return byteRange{}, false
 	}
@@ -96,20 +96,20 @@ func parseRequestRange(v string) (byteRange, bool) {
 	if dash < 0 {
 		return byteRange{}, false
 	}
-	startTxt := strings.TrimSpace(spec[:dash])
-	endTxt := strings.TrimSpace(spec[dash+1:])
+	startTxt := spec[:dash]
+	endTxt := spec[dash+1:]
 	if startTxt == "" {
 		return byteRange{}, false // suffix ranges ("-500") are not worth handling
 	}
-	start, err := strconv.ParseInt(startTxt, 10, 64)
-	if err != nil || start < 0 {
+	start, ok := parseASCIIDigits(startTxt)
+	if !ok {
 		return byteRange{}, false
 	}
 	if endTxt == "" {
 		return byteRange{start: start, end: -1}, true
 	}
-	end, err := strconv.ParseInt(endTxt, 10, 64)
-	if err != nil || end < start {
+	end, ok := parseASCIIDigits(endTxt)
+	if !ok || end < start {
 		return byteRange{}, false
 	}
 	return byteRange{start: start, end: end}, true
@@ -125,18 +125,18 @@ func parseLegacyRequestRange(values []string) (legacyRangeRequest, bool, bool) {
 	if len(values) != 1 {
 		return legacyRangeRequest{}, true, false
 	}
-	raw := strings.TrimSpace(values[0])
+	raw := trimHTTPOWS(values[0])
 	lower := strings.ToLower(raw)
 	if !strings.HasPrefix(lower, "bytes=") {
 		return legacyRangeRequest{}, true, false
 	}
-	spec := strings.TrimSpace(raw[len("bytes="):])
+	spec := raw[len("bytes="):]
 	if spec == "" || strings.Contains(spec, ",") {
 		return legacyRangeRequest{}, true, false
 	}
 	if strings.HasPrefix(spec, "-") {
-		suffix, err := strconv.ParseInt(strings.TrimSpace(spec[1:]), 10, 64)
-		if err != nil || suffix <= 0 {
+		suffix, ok := parseASCIIDigits(spec[1:])
+		if !ok || suffix <= 0 {
 			return legacyRangeRequest{}, true, false
 		}
 		return legacyRangeRequest{suffix: suffix}, true, true
@@ -154,34 +154,57 @@ func parseLegacyRequestRange(values []string) (legacyRangeRequest, bool, bool) {
 // parseContentRange parses a "bytes 0-99/4122738" response header. A total of
 // "*" is reported as -1.
 func parseContentRange(v string) (start, end, total int64, ok bool) {
-	v = strings.TrimSpace(v)
+	v = trimHTTPOWS(v)
 	if !strings.HasPrefix(strings.ToLower(v), "bytes ") {
 		return 0, 0, 0, false
 	}
-	spec := strings.TrimSpace(v[len("bytes "):])
+	spec := v[len("bytes "):]
 	slash := strings.LastIndex(spec, "/")
 	if slash < 0 {
 		return 0, 0, 0, false
 	}
-	spanTxt, totalTxt := spec[:slash], strings.TrimSpace(spec[slash+1:])
+	spanTxt, totalTxt := spec[:slash], spec[slash+1:]
 	dash := strings.Index(spanTxt, "-")
 	if dash < 0 {
 		return 0, 0, 0, false
 	}
-	start, err1 := strconv.ParseInt(strings.TrimSpace(spanTxt[:dash]), 10, 64)
-	end, err2 := strconv.ParseInt(strings.TrimSpace(spanTxt[dash+1:]), 10, 64)
-	if err1 != nil || err2 != nil || start > end {
+	start, ok = parseASCIIDigits(spanTxt[:dash])
+	if !ok {
+		return 0, 0, 0, false
+	}
+	end, ok = parseASCIIDigits(spanTxt[dash+1:])
+	if !ok || start > end {
 		return 0, 0, 0, false
 	}
 	total = -1
 	if totalTxt != "*" {
-		t, err := strconv.ParseInt(totalTxt, 10, 64)
-		if err != nil {
+		total, ok = parseASCIIDigits(totalTxt)
+		if !ok {
 			return 0, 0, 0, false
 		}
-		total = t
 	}
 	return start, end, total, true
+}
+
+// trimHTTPOWS removes only the optional whitespace allowed at the outer edge
+// of an HTTP field value. Whitespace inside a range's grammar is not optional.
+func trimHTTPOWS(v string) string {
+	return strings.Trim(v, " \t")
+}
+
+// parseASCIIDigits accepts a non-empty sequence of ASCII decimal digits and
+// reports overflow as invalid. strconv alone would also accept leading signs.
+func parseASCIIDigits(v string) (int64, bool) {
+	if v == "" {
+		return 0, false
+	}
+	for i := 0; i < len(v); i++ {
+		if v[i] < '0' || v[i] > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	return n, err == nil
 }
 
 // capsHas reports whether a client capability list ("hevc,av1") contains a name.
@@ -300,6 +323,13 @@ func proxyRemoteVia(w http.ResponseWriter, r *http.Request, target string, heade
 		fail(w, http.StatusBadGateway, "源返回了压缩媒体响应")
 		return
 	}
+	if resp.StatusCode == http.StatusOK {
+		if _, ok := legacyProxyContentLength(resp); !ok {
+			logLegacyProxyEvent("invalid_content_length", req.URL.Hostname(), resp.StatusCode)
+			fail(w, http.StatusBadGateway, "源返回了无效的媒体响应")
+			return
+		}
+	}
 
 	// The upstream ignored the range and is sending the whole file as 200.
 	if hasRange && resp.StatusCode == http.StatusOK {
@@ -379,8 +409,22 @@ func proxyRemoteVia(w http.ResponseWriter, r *http.Request, target string, heade
 			fail(w, http.StatusBadGateway, "源返回了不一致的分段响应")
 			return
 		}
-		total, ok := legacyProxyUnsatisfiableTotal(resp)
-		if !ok {
+		contentRangeValues := resp.Header.Values("Content-Range")
+		if len(contentRangeValues) > 1 {
+			logLegacyProxyEvent("unusable_content_range", req.URL.Hostname(), resp.StatusCode)
+			fail(w, http.StatusBadGateway, "源返回了不一致的分段响应")
+			return
+		}
+		var total int64
+		var ok bool
+		if len(contentRangeValues) == 1 {
+			total, ok = parseUnsatisfiedByteContentRange(contentRangeValues[0])
+			if !ok {
+				logLegacyProxyEvent("unusable_content_range", req.URL.Hostname(), resp.StatusCode)
+				fail(w, http.StatusBadGateway, "源返回了不一致的分段响应")
+				return
+			}
+		} else {
 			total, _, ok = probeSizeByRange(ctx, target, headers, baseClient)
 		}
 		if !ok {
@@ -663,16 +707,23 @@ func legacyProxyUnsatisfiableTotal(resp *http.Response) (int64, bool) {
 	if len(values) != 1 {
 		return 0, false
 	}
-	value := strings.TrimSpace(values[0])
-	if !strings.HasPrefix(strings.ToLower(value), "bytes */") {
+	return parseUnsatisfiedByteContentRange(values[0])
+}
+
+// parseUnsatisfiedByteContentRange parses the Content-Range form used on a 416
+// response: "bytes */complete-length". The header itself is optional at the
+// HTTP level, but when present it must follow this grammar exactly.
+func parseUnsatisfiedByteContentRange(v string) (int64, bool) {
+	v = trimHTTPOWS(v)
+	const prefix = "bytes "
+	if !strings.HasPrefix(strings.ToLower(v), prefix) {
 		return 0, false
 	}
-	total, err := strconv.ParseInt(
-		strings.TrimSpace(value[len("bytes */"):]), 10, 64)
-	if err != nil || total < 0 {
+	spec := v[len(prefix):]
+	if !strings.HasPrefix(spec, "*/") {
 		return 0, false
 	}
-	return total, true
+	return parseASCIIDigits(spec[len("*/"):])
 }
 
 // legacyProxyContentLength returns -1 when the length is unknown. A malformed
@@ -687,9 +738,9 @@ func legacyProxyContentLength(resp *http.Response) (int64, bool) {
 	}
 	length := int64(-1)
 	if len(values) == 1 {
-		value := strings.TrimSpace(values[0])
-		n, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || n < 0 {
+		value := trimHTTPOWS(values[0])
+		n, ok := parseASCIIDigits(value)
+		if !ok {
 			return -1, false
 		}
 		length = n

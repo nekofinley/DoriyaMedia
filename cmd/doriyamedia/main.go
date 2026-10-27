@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"doriyamedia/internal/api"
 	"doriyamedia/internal/config"
@@ -49,6 +50,11 @@ func main() {
 	store, err := db.Open(cfg.DBPath())
 	if err != nil {
 		log.Fatalf("open db: %v", err)
+	}
+	// Probe workers are process-local. Converge any leftovers before serving so
+	// clients see a terminal state instead of a five-minute false "probing".
+	if _, err := store.FailInterruptedPlaybackProbes(time.Now().UTC()); err != nil {
+		log.Fatal("recover interrupted playback probes failed")
 	}
 
 	engine := media.NewEngine(store, cfg)

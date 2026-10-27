@@ -377,6 +377,190 @@ func TestPlaybackSubtitleSessionBindingAuthorizationAndTTL(t *testing.T) {
 	}
 }
 
+func TestPlaybackSubtitleSessionSupportsDirectDASHAndTransportRevocation(t *testing.T) {
+	store := openPlaybackTestStore(t)
+	now := time.Date(2026, 10, 27, 10, 0, 0, 0, time.UTC)
+	fixture := addPlaybackTestFixture(
+		t, store, "subtitle-direct-dash", "subtitle-direct-dash", now)
+	subtitleID := addPlaybackSubtitle(
+		t, store, fixture.fileID, "/subtitle-direct-dash/caption.srt",
+		"subrip", false, 0)
+	ticket, err := store.CreatePlaybackTicket(models.PlaybackTicketRequest{
+		UserID: fixture.user.ID, DeviceID: fixture.device.ID, FileID: fixture.fileID,
+		CandidateTransports: []string{models.PlaybackTransportDirectDASH},
+	}, now)
+	if err != nil {
+		t.Fatalf("create direct-dash ticket: %v", err)
+	}
+	ready, err := store.FinishPlaybackTicketProbe(
+		fixture.bindingWith(ticket.TicketID),
+		ticket.Version,
+		models.PlaybackTicketProbeResult{
+			State:               models.PlaybackTicketReady,
+			CandidateTransports: []string{models.PlaybackTransportDirectDASH},
+			SubtitleIDs:         []int64{subtitleID},
+			VideoIndex:          playbackVideoIndexPtr(0),
+		},
+		now.Add(time.Second),
+	)
+	if err != nil {
+		t.Fatalf("finish direct-dash ticket probe: %v", err)
+	}
+	claimed := claimPlaybackTransport(
+		t, store, fixture, ready, models.PlaybackTransportDirectDASH, now.Add(2*time.Second))
+
+	grant, err := store.CreatePlaybackSubtitleSession(
+		models.PlaybackSubtitleSessionRequest{
+			Ticket:       playbackSubtitleTicketBinding(claimed),
+			Transport:    models.PlaybackTransportDirectDASH,
+			SubtitleID:   subtitleID,
+			StartSeconds: 3.5,
+		},
+		now.Add(3*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("create direct-dash subtitle session: %v", err)
+	}
+	access, err := store.AuthorizePlaybackSubtitleSession(
+		grant.Capability, false, now.Add(4*time.Second))
+	if err != nil {
+		t.Fatalf("authorize direct-dash subtitle session: %v", err)
+	}
+	if access.Session.Transport != models.PlaybackTransportDirectDASH ||
+		access.Session.StartSeconds != 3.5 {
+		t.Fatalf("direct-dash subtitle access = %+v", access.Session)
+	}
+
+	revoked, err := store.RevokePlaybackSubtitleSessionsForTransport(
+		models.PlaybackTransportDirectDASH, now.Add(5*time.Second))
+	if err != nil || revoked != 1 {
+		t.Fatalf("revoke direct-dash subtitle sessions = %d, %v; want 1, nil",
+			revoked, err)
+	}
+	if _, err := store.AuthorizePlaybackSubtitleSession(
+		grant.Capability, false, now.Add(6*time.Second)); !errors.Is(
+		err, ErrPlaybackSubtitleSessionRevoked) {
+		t.Fatalf("revoked direct-dash subtitle authorization error = %v", err)
+	}
+
+	ticketGrant, err := store.CreatePlaybackSubtitleSession(
+		models.PlaybackSubtitleSessionRequest{
+			Ticket:       playbackSubtitleTicketBinding(claimed),
+			Transport:    models.PlaybackTransportDirectDASH,
+			SubtitleID:   subtitleID,
+			StartSeconds: 0,
+		},
+		now.Add(7*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("create second direct-dash subtitle session: %v", err)
+	}
+	revoked, err = store.RevokePlaybackSubtitleSessionsForTicket(
+		playbackSubtitleTicketBinding(claimed),
+		models.PlaybackTransportDirectDASH,
+		now.Add(8*time.Second),
+	)
+	if err != nil || revoked != 1 {
+		t.Fatalf("ticket-scoped direct-dash subtitle cleanup = %d, %v; want 1, nil",
+			revoked, err)
+	}
+	if _, err := store.AuthorizePlaybackSubtitleSession(
+		ticketGrant.Capability, false, now.Add(9*time.Second)); !errors.Is(
+		err, ErrPlaybackSubtitleSessionRevoked) {
+		t.Fatalf("ticket-cleaned direct-dash subtitle error = %v", err)
+	}
+}
+
+func TestPlaybackSubtitleSessionInvalidatedAfterTransportFallback(t *testing.T) {
+	store := openPlaybackTestStore(t)
+	now := time.Date(2026, 10, 27, 10, 30, 0, 0, time.UTC)
+	fixture := addPlaybackTestFixture(
+		t, store, "subtitle-dash-fallback", "subtitle-dash-fallback", now)
+	subtitleID := addPlaybackSubtitle(
+		t, store, fixture.fileID, "/subtitle-dash-fallback/caption.srt",
+		"subrip", false, 0)
+	candidates := []string{
+		models.PlaybackTransportDirectDASH,
+		models.PlaybackTransportServerHLS,
+	}
+	ticket, err := store.CreatePlaybackTicket(models.PlaybackTicketRequest{
+		UserID: fixture.user.ID, DeviceID: fixture.device.ID, FileID: fixture.fileID,
+		CandidateTransports: candidates,
+	}, now)
+	if err != nil {
+		t.Fatalf("create fallback ticket: %v", err)
+	}
+	ready, err := store.FinishPlaybackTicketProbe(
+		fixture.bindingWith(ticket.TicketID),
+		ticket.Version,
+		models.PlaybackTicketProbeResult{
+			State:               models.PlaybackTicketReady,
+			CandidateTransports: candidates,
+			SubtitleIDs:         []int64{subtitleID},
+			VideoIndex:          playbackVideoIndexPtr(0),
+		},
+		now.Add(time.Second),
+	)
+	if err != nil {
+		t.Fatalf("finish fallback ticket probe: %v", err)
+	}
+	direct := claimPlaybackTransport(
+		t, store, fixture, ready, models.PlaybackTransportDirectDASH,
+		now.Add(2*time.Second))
+	directGrant, err := store.CreatePlaybackSubtitleSession(
+		models.PlaybackSubtitleSessionRequest{
+			Ticket:       playbackSubtitleTicketBinding(direct),
+			Transport:    models.PlaybackTransportDirectDASH,
+			SubtitleID:   subtitleID,
+			StartSeconds: 0,
+		},
+		now.Add(3*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("create direct-dash subtitle session: %v", err)
+	}
+
+	if err := store.ReleasePlaybackTransportClaim(
+		context.Background(), playbackSubtitleTicketBinding(direct),
+		direct.Version, models.PlaybackTransportDirectDASH, direct.ClaimToken,
+		now.Add(4*time.Second)); err != nil {
+		t.Fatalf("release direct-dash claim: %v", err)
+	}
+	reloaded, err := store.PlaybackTicketByID(
+		playbackSubtitleTicketBinding(direct), now.Add(4*time.Second))
+	if err != nil {
+		t.Fatalf("reload fallback ticket: %v", err)
+	}
+	fallback := claimPlaybackTransport(
+		t, store, fixture, reloaded, models.PlaybackTransportServerHLS,
+		now.Add(5*time.Second))
+	if fallback.SelectedTransport != models.PlaybackTransportServerHLS {
+		t.Fatalf("fallback transport = %q, want server-hls", fallback.SelectedTransport)
+	}
+
+	if _, err := store.AuthorizePlaybackSubtitleSession(
+		directGrant.Capability, false, now.Add(6*time.Second)); !errors.Is(
+		err, ErrPlaybackSubtitleSessionNotFound) {
+		t.Fatalf("stale direct-dash subtitle authorization error = %v", err)
+	}
+	hlsGrant, err := store.CreatePlaybackSubtitleSession(
+		models.PlaybackSubtitleSessionRequest{
+			Ticket:       playbackSubtitleTicketBinding(fallback),
+			Transport:    models.PlaybackTransportServerHLS,
+			SubtitleID:   subtitleID,
+			StartSeconds: 0,
+		},
+		now.Add(6*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("create server-hls subtitle session after fallback: %v", err)
+	}
+	if _, err := store.AuthorizePlaybackSubtitleSession(
+		hlsGrant.Capability, false, now.Add(7*time.Second)); err != nil {
+		t.Fatalf("authorize server-hls subtitle session after fallback: %v", err)
+	}
+}
+
 func TestPlaybackSubtitleSessionFailsClosedOnRevocationAndCascade(t *testing.T) {
 	store := openPlaybackTestStore(t)
 	now := time.Date(2026, 10, 26, 20, 0, 0, 0, time.UTC)

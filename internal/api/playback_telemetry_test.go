@@ -509,6 +509,9 @@ func TestPlaybackFailureStageMatrix(t *testing.T) {
 }
 
 func TestPlaybackTelemetryDimensionsUseIndependentFixedEnums(t *testing.T) {
+	if got := safePlaybackTelemetryTransport("direct-dash"); got != "direct-dash" {
+		t.Fatalf("transport sanitizer rejected direct-dash: %q", got)
+	}
 	if got := safePlaybackTelemetryTransport("success"); got != "unknown" {
 		t.Fatalf("transport sanitizer accepted an outcome value: %q", got)
 	}

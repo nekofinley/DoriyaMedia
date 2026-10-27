@@ -697,6 +697,35 @@ func TestPlaybackSecurityAllowsExactLANSourcesAndPreservesRange(t *testing.T) {
 	}
 }
 
+func TestPlaybackSecurityLocalIfRangeRequiresCurrentFileVersionETag(t *testing.T) {
+	const etag = `"a-1-2-3"`
+	tests := []struct {
+		name    string
+		raw     string
+		etag    string
+		matches bool
+	}{
+		{name: "matching strong ETag", raw: etag, etag: etag, matches: true},
+		{name: "stale strong ETag", raw: `"old"`, etag: etag},
+		{name: "weak ETag", raw: "W/" + etag, etag: etag},
+		{
+			name: "modification date",
+			raw:  time.Unix(1_700_000_000, 0).UTC().Format(http.TimeFormat),
+			etag: etag,
+		},
+		{name: "no reliable file version", raw: etag},
+		{name: "malformed ETag", raw: `"a-1-2-3"junk`, etag: etag},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := v1LocalIfRangeMatches(tc.raw, tc.etag); got != tc.matches {
+				t.Fatalf("v1LocalIfRangeMatches(%q, %q) = %v, want %v",
+					tc.raw, tc.etag, got, tc.matches)
+			}
+		})
+	}
+}
+
 func TestPlaybackSecuritySourceBridgeReceivesValidatedIP(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -740,6 +769,197 @@ func TestPlaybackSecuritySourceBridgeReceivesValidatedIP(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for source bridge request")
+	}
+}
+
+func TestPlaybackSecurityServerProxyConfiguresPhaseTimeouts(t *testing.T) {
+	lookup := playbackSecurityLookup(t, map[string][]string{
+		"media.example": {"203.0.113.71"},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := v1PlaybackProxyClientWithLookup(
+		ctx, "https://media.example/video.mp4", "", nil, lookup)
+	if err != nil {
+		t.Fatalf("create playback proxy client: %v", err)
+	}
+	transport, ok := client.Transport.(*v1PlaybackSchemeTransport)
+	if !ok || transport.base == nil {
+		t.Fatalf("transport = %T, want *v1PlaybackSchemeTransport", client.Transport)
+	}
+	if got := transport.base.TLSHandshakeTimeout; got != v1PlaybackTLSHandshakeTimeout {
+		t.Errorf("TLSHandshakeTimeout = %s, want %s",
+			got, v1PlaybackTLSHandshakeTimeout)
+	}
+	if got := transport.base.ResponseHeaderTimeout; got != v1PlaybackResponseHeaderTimeout {
+		t.Errorf("ResponseHeaderTimeout = %s, want %s",
+			got, v1PlaybackResponseHeaderTimeout)
+	}
+	if client.Timeout != 0 {
+		t.Errorf("total client timeout = %s, want no total timeout", client.Timeout)
+	}
+}
+
+func TestPlaybackSecurityServerProxySilentSourceHonorsContext(t *testing.T) {
+	for _, scheme := range []string{"http", "https"} {
+		t.Run(scheme, func(t *testing.T) {
+			listener := newPlaybackSecuritySilentListener(t)
+			_, port, err := net.SplitHostPort(listener.Addr().String())
+			if err != nil {
+				t.Fatalf("split silent listener address: %v", err)
+			}
+			lookup, dial := playbackSecurityPublicNetwork(t, map[string]string{
+				"silent.example": "http://" + listener.Addr().String(),
+			})
+			target := scheme + "://silent.example:" + port + "/video.mp4"
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			client, err := v1PlaybackProxyClientForDriverWithLookupAndDial(
+				ctx, target, "", nil, nil, lookup, dial)
+			if err != nil {
+				t.Fatalf("create playback proxy client: %v", err)
+			}
+			t.Cleanup(client.CloseIdleConnections)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+			if err != nil {
+				t.Fatalf("new silent source request: %v", err)
+			}
+
+			result := make(chan error, 1)
+			started := time.Now()
+			go func() {
+				resp, err := client.Do(req)
+				if resp != nil && resp.Body != nil {
+					_ = resp.Body.Close()
+				}
+				result <- err
+			}()
+
+			select {
+			case err := <-result:
+				if err == nil {
+					t.Fatal("silent source request unexpectedly succeeded")
+				}
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("silent source error = %v, want context deadline", err)
+				}
+				if elapsed := time.Since(started); elapsed > time.Second {
+					t.Fatalf("silent source request took %s, want less than 1s", elapsed)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("silent source request did not return within 1s")
+			}
+		})
+	}
+}
+
+func TestPlaybackSecurityBridgeConnectHonorsContext(t *testing.T) {
+	clientConn, proxyConn := net.Pipe()
+	stopProxy := make(chan struct{})
+	t.Cleanup(func() {
+		close(stopProxy)
+		_ = clientConn.Close()
+		_ = proxyConn.Close()
+	})
+	requestRead := make(chan error, 1)
+	go func() {
+		_, err := http.ReadRequest(bufio.NewReader(proxyConn))
+		requestRead <- err
+		<-stopProxy
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	started := time.Now()
+	go func() {
+		_, err := v1PlaybackDialHTTPProxy(
+			ctx, &url.URL{Scheme: "http"}, "proxy.test:8080",
+			"203.0.113.72:443",
+			func(context.Context, string, string) (net.Conn, error) {
+				return clientConn, nil
+			})
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("silent CONNECT error = %v, want context deadline", err)
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("silent CONNECT took %s, want less than 1s", elapsed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("silent CONNECT did not return within 1s")
+	}
+	select {
+	case err := <-requestRead:
+		if err != nil {
+			t.Fatalf("read CONNECT request: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("source bridge did not receive the CONNECT request")
+	}
+}
+
+func TestPlaybackSecurityBridgeConnectClearsHandshakeDeadline(t *testing.T) {
+	clientConn, proxyConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = clientConn.Close()
+		_ = proxyConn.Close()
+	})
+	proxyResult := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReader(proxyConn)
+		if _, err := http.ReadRequest(reader); err != nil {
+			proxyResult <- err
+			return
+		}
+		if _, err := io.WriteString(proxyConn,
+			"HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+			proxyResult <- err
+			return
+		}
+		var payload [1]byte
+		_, err := io.ReadFull(proxyConn, payload[:])
+		proxyResult <- err
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	conn, err := v1PlaybackDialHTTPProxy(
+		ctx, &url.URL{Scheme: "http"}, "proxy.test:8080",
+		"203.0.113.73:443",
+		func(context.Context, string, string) (net.Conn, error) {
+			return clientConn, nil
+		})
+	if err != nil {
+		t.Fatalf("establish CONNECT tunnel: %v", err)
+	}
+	defer conn.Close()
+	time.Sleep(150 * time.Millisecond)
+
+	writeResult := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte("x"))
+		writeResult <- err
+	}()
+	select {
+	case err := <-writeResult:
+		if err != nil {
+			t.Fatalf("write after handshake context expiry: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("write after handshake context expiry did not return within 1s")
+	}
+	select {
+	case err := <-proxyResult:
+		if err != nil {
+			t.Fatalf("proxy tunnel read: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("proxy did not receive tunneled payload")
 	}
 }
 
@@ -998,6 +1218,33 @@ func playbackSecurityLookup(
 		}
 		return ips, nil
 	}
+}
+
+func newPlaybackSecuritySilentListener(t *testing.T) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for silent source: %v", err)
+	}
+	accepted := make(chan net.Conn, 1)
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		conn, err := listener.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		<-acceptDone
+		select {
+		case conn := <-accepted:
+			_ = conn.Close()
+		default:
+		}
+	})
+	return listener
 }
 
 func receivePlaybackSecurityHeaders(t *testing.T, headers <-chan http.Header) http.Header {

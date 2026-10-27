@@ -501,6 +501,118 @@ func TestEgressProxyRoutesCrossOriginThroughSourceBridge(t *testing.T) {
 	}
 }
 
+func TestEgressSourceBridgeConnectHonorsContext(t *testing.T) {
+	clientConn, proxyConn := net.Pipe()
+	stopProxy := make(chan struct{})
+	t.Cleanup(func() {
+		close(stopProxy)
+		_ = clientConn.Close()
+		_ = proxyConn.Close()
+	})
+	requestRead := make(chan error, 1)
+	go func() {
+		_, err := http.ReadRequest(bufio.NewReader(proxyConn))
+		requestRead <- err
+		<-stopProxy
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	started := time.Now()
+	go func() {
+		_, err := dialHTTPProxyBridge(
+			ctx,
+			&url.URL{Scheme: "http", Host: "proxy.test:8080"},
+			"203.0.113.74:443",
+			func(context.Context, string, string) (net.Conn, error) {
+				return clientConn, nil
+			})
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("silent CONNECT error = %v, want context deadline", err)
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("silent CONNECT took %s, want less than 1s", elapsed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("silent CONNECT did not return within 1s")
+	}
+	select {
+	case err := <-requestRead:
+		if err != nil {
+			t.Fatalf("read CONNECT request: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("source bridge did not receive the CONNECT request")
+	}
+}
+
+func TestEgressSourceBridgeConnectClearsHandshakeDeadline(t *testing.T) {
+	clientConn, proxyConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = clientConn.Close()
+		_ = proxyConn.Close()
+	})
+	proxyResult := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReader(proxyConn)
+		if _, err := http.ReadRequest(reader); err != nil {
+			proxyResult <- err
+			return
+		}
+		if _, err := io.WriteString(proxyConn,
+			"HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+			proxyResult <- err
+			return
+		}
+		var payload [1]byte
+		_, err := io.ReadFull(proxyConn, payload[:])
+		proxyResult <- err
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	conn, err := dialHTTPProxyBridge(
+		ctx,
+		&url.URL{Scheme: "http", Host: "proxy.test:8080"},
+		"203.0.113.75:443",
+		func(context.Context, string, string) (net.Conn, error) {
+			return clientConn, nil
+		})
+	if err != nil {
+		t.Fatalf("establish CONNECT tunnel: %v", err)
+	}
+	defer conn.Close()
+	time.Sleep(150 * time.Millisecond)
+
+	writeResult := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte("x"))
+		writeResult <- err
+	}()
+	select {
+	case err := <-writeResult:
+		if err != nil {
+			t.Fatalf("write after handshake context expiry: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("write after handshake context expiry did not return within 1s")
+	}
+	select {
+	case err := <-proxyResult:
+		if err != nil {
+			t.Fatalf("proxy tunnel read: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("proxy did not receive tunneled payload")
+	}
+}
+
 func TestEgressTrustRequiresExactSchemeHostAndPort(t *testing.T) {
 	trust := newEgressTrust()
 	trust.addURL("https://nas.example:8443/dav")

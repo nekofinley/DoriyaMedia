@@ -325,7 +325,8 @@ func (e *Engine) alignInputs(ctx context.Context, file *models.MediaFile, inputs
 	e.keyMu.Unlock()
 
 	video := inputs[0]
-	found, err := e.prober.keyframeWindowAtOrBefore(ctx, video.Target, video.Headers, video.Proxy, pos, keyframeSearchWindow)
+	found, err := e.currentProber().keyframeWindowAtOrBefore(
+		ctx, video.Target, video.Headers, video.Proxy, pos, keyframeSearchWindow)
 	if err != nil {
 		log.Printf("keyframe alignment for file %d at %.1fs: %s",
 			file.ID, pos, safeMediaLogError(err))

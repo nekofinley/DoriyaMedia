@@ -14,7 +14,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,9 +155,21 @@ func playbackSubtitleRawRequest(
 	method, target string,
 ) (*http.Response, []byte) {
 	t.Helper()
+	return playbackSubtitleRawRequestWithHeaders(t, method, target, nil)
+}
+
+func playbackSubtitleRawRequestWithHeaders(
+	t *testing.T,
+	method, target string,
+	headers map[string]string,
+) (*http.Response, []byte) {
+	t.Helper()
 	req, err := http.NewRequest(method, target, nil)
 	if err != nil {
 		t.Fatalf("new subtitle request: %v", err)
+	}
+	for name, value := range headers {
+		req.Header.Set(name, value)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -204,9 +218,75 @@ func playbackSubtitleCapabilityFromURL(
 	return ""
 }
 
+func playbackSubtitleTextURL(
+	t *testing.T,
+	transport map[string]any,
+) string {
+	t.Helper()
+	for _, subtitle := range playbackSubtitleObjects(t, transport) {
+		if subtitle["format"] != "vtt" {
+			continue
+		}
+		rawURL, _ := subtitle["url"].(string)
+		if rawURL != "" {
+			return rawURL
+		}
+	}
+	t.Fatal("issued transport has no text subtitle URL")
+	return ""
+}
+
 func hashPlaybackCapabilityForTest(capability string) string {
 	sum := sha256.Sum256([]byte(capability))
 	return hex.EncodeToString(sum[:])
+}
+
+func assertV1SubtitleMediaResponseLog(
+	t *testing.T,
+	output, transport, outcome, failureStage string,
+	status, responseBytes int,
+) {
+	t.Helper()
+	logged := mediaResponseLogs(output)
+	for _, want := range []string{
+		"surface=v1",
+		"transport=" + transport,
+		"asset=subtitle",
+		"outcome=" + outcome,
+		"failure_stage=" + failureStage,
+		"status=" + strconv.Itoa(status),
+		"response_bytes=" + strconv.Itoa(responseBytes),
+		"server_media_bytes=0",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("v1 subtitle telemetry omits %q: %q", want, logged)
+		}
+	}
+}
+
+func assertV1SubtitleTelemetry(
+	t *testing.T,
+	transport, outcome, failureStage string,
+	responseBytes int64,
+) {
+	t.Helper()
+	snapshot := v1PlaybackTelemetryRecorder.snapshot()
+	if len(snapshot) != 1 {
+		t.Fatalf("telemetry series = %d, want 1", len(snapshot))
+	}
+	got := snapshot[0]
+	if got.Key.Surface != "v1" ||
+		got.Key.Transport != transport ||
+		got.Key.Asset != playbackAssetSubtitle ||
+		got.Key.Outcome != outcome ||
+		got.Key.FailureStage != failureStage ||
+		got.Value.ResponseBytes != responseBytes ||
+		got.Value.ServerMediaBytes != 0 {
+		t.Fatalf(
+			"v1 subtitle telemetry = %+v, want transport=%s outcome=%s stage=%s bytes=%d",
+			got, transport, outcome, failureStage, responseBytes,
+		)
+	}
 }
 
 func TestPlaybackSubtitleIssuanceConvertsTextAndKeepsPGSDescriptive(t *testing.T) {
@@ -392,6 +472,253 @@ func TestPlaybackSubtitleIssuanceConvertsTextAndKeepsPGSDescriptive(t *testing.T
 	f.server.handleV1PlaybackSubtitle(rec, forceQuery)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("ForceQuery status = %d body %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPlaybackSubtitleV1TelemetryGetAndHead(t *testing.T) {
+	tests := []struct {
+		name      string
+		transport string
+		configure func(*config.ClientFeatures)
+	}{
+		{
+			name:      "server proxy",
+			transport: models.PlaybackTransportServerProxy,
+			configure: func(features *config.ClientFeatures) {
+				features.ServerProxyV1Enabled = true
+			},
+		},
+		{
+			name:      "server hls embedded rendition",
+			transport: models.PlaybackTransportServerHLS,
+			configure: func(features *config.ClientFeatures) {
+				features.ServerHLSV1Enabled = true
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := capturePlaybackSecurityLogs(t)
+			v1PlaybackTelemetryRecorder.reset()
+			t.Cleanup(v1PlaybackTelemetryRecorder.reset)
+
+			f := newPlaybackAPIFixture(t)
+			f.server.Cfg.Client = config.ClientFeatures{
+				V1Enabled:             true,
+				DeviceAuthEnabled:     true,
+				PlaybackTicketEnabled: true,
+			}
+			tc.configure(&f.server.Cfg.Client)
+			fileID, sourceRoot := seedPlaybackSubtitleLocalFile(
+				t, f.server.Store, playbackSubtitleProbe,
+				map[string]string{"episode.srt": playbackSubtitleSRT},
+			)
+			create := f.call(t, http.MethodPost, "/api/v1/playback/tickets",
+				playbackCreateBody(fileID, f.deviceID, tc.transport))
+			if create.Status != http.StatusCreated {
+				t.Fatalf("create subtitle ticket = %d body %s",
+					create.Status, create.Body)
+			}
+			transport := v1ObjectField(t, create.JSON, "transport")
+			if transport["kind"] != tc.transport {
+				t.Fatalf("ticket transport = %v, want %s",
+					transport["kind"], tc.transport)
+			}
+			rawURL := playbackSubtitleTextURL(t, transport)
+			target := playbackSubtitleTestURL(t, f, rawURL)
+			capability := playbackSubtitleCapabilityFromURL(
+				t, target, "subtitle-sessions")
+			headerCanary := "v1-subtitle-get-header-canary"
+
+			logs.Reset()
+			resp, body := playbackSubtitleRawRequestWithHeaders(
+				t, http.MethodGet, target,
+				map[string]string{"Authorization": "Bearer " + headerCanary},
+			)
+			if resp.StatusCode != http.StatusOK ||
+				!bytes.HasPrefix(body, []byte("WEBVTT")) {
+				t.Fatalf("subtitle GET = %d body %q", resp.StatusCode, body)
+			}
+			assertV1SubtitleTelemetry(
+				t, tc.transport, "success", playbackFailureStageComplete,
+				int64(len(body)),
+			)
+			assertV1SubtitleMediaResponseLog(
+				t, logs.String(), tc.transport, "success",
+				playbackFailureStageComplete, http.StatusOK, len(body),
+			)
+			logged := logs.String()
+			telemetryLog := mediaResponseLogs(logged)
+			for _, secret := range []string{
+				sourceRoot, capability, headerCanary, "episode.srt",
+			} {
+				if strings.Contains(logged, secret) {
+					t.Errorf("subtitle GET telemetry leaked %q: %q",
+						secret, logged)
+				}
+			}
+			if !strings.Contains(telemetryLog, "asset=subtitle") {
+				t.Errorf("subtitle GET has no media_response telemetry: %q", logged)
+			}
+
+			v1PlaybackTelemetryRecorder.reset()
+			logs.Reset()
+			headResp, headBody := playbackSubtitleRawRequestWithHeaders(
+				t, http.MethodHead, target,
+				map[string]string{"Authorization": "Bearer " + headerCanary},
+			)
+			if headResp.StatusCode != http.StatusOK || len(headBody) != 0 {
+				t.Fatalf("subtitle HEAD = %d body %q",
+					headResp.StatusCode, headBody)
+			}
+			assertV1SubtitleTelemetry(
+				t, tc.transport, "success", playbackFailureStageComplete, 0,
+			)
+			assertV1SubtitleMediaResponseLog(
+				t, logs.String(), tc.transport, "success",
+				playbackFailureStageComplete, http.StatusOK, 0,
+			)
+			if strings.Contains(logs.String(), capability) {
+				t.Errorf("subtitle HEAD telemetry leaked capability: %q",
+					logs.String())
+			}
+		})
+	}
+}
+
+func TestPlaybackSubtitleV1TelemetryFailureAndRedaction(t *testing.T) {
+	tests := []struct {
+		name      string
+		transport string
+		configure func(*config.ClientFeatures)
+	}{
+		{
+			name:      "server proxy",
+			transport: models.PlaybackTransportServerProxy,
+			configure: func(features *config.ClientFeatures) {
+				features.ServerProxyV1Enabled = true
+			},
+		},
+		{
+			name:      "server hls embedded rendition",
+			transport: models.PlaybackTransportServerHLS,
+			configure: func(features *config.ClientFeatures) {
+				features.ServerHLSV1Enabled = true
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			const (
+				pathCanary   = "v1-subtitle-source-path-canary"
+				headerCanary = "v1-subtitle-failure-header-canary"
+				queryCanary  = "v1-subtitle-query-canary"
+				sourceCanary = "v1-subtitle-source-query-canary"
+			)
+			logs := capturePlaybackSecurityLogs(t)
+			v1PlaybackTelemetryRecorder.reset()
+			t.Cleanup(v1PlaybackTelemetryRecorder.reset)
+
+			f := newPlaybackAPIFixture(t)
+			f.server.Cfg.Client = config.ClientFeatures{
+				V1Enabled:             true,
+				DeviceAuthEnabled:     true,
+				PlaybackTicketEnabled: true,
+			}
+			tc.configure(&f.server.Cfg.Client)
+			fileID, sourceRoot := seedPlaybackSubtitleLocalFile(
+				t, f.server.Store, playbackSubtitleProbe,
+				map[string]string{"episode.srt": playbackSubtitleSRT},
+			)
+			create := f.call(t, http.MethodPost, "/api/v1/playback/tickets",
+				playbackCreateBody(fileID, f.deviceID, tc.transport))
+			if create.Status != http.StatusCreated {
+				t.Fatalf("create subtitle ticket = %d body %s",
+					create.Status, create.Body)
+			}
+			transport := v1ObjectField(t, create.JSON, "transport")
+			target := playbackSubtitleTestURL(
+				t, f, playbackSubtitleTextURL(t, transport))
+			capability := playbackSubtitleCapabilityFromURL(
+				t, target, "subtitle-sessions")
+			if _, err := f.server.Store.DB.Exec(`UPDATE subtitles
+				SET path = ?
+				WHERE file_id = ?`,
+				"/media/"+pathCanary+".srt?token="+sourceCanary, fileID,
+			); err != nil {
+				t.Fatalf("make subtitle source unavailable: %v", err)
+			}
+
+			for _, method := range []string{http.MethodGet, http.MethodHead} {
+				v1PlaybackTelemetryRecorder.reset()
+				logs.Reset()
+				resp, body := playbackSubtitleRawRequestWithHeaders(
+					t, method, target,
+					map[string]string{"Authorization": "Bearer " + headerCanary},
+				)
+				if resp.StatusCode != http.StatusBadGateway {
+					t.Fatalf("subtitle %s status = %d body %s",
+						method, resp.StatusCode, body)
+				}
+				if method == http.MethodHead && len(body) != 0 {
+					t.Fatalf("subtitle HEAD body = %q, want empty", body)
+				}
+				wantBytes := int64(len(body))
+				assertV1SubtitleTelemetry(
+					t, tc.transport, "error",
+					playbackFailureStageSource, wantBytes,
+				)
+				assertV1SubtitleMediaResponseLog(
+					t, logs.String(), tc.transport, "error",
+					playbackFailureStageSource, http.StatusBadGateway,
+					int(wantBytes),
+				)
+				logged := logs.String()
+				for _, secret := range []string{
+					sourceRoot, pathCanary, sourceCanary, capability,
+					headerCanary, "episode.srt",
+				} {
+					if strings.Contains(logged, secret) {
+						t.Errorf("subtitle %s telemetry leaked %q: %q",
+							method, secret, logged)
+					}
+				}
+			}
+
+			// A non-nested flat route cannot resolve its transport before
+			// authorization. Use the nested HLS route to verify request-stage
+			// telemetry is still fixed and query/header-safe.
+			if tc.transport == models.PlaybackTransportServerHLS {
+				v1PlaybackTelemetryRecorder.reset()
+				logs.Reset()
+				resp, body := playbackSubtitleRawRequestWithHeaders(
+					t, http.MethodGet, target+"?token="+queryCanary,
+					map[string]string{"Authorization": "Bearer " + headerCanary},
+				)
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Fatalf("tampered HLS subtitle = %d body %s",
+						resp.StatusCode, body)
+				}
+				assertV1SubtitleTelemetry(
+					t, models.PlaybackTransportServerHLS, "error",
+					playbackFailureStageRequest, int64(len(body)),
+				)
+				assertV1SubtitleMediaResponseLog(
+					t, logs.String(), models.PlaybackTransportServerHLS, "error",
+					playbackFailureStageRequest, http.StatusBadRequest, len(body),
+				)
+				logged := logs.String()
+				for _, secret := range []string{
+					sourceRoot, pathCanary, sourceCanary, capability,
+					headerCanary, queryCanary,
+				} {
+					if strings.Contains(logged, secret) {
+						t.Errorf("HLS query telemetry leaked %q: %q",
+							secret, logged)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -819,6 +1146,237 @@ func TestPlaybackSubtitleErrorsAndLogsDoNotExposeSourceSecrets(t *testing.T) {
 type playbackSubtitleSourceDriver struct {
 	body string
 	err  error
+}
+
+type playbackSubtitleBlockingDiscovery struct {
+	started     chan struct{}
+	release     chan struct{}
+	finished    chan struct{}
+	startOnce   sync.Once
+	releaseOnce sync.Once
+	finishOnce  sync.Once
+}
+
+func newPlaybackSubtitleBlockingDiscovery() *playbackSubtitleBlockingDiscovery {
+	return &playbackSubtitleBlockingDiscovery{
+		started: make(chan struct{}), release: make(chan struct{}),
+		finished: make(chan struct{}),
+	}
+}
+
+func (d *playbackSubtitleBlockingDiscovery) block() {
+	d.startOnce.Do(func() { close(d.started) })
+	<-d.release
+	d.finishOnce.Do(func() { close(d.finished) })
+}
+
+func (d *playbackSubtitleBlockingDiscovery) close() {
+	d.releaseOnce.Do(func() { close(d.release) })
+}
+
+type playbackSubtitleBlockingDriverBase struct {
+	discovery *playbackSubtitleBlockingDiscovery
+}
+
+func (d *playbackSubtitleBlockingDriverBase) List(
+	context.Context,
+	string,
+) ([]source.Entry, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (d *playbackSubtitleBlockingDriverBase) DirectURL(
+	context.Context,
+	string,
+) (string, map[string]string, error) {
+	return "", nil, source.ErrNoDirect
+}
+
+func (d *playbackSubtitleBlockingDriverBase) Open(
+	context.Context,
+	string,
+) (io.ReadCloser, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (d *playbackSubtitleBlockingDriverBase) ProbeURL(
+	context.Context,
+	string,
+) (string, map[string]string, error) {
+	return "", nil, source.ErrNoDirect
+}
+
+func (d *playbackSubtitleBlockingDriverBase) HasDirect() bool { return false }
+
+type playbackSubtitleBlockingSubtitleDriver struct {
+	*playbackSubtitleBlockingDriverBase
+}
+
+func (d *playbackSubtitleBlockingSubtitleDriver) Subtitles(
+	context.Context,
+	string,
+) ([]source.SubtitleTrack, error) {
+	d.discovery.block()
+	return []source.SubtitleTrack{{
+		Path: "driver:late.srt", Format: "subrip", Convertible: true,
+	}}, nil
+}
+
+func (d *playbackSubtitleBlockingSubtitleDriver) OpenSubtitle(
+	context.Context,
+	string,
+	string,
+) (io.ReadCloser, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (d *playbackSubtitleBlockingSubtitleDriver) SubtitlePathPrefix() string {
+	return "driver:"
+}
+
+type playbackSubtitleBlockingListDriver struct {
+	*playbackSubtitleBlockingDriverBase
+}
+
+func (d *playbackSubtitleBlockingListDriver) List(
+	context.Context,
+	string,
+) ([]source.Entry, error) {
+	d.discovery.block()
+	return []source.Entry{{
+		Name: "episode.srt", Path: "/media/episode.srt",
+	}}, nil
+}
+
+var (
+	_ source.Driver         = (*playbackSubtitleBlockingSubtitleDriver)(nil)
+	_ source.SubtitleSource = (*playbackSubtitleBlockingSubtitleDriver)(nil)
+	_ source.Driver         = (*playbackSubtitleBlockingListDriver)(nil)
+)
+
+func TestPrepareV1PlaybackProbeMetadataWatchdogIsBestEffort(t *testing.T) {
+	tests := []struct {
+		name   string
+		driver func(*playbackSubtitleBlockingDiscovery) source.Driver
+	}{
+		{
+			name: "subtitle source",
+			driver: func(discovery *playbackSubtitleBlockingDiscovery) source.Driver {
+				return &playbackSubtitleBlockingSubtitleDriver{
+					playbackSubtitleBlockingDriverBase: &playbackSubtitleBlockingDriverBase{
+						discovery: discovery,
+					},
+				}
+			},
+		},
+		{
+			name: "directory listing",
+			driver: func(discovery *playbackSubtitleBlockingDiscovery) source.Driver {
+				return &playbackSubtitleBlockingListDriver{
+					playbackSubtitleBlockingDriverBase: &playbackSubtitleBlockingDriverBase{
+						discovery: discovery,
+					},
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newPlaybackAPIFixture(t)
+			fileID := seedPlaybackAPIFile(
+				t, f.server.Store, "/media/episode.mkv", playbackAPITestProbe)
+			if err := f.server.Store.UpsertSubtitle(&models.Subtitle{
+				FileID: fileID, Path: "/media/existing.srt",
+				Format: "subrip", Convertible: true,
+			}); err != nil {
+				t.Fatalf("seed existing subtitle: %v", err)
+			}
+			file, err := f.server.Store.FileByID(fileID)
+			if err != nil {
+				t.Fatalf("load playback file: %v", err)
+			}
+			probe := media.ProbeFromCache(file)
+			if probe == nil {
+				t.Fatal("playback fixture has no cached probe")
+			}
+			beforeFile := *file
+			beforeSubtitles, err := f.server.Store.SubtitlesByFile(fileID)
+			if err != nil {
+				t.Fatalf("read seeded subtitles: %v", err)
+			}
+
+			discovery := newPlaybackSubtitleBlockingDiscovery()
+			t.Cleanup(discovery.close)
+			driver := tc.driver(discovery)
+			parentCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			type result struct {
+				metadata db.PlaybackTicketProbeMetadata
+				err      error
+			}
+			resultCh := make(chan result, 1)
+			go func() {
+				metadata, err := f.server.prepareV1PlaybackProbeMetadataWithTimeout(
+					parentCtx, file, driver, probe, 50*time.Millisecond)
+				resultCh <- result{metadata: metadata, err: err}
+			}()
+
+			select {
+			case <-discovery.started:
+			case <-time.After(time.Second):
+				t.Fatal("metadata discovery did not enter the blocking driver")
+			}
+			select {
+			case got := <-resultCh:
+				if got.err != nil {
+					t.Fatalf("metadata discovery error = %v, want best-effort success", got.err)
+				}
+				if err := parentCtx.Err(); err != nil {
+					t.Fatalf("parent context ended during watchdog timeout: %v", err)
+				}
+				if got.metadata.FileProbe == "" ||
+					got.metadata.FileVersion == nil ||
+					got.metadata.FileVersion.Size != file.Size ||
+					got.metadata.FileVersion.MTime != file.MTime {
+					t.Fatalf("metadata did not continue past watchdog: %+v", got.metadata)
+				}
+				if len(got.metadata.Subtitles) != 0 {
+					t.Fatalf("watchdog kept stale subtitle candidates: %+v",
+						got.metadata.Subtitles)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("metadata discovery waited for a context-ignoring driver")
+			}
+
+			// Release the abandoned driver. Its late answer must not reach the
+			// metadata result or mutate the shared probe/subtitle rows.
+			discovery.close()
+			select {
+			case <-discovery.finished:
+			case <-time.After(time.Second):
+				t.Fatal("blocking driver did not finish after release")
+			}
+			afterFile, err := f.server.Store.FileByID(fileID)
+			if err != nil {
+				t.Fatalf("reload playback file: %v", err)
+			}
+			if afterFile.Probe != beforeFile.Probe ||
+				afterFile.Size != beforeFile.Size ||
+				afterFile.MTime != beforeFile.MTime {
+				t.Fatalf("late discovery changed file metadata: before %+v after %+v",
+					beforeFile, *afterFile)
+			}
+			afterSubtitles, err := f.server.Store.SubtitlesByFile(fileID)
+			if err != nil {
+				t.Fatalf("reload subtitles: %v", err)
+			}
+			if len(afterSubtitles) != len(beforeSubtitles) ||
+				(len(afterSubtitles) == 1 && afterSubtitles[0] != beforeSubtitles[0]) {
+				t.Fatalf("late discovery changed subtitles: before %+v after %+v",
+					beforeSubtitles, afterSubtitles)
+			}
+		})
+	}
 }
 
 func (d *playbackSubtitleSourceDriver) List(context.Context, string) ([]source.Entry, error) {

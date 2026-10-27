@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"io"
-	"log"
 	"math"
 	"net/http"
 	"regexp"
@@ -35,7 +34,7 @@ var v1HLSCapabilityPattern = regexp.MustCompile(`^ms_[A-Za-z0-9_-]{22,96}$`)
 // and segment arguments can be tested without a real database or ffmpeg.
 type v1PlaybackHLSStore interface {
 	AuthorizePlaybackMediaSessionContext(context.Context, string, bool, time.Time) (*db.PlaybackMediaSessionAccess, error)
-	RevokePlaybackMediaSessionsForTransport(string, time.Time) (int64, error)
+	RevokePlaybackMediaSessionsForTransportContext(context.Context, string, time.Time) (int64, error)
 	FileByID(int64) (*models.MediaFile, error)
 }
 
@@ -259,31 +258,28 @@ func (h *v1ServerHLS) revokeTransportSessions() {
 	if h == nil || h.store == nil {
 		return
 	}
-	if _, err := h.store.RevokePlaybackMediaSessionsForTransport(
-		models.PlaybackTransportServerHLS, time.Now().UTC()); err != nil {
-		// Never log the underlying DB error: it can include source paths or
-		// connection details. The response already fails closed.
-		log.Printf("playback HLS media session cleanup failed")
-	}
-	revokeV1PlaybackSubtitleSessionsForTransport(
-		h.store, models.PlaybackTransportServerHLS)
+	ctx, cancel := context.WithTimeout(
+		context.Background(), v1PlaybackCleanupTimeout)
+	defer cancel()
+	v1PlaybackRevokeMediaSessionsForTransportContext(
+		ctx, h.store, models.PlaybackTransportServerHLS)
 }
 
 func (h *v1ServerHLS) revokeAllSessions() {
 	if h == nil || h.store == nil {
 		return
 	}
+	ctx, cancel := context.WithTimeout(
+		context.Background(), v1PlaybackCleanupTimeout)
+	defer cancel()
 	for _, transport := range []string{
 		models.PlaybackTransportServerProxy,
 		models.PlaybackTransportServerHLS,
 	} {
-		if _, err := h.store.RevokePlaybackMediaSessionsForTransport(
-			transport, time.Now().UTC()); err != nil {
-			log.Printf("playback media session cleanup failed transport=%s", transport)
-		}
-		revokeV1PlaybackSubtitleSessionsForTransport(h.store, transport)
+		v1PlaybackRevokeMediaSessionsForTransportContext(
+			ctx, h.store, transport)
 	}
-	revokeAllV1PlaybackSubtitleSessionsFromStore(h.store)
+	revokeAllV1PlaybackSubtitleSessionsContext(ctx, h.store)
 }
 
 // authorize reauthorizes and touches the media session for every playlist and
@@ -303,6 +299,10 @@ func (h *v1ServerHLS) authorize(w http.ResponseWriter, ctx context.Context, capa
 		err    error
 	)
 	for attempt := 0; attempt < attempts; attempt++ {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			writeV1HLSAuthorizeError(w, ctxErr)
+			return nil, false
+		}
 		access, err = h.store.AuthorizePlaybackMediaSessionContext(
 			ctx, capability, h.cfg.EmailVerificationRequired(), now())
 		if !errors.Is(err, db.ErrPlaybackMediaSessionConflict) {
@@ -366,6 +366,13 @@ func (h *v1ServerHLS) prepareMedia(w http.ResponseWriter, ctx context.Context, s
 
 func writeV1HLSAuthorizeError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		writeV1HLSError(w, http.StatusGatewayTimeout, V1ErrorInternal,
+			"The server could not complete the playback request in time.",
+			map[string]any{"action": "retry"})
+	case errors.Is(err, context.Canceled):
+		writeV1HLSError(w, http.StatusRequestTimeout, V1ErrorInvalidRequest,
+			"The playback request was canceled.", nil)
 	case errors.Is(err, db.ErrPlaybackMediaSessionNotFound):
 		writeV1HLSError(w, http.StatusNotFound, V1ErrorMediaSessionNotFound,
 			"The media session was not found.", map[string]any{"action": "request_new_ticket"})

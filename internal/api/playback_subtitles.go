@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -16,53 +17,202 @@ import (
 	"doriyamedia/internal/db"
 	"doriyamedia/internal/media"
 	"doriyamedia/internal/models"
+	"doriyamedia/internal/scan"
 	"doriyamedia/internal/source"
 )
 
-const v1PlaybackSubtitleMaxBytes = 8 << 20
+const (
+	v1PlaybackSubtitleMaxBytes    = 8 << 20
+	v1PlaybackSubtitleListTimeout = 5 * time.Second
+)
+
+type playbackProbeSubtitleKey struct {
+	path        string
+	streamIndex int
+}
 
 var (
 	v1PlaybackSubtitleCapabilityPattern = regexp.MustCompile(`^ss_[A-Za-z0-9_-]{22,96}$`)
 	v1PlaybackSubtitleLanguagePattern   = regexp.MustCompile(`^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$`)
 )
 
-// snapshotV1PlaybackSubtitleIDs discovers the same embedded, external, and
-// driver-published tracks the legacy player sees, then snapshots only their local
-// ids. No path, URL, title, or header is copied into ticket storage.
-func (s *Server) snapshotV1PlaybackSubtitleIDs(
+// prepareV1PlaybackProbeMetadata performs playback-ticket probe and subtitle
+// discovery as pure reads. The returned rows are committed with the ticket CAS,
+// so a revocation that lands during discovery leaves no cache side effects.
+func (s *Server) prepareV1PlaybackProbeMetadata(
 	ctx context.Context,
 	file *models.MediaFile,
 	drv source.Driver,
-) []int64 {
-	if s == nil || s.Store == nil || s.Engine == nil || file == nil || drv == nil {
-		return []int64{}
+	probe *media.Probe,
+) (db.PlaybackTicketProbeMetadata, error) {
+	return s.prepareV1PlaybackProbeMetadataWithTimeout(
+		ctx, file, drv, probe, v1PlaybackSubtitleListTimeout)
+}
+
+func (s *Server) prepareV1PlaybackProbeMetadataWithTimeout(
+	ctx context.Context,
+	file *models.MediaFile,
+	drv source.Driver,
+	probe *media.Probe,
+	listTimeout time.Duration,
+) (db.PlaybackTicketProbeMetadata, error) {
+	if s == nil || file == nil || probe == nil {
+		return db.PlaybackTicketProbeMetadata{}, errors.New(
+			"playback probe metadata unavailable")
 	}
-	seen := make(map[int64]struct{})
-	ids := make([]int64, 0, 8)
-	for _, sub := range s.discoverSubtitles(ctx, drv, file) {
-		if sub.ID <= 0 || sub.FileID != file.ID {
-			continue
-		}
+	rawProbe, err := json.Marshal(probe)
+	if err != nil {
+		return db.PlaybackTicketProbeMetadata{}, err
+	}
+	metadata := db.PlaybackTicketProbeMetadata{
+		FileProbe: string(rawProbe),
+		FileVersion: &db.PlaybackTicketFileVersion{
+			Size: file.Size, MTime: file.MTime,
+		},
+	}
+	candidates := make([]models.Subtitle, 0, 8)
+	seen := make(map[playbackProbeSubtitleKey]int, 8)
+	add := func(sub models.Subtitle) {
+		sub.FileID = file.ID
 		if _, _, ok := v1PlaybackSubtitleDescription(&sub); !ok {
-			continue
+			return
 		}
-		if _, duplicate := seen[sub.ID]; duplicate {
-			continue
+		key := playbackProbeSubtitleKey{
+			path: sub.Path, streamIndex: sub.StreamIdx,
 		}
-		seen[sub.ID] = struct{}{}
-		ids = append(ids, sub.ID)
-		if len(ids) == models.PlaybackMaxSubtitleGrants {
-			break
+		if index, duplicate := seen[key]; duplicate {
+			candidates[index] = sub
+			return
+		}
+		seen[key] = len(candidates)
+		candidates = append(candidates, sub)
+	}
+
+	if ss, ok := drv.(source.SubtitleSource); ok {
+		tracks, listErr := boundedPlaybackMetadataCall(
+			ctx, listTimeout,
+			func(callCtx context.Context) ([]source.SubtitleTrack, error) {
+				return ss.Subtitles(callCtx, file.Path)
+			},
+		)
+		if err := ctx.Err(); err != nil {
+			return db.PlaybackTicketProbeMetadata{}, err
+		}
+		// External discovery is best-effort. A list error, including this
+		// helper's own watchdog deadline, only omits external tracks; the
+		// probe-derived metadata and ticket finalization still proceed.
+		if listErr == nil {
+			for _, track := range tracks {
+				if track.Path == "" {
+					continue
+				}
+				add(models.Subtitle{
+					Path: track.Path, Lang: track.Lang, Title: track.Title,
+					Format: track.Format, Convertible: track.Convertible,
+				})
+			}
+		}
+	} else if drv != nil && !strings.HasPrefix(file.Path, "http://") &&
+		!strings.HasPrefix(file.Path, "https://") {
+		if dir, base := splitDirBase(file.Path); dir != "" && base != "" {
+			entries, listErr := boundedPlaybackMetadataCall(
+				ctx, listTimeout,
+				func(callCtx context.Context) ([]source.Entry, error) {
+					return drv.List(callCtx, dir)
+				},
+			)
+			if err := ctx.Err(); err != nil {
+				return db.PlaybackTicketProbeMetadata{}, err
+			}
+			// As with SubtitleSource, a directory-listing failure is not a
+			// reason to fail playback-ticket finalization.
+			if listErr == nil {
+				names := make([]string, len(entries))
+				for i, entry := range entries {
+					if entry.IsDir {
+						continue
+					}
+					if _, ok := subFormatOf(entry.Name); ok {
+						names[i] = entry.Name
+					}
+				}
+				attached := scan.SubtitleAttachmentIn(base, names)
+				for i, entry := range entries {
+					if !attached[i] {
+						continue
+					}
+					format, convertible := subFormatOf(entry.Name)
+					add(models.Subtitle{
+						Path: entry.Path, Lang: media.GuessLang(entry.Name),
+						Title: media.SubLabel(entry.Name), Format: format,
+						Convertible: convertible,
+					})
+				}
+			}
 		}
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	return ids
+	for _, sub := range media.EmbeddedSubtitleRows(file.ID, probe) {
+		add(sub)
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].Path != candidates[j].Path {
+			return candidates[i].Path < candidates[j].Path
+		}
+		if candidates[i].StreamIdx != candidates[j].StreamIdx {
+			return candidates[i].StreamIdx < candidates[j].StreamIdx
+		}
+		return !candidates[i].Embedded && candidates[j].Embedded
+	})
+	if len(candidates) > models.PlaybackMaxSubtitleGrants {
+		candidates = candidates[:models.PlaybackMaxSubtitleGrants]
+	}
+	metadata.Subtitles = candidates
+	return metadata, nil
+}
+
+// boundedPlaybackMetadataCall lets finalization stop waiting when a source
+// driver ignores cancellation. The driver goroutine is not forcibly stopped,
+// but it can no longer hold the ticket transaction or HTTP handler open.
+//
+// When only the internal watchdog expires, it returns context.DeadlineExceeded
+// while ctx remains live. Best-effort callers intentionally ignore that result;
+// cancellation or expiry of ctx itself is returned instead and remains fatal.
+func boundedPlaybackMetadataCall[T any](
+	ctx context.Context,
+	timeout time.Duration,
+	call func(context.Context) (T, error),
+) (T, error) {
+	var zero T
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	type result struct {
+		value T
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		value, err := call(callCtx)
+		done <- result{value: value, err: err}
+	}()
+	select {
+	case got := <-done:
+		if err := ctx.Err(); err != nil {
+			return zero, err
+		}
+		return got.value, got.err
+	case <-callCtx.Done():
+		if err := ctx.Err(); err != nil {
+			return zero, err
+		}
+		return zero, context.DeadlineExceeded
+	}
 }
 
 // issueV1PlaybackSubtitles creates one independently revocable capability per
 // deliverable text track. Bitmap tracks are described without a URL, except for
 // server-HLS where they are omitted because S3 does not expose a burn path.
 func (s *Server) issueV1PlaybackSubtitles(
+	ctx context.Context,
 	ticket *models.PlaybackTicket,
 	file *models.MediaFile,
 	transport string,
@@ -124,13 +274,14 @@ func (s *Server) issueV1PlaybackSubtitles(
 	issued := false
 	defer func() {
 		if !issued && createdGrant {
-			s.cleanupV1PlaybackSubtitleIssuance(ticket, transport)
+			s.cleanupV1PlaybackSubtitleIssuance(ctx, ticket, transport)
 		}
 	}()
 	for _, item := range selected {
 		url := ""
 		if item.deliverable {
-			grant, err := s.Store.CreatePlaybackSubtitleSession(
+			grant, err := s.Store.CreatePlaybackSubtitleSessionContext(
+				ctx,
 				models.PlaybackSubtitleSessionRequest{
 					Ticket:       playbackBinding(ticket),
 					Transport:    transport,
@@ -164,13 +315,18 @@ func (s *Server) issueV1PlaybackSubtitles(
 }
 
 func (s *Server) cleanupV1PlaybackSubtitleIssuance(
+	parent context.Context,
 	ticket *models.PlaybackTicket,
 	transport string,
 ) {
 	if s == nil || s.Store == nil || ticket == nil {
 		return
 	}
-	if _, err := s.Store.RevokePlaybackSubtitleSessionsForTicket(
+	ctx, cancel := context.WithTimeout(
+		context.WithoutCancel(parent), v1PlaybackCleanupTimeout)
+	defer cancel()
+	if _, err := s.Store.RevokePlaybackSubtitleSessionsForTicketContext(
+		ctx,
 		playbackBinding(ticket), transport, time.Now().UTC()); err != nil {
 		log.Printf("playback subtitle cleanup failed transport=%s", transport)
 	}
@@ -277,6 +433,16 @@ func (s *Server) serveV1PlaybackSubtitle(
 	r *http.Request,
 	nested bool,
 ) {
+	telemetry := newV1PlaybackTelemetry(w, "", r)
+	telemetry.setAsset(playbackAssetSubtitle)
+	if nested {
+		// The nested route is always an HLS rendition. Flat subtitle routes can
+		// belong to either direct-http or server-proxy, so their transport is
+		// resolved from the authorized session below.
+		telemetry.transport = models.PlaybackTransportServerHLS
+	}
+	defer telemetry.finish()
+	w = telemetry
 	if r != nil && r.Method == http.MethodHead {
 		w = v1ProxyHeadWriter{ResponseWriter: w}
 	}
@@ -338,6 +504,7 @@ func (s *Server) serveV1PlaybackSubtitle(
 	if !ok {
 		return
 	}
+	telemetry.transport = session.Session.Transport
 	if nested {
 		if mediaSession == nil || mediaSession.Session == nil ||
 			mediaSession.Session.TicketID != session.Session.TicketID ||
@@ -401,8 +568,12 @@ func (s *Server) authorizeV1PlaybackSubtitleSession(
 ) (*db.PlaybackSubtitleSessionAccess, bool) {
 	requireEmailVerification := s.Cfg != nil && s.Cfg.EmailVerificationRequired()
 	for attempts := 0; attempts < 4; attempts++ {
-		access, err := s.Store.AuthorizePlaybackSubtitleSession(
-			capability, requireEmailVerification, time.Now().UTC())
+		if err := r.Context().Err(); err != nil {
+			writeV1PlaybackSubtitleSessionError(w, err)
+			return nil, false
+		}
+		access, err := s.Store.AuthorizePlaybackSubtitleSessionContext(
+			r.Context(), capability, requireEmailVerification, time.Now().UTC())
 		if err == nil {
 			if access == nil || access.Session == nil ||
 				access.Session.State != models.PlaybackSubtitleSessionActive {
@@ -415,6 +586,7 @@ func (s *Server) authorizeV1PlaybackSubtitleSession(
 		if errors.Is(err, db.ErrPlaybackSubtitleSessionConflict) && attempts < 3 {
 			select {
 			case <-r.Context().Done():
+				writeV1PlaybackSubtitleSessionError(w, r.Context().Err())
 				return nil, false
 			case <-time.After(time.Duration(attempts+1) * 5 * time.Millisecond):
 			}
@@ -472,6 +644,12 @@ func (s *Server) loadV1PlaybackSubtitleVTT(
 
 func writeV1PlaybackSubtitleSessionError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		writeV1PlaybackError(w, http.StatusGatewayTimeout, V1ErrorInternal,
+			"The server could not authorize the subtitle session in time.", nil)
+	case errors.Is(err, context.Canceled):
+		writeV1PlaybackError(w, http.StatusRequestTimeout, V1ErrorInvalidRequest,
+			"The subtitle request was canceled.", nil)
 	case errors.Is(err, db.ErrPlaybackSubtitleSessionNotFound):
 		writeV1PlaybackError(w, http.StatusNotFound, V1ErrorMediaSessionNotFound,
 			"The subtitle session was not found.", nil)
@@ -511,6 +689,8 @@ func (s *Server) v1PlaybackSubtitleTransportEnabled(transport string) bool {
 	switch transport {
 	case models.PlaybackTransportDirectHTTP:
 		return s.Cfg.Client.DirectHTTPEnabled
+	case models.PlaybackTransportDirectDASH:
+		return s.Cfg.Client.DirectDASHEnabled
 	case models.PlaybackTransportServerProxy:
 		return s.Cfg.Client.ServerProxyV1Enabled
 	case models.PlaybackTransportServerHLS:
@@ -524,39 +704,61 @@ func (s *Server) revokeDisabledV1PlaybackSubtitleSessions() {
 	if s == nil || s.Cfg == nil {
 		return
 	}
+	ctx, cancel := context.WithTimeout(
+		context.Background(), v1PlaybackCleanupTimeout)
+	defer cancel()
 	for _, item := range []struct {
 		enabled   bool
 		transport string
 	}{
 		{s.Cfg.Client.DirectHTTPEnabled, models.PlaybackTransportDirectHTTP},
+		{s.Cfg.Client.DirectDASHEnabled, models.PlaybackTransportDirectDASH},
 		{s.Cfg.Client.ServerProxyV1Enabled, models.PlaybackTransportServerProxy},
 		{s.Cfg.Client.ServerHLSV1Enabled, models.PlaybackTransportServerHLS},
 	} {
 		if !item.enabled {
-			s.revokeV1PlaybackSubtitleSessionsForTransport(item.transport)
+			revokeV1PlaybackSubtitleSessionsForTransportContext(
+				ctx, s.Store, item.transport)
 		}
 	}
 }
 
-type v1PlaybackSubtitleSessionRevoker interface {
-	RevokePlaybackSubtitleSessionsForTransport(string, time.Time) (int64, error)
-	RevokeAllPlaybackSubtitleSessions(time.Time) (int64, error)
+type v1PlaybackSubtitleSessionContextRevoker interface {
+	RevokePlaybackSubtitleSessionsForTransportContext(
+		context.Context, string, time.Time) (int64, error)
+	RevokeAllPlaybackSubtitleSessionsContext(
+		context.Context, time.Time) (int64, error)
 }
 
 func (s *Server) revokeV1PlaybackSubtitleSessionsForTransport(transport string) {
 	if s == nil {
 		return
 	}
-	revokeV1PlaybackSubtitleSessionsForTransport(s.Store, transport)
+	ctx, cancel := context.WithTimeout(
+		context.Background(), v1PlaybackCleanupTimeout)
+	defer cancel()
+	revokeV1PlaybackSubtitleSessionsForTransportContext(ctx, s.Store, transport)
 }
 
 func revokeV1PlaybackSubtitleSessionsForTransport(store any, transport string) {
-	revoker, ok := store.(v1PlaybackSubtitleSessionRevoker)
+	ctx, cancel := context.WithTimeout(
+		context.Background(), v1PlaybackCleanupTimeout)
+	defer cancel()
+	revokeV1PlaybackSubtitleSessionsForTransportContext(ctx, store, transport)
+}
+
+func revokeV1PlaybackSubtitleSessionsForTransportContext(
+	ctx context.Context,
+	store any,
+	transport string,
+) {
+	revoker, ok := store.(v1PlaybackSubtitleSessionContextRevoker)
 	if !ok {
 		return
 	}
-	if _, err := revoker.RevokePlaybackSubtitleSessionsForTransport(
-		transport, time.Now().UTC()); err != nil {
+	_, err := revoker.RevokePlaybackSubtitleSessionsForTransportContext(
+		ctx, transport, time.Now().UTC())
+	if err != nil {
 		// Errors can contain storage connection details, never log them.
 		log.Printf("playback subtitle session cleanup failed transport=%s", transport)
 	}
@@ -566,15 +768,27 @@ func (s *Server) revokeAllV1PlaybackSubtitleSessions() {
 	if s == nil {
 		return
 	}
-	revokeAllV1PlaybackSubtitleSessionsFromStore(s.Store)
+	ctx, cancel := context.WithTimeout(
+		context.Background(), v1PlaybackCleanupTimeout)
+	defer cancel()
+	revokeAllV1PlaybackSubtitleSessionsContext(ctx, s.Store)
 }
 
 func revokeAllV1PlaybackSubtitleSessionsFromStore(store any) {
-	revoker, ok := store.(v1PlaybackSubtitleSessionRevoker)
+	ctx, cancel := context.WithTimeout(
+		context.Background(), v1PlaybackCleanupTimeout)
+	defer cancel()
+	revokeAllV1PlaybackSubtitleSessionsContext(ctx, store)
+}
+
+func revokeAllV1PlaybackSubtitleSessionsContext(ctx context.Context, store any) {
+	revoker, ok := store.(v1PlaybackSubtitleSessionContextRevoker)
 	if !ok {
 		return
 	}
-	if _, err := revoker.RevokeAllPlaybackSubtitleSessions(time.Now().UTC()); err != nil {
+	_, err := revoker.RevokeAllPlaybackSubtitleSessionsContext(
+		ctx, time.Now().UTC())
+	if err != nil {
 		// Fail closed on the current request; keep DB details out of logs.
 		log.Printf("playback subtitle session global cleanup failed")
 	}

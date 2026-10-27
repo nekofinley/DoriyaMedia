@@ -160,6 +160,9 @@ func (s *Server) handleBiliQRPoll(w http.ResponseWriter, r *http.Request, user *
 		fail(w, 500, "登录成功但保存失败: "+err.Error())
 		return
 	}
+	if s.Engine != nil {
+		s.Engine.InvalidateSourceCaches(src.ID)
+	}
 	// Every cached listing was read with the dead cookie. They are all suspect
 	// now — a 480P ladder, an empty season, a follow list that failed — so the
 	// cache goes with the login rather than answering for it.
@@ -201,6 +204,9 @@ func (s *Server) handleBiliRefresh(w http.ResponseWriter, r *http.Request, user 
 	if err := s.Store.UpdateSource(src); err != nil {
 		fail(w, 500, "续期成功但保存失败: "+err.Error())
 		return
+	}
+	if s.Engine != nil {
+		s.Engine.InvalidateSourceCaches(src.ID)
 	}
 	source.ClearBiliCache()
 	writeJSON(w, 200, drv.Health(ctx, true))

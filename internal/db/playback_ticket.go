@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -44,17 +45,36 @@ type PlaybackMediaSessionAccess struct {
 }
 
 const (
-	playbackTicketsTable       = "playback_tickets"
-	playbackMediaSessionsTable = "playback_media_sessions"
-	maxPlaybackMediaSummary    = 64 << 10
-	maxPlaybackCapabilities    = 16 << 10
+	playbackTicketsTable             = "playback_tickets"
+	playbackMediaSessionsTable       = "playback_media_sessions"
+	maxPlaybackMediaSummary          = 64 << 10
+	maxPlaybackCapabilities          = 16 << 10
+	playbackWriteLockBudget          = 10 * time.Second
+	playbackWriteLockMinBackoff      = time.Millisecond
+	playbackWriteLockMaxBackoff      = 25 * time.Millisecond
+	playbackSQLiteBusyTimeout        = 10000
+	playbackSQLiteBusyTimeoutCleanup = 2 * time.Second
+	maxPlaybackProbeJSON             = 4 << 20
 )
+
+// PlaybackTicketProbeMetadata is the shared cache written atomically with a
+// ticket's final probe transition. Subtitles contains only candidates selected
+// for this ticket; the transaction must not use it to delete other tracks.
+type PlaybackTicketFileVersion struct {
+	Size  int64
+	MTime int64
+}
+
+type PlaybackTicketProbeMetadata struct {
+	FileProbe   string
+	FileVersion *PlaybackTicketFileVersion
+	Subtitles   []models.Subtitle
+}
 
 // Playback persistence stores only opaque ticket/session identifiers, hashed
 // session capabilities, transport names, and non-sensitive media summaries.
 // Source URLs and source headers are deliberately absent.
-var playbackMigrationStatements = []string{
-	`CREATE TABLE IF NOT EXISTS playback_tickets (
+const playbackTicketsTableDefinition = `CREATE TABLE IF NOT EXISTS playback_tickets (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		ticket_id TEXT NOT NULL,
 		user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -67,10 +87,11 @@ var playbackMigrationStatements = []string{
 		candidate_transports TEXT NOT NULL DEFAULT '[]',
 		attempted_transports TEXT NOT NULL DEFAULT '[]',
 		selected_transport TEXT NOT NULL DEFAULT '' CHECK(selected_transport IN (
-			'','direct-http','server-proxy','server-hls'
+			'','direct-http','direct-dash','server-proxy','server-hls'
 		)),
 		media_summary_json TEXT NOT NULL DEFAULT '{}',
 		client_capabilities_json TEXT NOT NULL DEFAULT '{}',
+		subtitle_ids_json TEXT NOT NULL DEFAULT '[]',
 		failure_code TEXT NOT NULL DEFAULT '',
 		video_index INTEGER NOT NULL DEFAULT -1 CHECK(video_index >= -1),
 		claim_token TEXT NOT NULL DEFAULT '',
@@ -81,7 +102,10 @@ var playbackMigrationStatements = []string{
 		updated_at TIMESTAMP NOT NULL,
 		consumed_at TIMESTAMP,
 		revoked_at TIMESTAMP
-	)`,
+	)`
+
+var playbackMigrationStatements = []string{
+	playbackTicketsTableDefinition,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_playback_tickets_public_id
 		ON playback_tickets(ticket_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_playback_tickets_binding
@@ -303,6 +327,306 @@ func (s *Store) MigratePlaybackTransportClaims() error {
 		`ALTER TABLE playback_tickets ADD COLUMN claim_expires_at TIMESTAMP`)
 }
 
+// MigratePlaybackDirectDASHTransports rebuilds only tables whose legacy
+// transport CHECK excludes direct-dash. SQLite cannot alter a CHECK in place,
+// so the rebuild copies every column, replays the table's indexes and triggers,
+// and verifies the copied foreign keys before committing. The operation is
+// skipped for new databases and databases already migrated.
+func (s *Store) MigratePlaybackDirectDASHTransports() (err error) {
+	ctx := context.Background()
+	conn, err := s.DB.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	var foreignKeysEnabled int
+	if err := conn.QueryRowContext(ctx, `PRAGMA foreign_keys`).
+		Scan(&foreignKeysEnabled); err != nil {
+		return err
+	}
+	if foreignKeysEnabled != 0 {
+		if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+			return err
+		}
+		defer func() {
+			restoreCtx, cancel := context.WithTimeout(
+				context.Background(), playbackSQLiteBusyTimeoutCleanup)
+			defer cancel()
+			if _, restoreErr := conn.ExecContext(
+				restoreCtx, `PRAGMA foreign_keys=ON`); restoreErr != nil {
+				err = errors.Join(err, fmt.Errorf(
+					"restore playback migration foreign keys: %w", restoreErr))
+			}
+		}()
+	}
+
+	// Child-table triggers reference playback_tickets. Legacy rename semantics
+	// avoid validating them while the old parent is briefly absent; the exact
+	// table name and all captured indexes/triggers are restored before commit.
+	var legacyAlterTable int
+	if err := conn.QueryRowContext(ctx, `PRAGMA legacy_alter_table`).
+		Scan(&legacyAlterTable); err != nil {
+		return err
+	}
+	if legacyAlterTable == 0 {
+		if _, err := conn.ExecContext(ctx, `PRAGMA legacy_alter_table=ON`); err != nil {
+			return err
+		}
+		defer func() {
+			if _, restoreErr := conn.ExecContext(
+				context.Background(), `PRAGMA legacy_alter_table=OFF`); restoreErr != nil {
+				err = errors.Join(err, fmt.Errorf(
+					"restore playback migration ALTER TABLE behavior: %w", restoreErr))
+			}
+		}()
+	}
+
+	type migrationSpec struct {
+		table      string
+		definition string
+		columns    string
+	}
+	var migrations []migrationSpec
+	for _, migration := range []migrationSpec{
+		{
+			table:      playbackTicketsTable,
+			definition: playbackTicketsTableDefinition,
+			columns:    playbackTicketColumns,
+		},
+		{
+			table:      "playback_subtitle_sessions",
+			definition: playbackSubtitleSessionsTableDefinition,
+			columns:    playbackSubtitleSessionMigrationColumns,
+		},
+	} {
+		needsMigration, err := playbackTransportCheckNeedsDirectDASH(
+			ctx, conn, migration.table)
+		if err != nil {
+			return err
+		}
+		if !needsMigration {
+			continue
+		}
+		migrations = append(migrations, migration)
+	}
+	if len(migrations) == 0 {
+		return nil
+	}
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := checkPlaybackTicketIncomingForeignKeys(ctx, tx); err != nil {
+		return err
+	}
+	for _, migration := range migrations {
+		if err := rebuildPlaybackTransportCheckTable(
+			ctx, tx, migration.table, migration.definition, migration.columns); err != nil {
+			return err
+		}
+	}
+	if err := checkPlaybackTicketIncomingForeignKeys(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func playbackTransportCheckNeedsDirectDASH(
+	ctx context.Context,
+	conn *sql.Conn,
+	table string,
+) (bool, error) {
+	var definition string
+	if err := conn.QueryRowContext(ctx, `SELECT sql FROM sqlite_master
+		WHERE type = 'table' AND name = ?`, table).Scan(&definition); err != nil {
+		return false, fmt.Errorf("inspect %s transport check: %w", table, err)
+	}
+	normalized := strings.ToLower(definition)
+	if strings.Contains(normalized, "direct-dash") {
+		return false, nil
+	}
+	return strings.Contains(normalized, "server-hls") ||
+		strings.Contains(normalized, "server-proxy"), nil
+}
+
+type playbackSchemaObject struct {
+	kind      string
+	name      string
+	statement string
+}
+
+func rebuildPlaybackTransportCheckTable(
+	ctx context.Context,
+	tx *sql.Tx,
+	table, definition, columns string,
+) error {
+	rows, err := tx.QueryContext(ctx, `SELECT type, name, sql
+		FROM sqlite_master
+		WHERE tbl_name = ? AND type IN ('index', 'trigger') AND sql IS NOT NULL
+		ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name`, table)
+	if err != nil {
+		return err
+	}
+	objects := make([]playbackSchemaObject, 0)
+	for rows.Next() {
+		var object playbackSchemaObject
+		if err := rows.Scan(&object.kind, &object.name, &object.statement); err != nil {
+			rows.Close()
+			return err
+		}
+		objects = append(objects, object)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	var oldSequence sql.NullInt64
+	err = tx.QueryRowContext(ctx,
+		`SELECT seq FROM sqlite_sequence WHERE name = ?`, table).
+		Scan(&oldSequence)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read %s sequence: %w", table, err)
+	}
+
+	var before int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM `+table).Scan(&before); err != nil {
+		return err
+	}
+
+	temporary := table + "_direct_dash_new"
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS `+temporary); err != nil {
+		return err
+	}
+	createTable := strings.Replace(
+		definition,
+		"CREATE TABLE IF NOT EXISTS "+table,
+		"CREATE TABLE "+temporary,
+		1,
+	)
+	if createTable == definition {
+		return fmt.Errorf("build %s migration table definition", table)
+	}
+	if _, err := tx.ExecContext(ctx, createTable); err != nil {
+		return fmt.Errorf("create %s migration table: %w", table, err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO `+temporary+` (`+columns+`)
+		SELECT `+columns+` FROM `+table); err != nil {
+		return fmt.Errorf("copy %s migration data: %w", table, err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE `+table); err != nil {
+		return fmt.Errorf("drop legacy %s table: %w", table, err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`ALTER TABLE `+temporary+` RENAME TO `+table); err != nil {
+		return fmt.Errorf("rename migrated %s table: %w", table, err)
+	}
+
+	for _, object := range objects {
+		if _, err := tx.ExecContext(ctx, object.statement); err != nil {
+			return fmt.Errorf("restore %s %s: %w", object.kind, object.name, err)
+		}
+	}
+
+	var maxID sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT MAX(id) FROM `+table).Scan(&maxID); err != nil {
+		return fmt.Errorf("read migrated %s id high-water mark: %w", table, err)
+	}
+	highWater := int64(0)
+	restoreSequence := oldSequence.Valid || maxID.Valid
+	if oldSequence.Valid {
+		highWater = oldSequence.Int64
+	}
+	if maxID.Valid && maxID.Int64 > highWater {
+		highWater = maxID.Int64
+	}
+	if restoreSequence {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM sqlite_sequence WHERE name = ?`, table); err != nil {
+			return fmt.Errorf("clear migrated %s sequence: %w", table, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)`,
+			table, highWater); err != nil {
+			return fmt.Errorf("restore migrated %s sequence: %w", table, err)
+		}
+	}
+
+	var after int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM `+table).Scan(&after); err != nil {
+		return err
+	}
+	if after != before {
+		return fmt.Errorf("migrated %s row count = %d, want %d", table, after, before)
+	}
+
+	violations, err := tx.QueryContext(ctx, `PRAGMA foreign_key_check(`+table+`)`)
+	if err != nil {
+		return fmt.Errorf("check migrated %s foreign keys: %w", table, err)
+	}
+	defer violations.Close()
+	if violations.Next() {
+		var (
+			childTable string
+			rowID      sql.NullInt64
+			parent     string
+			fkID       int
+		)
+		if err := violations.Scan(&childTable, &rowID, &parent, &fkID); err != nil {
+			return err
+		}
+		return fmt.Errorf(
+			"migrated %s foreign key violation: table=%s row=%v parent=%s fk=%d",
+			table, childTable, rowID, parent, fkID)
+	}
+	if err := violations.Close(); err != nil {
+		return err
+	}
+	if err := violations.Err(); err != nil {
+		return err
+	}
+
+	var migratedDefinition string
+	if err := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master
+		WHERE type = 'table' AND name = ?`, table).Scan(&migratedDefinition); err != nil {
+		return err
+	}
+	if !strings.Contains(strings.ToLower(migratedDefinition), "direct-dash") {
+		return fmt.Errorf("migrated %s table still rejects direct-dash", table)
+	}
+	return nil
+}
+
+func checkPlaybackTicketIncomingForeignKeys(ctx context.Context, tx *sql.Tx) error {
+	for _, child := range []string{
+		playbackMediaSessionsTable,
+		"playback_subtitle_sessions",
+	} {
+		var orphan int
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+			SELECT 1 FROM `+child+` c
+			LEFT JOIN playback_tickets t ON t.ticket_id = c.ticket_id
+			WHERE c.ticket_id IS NOT NULL AND t.ticket_id IS NULL
+			LIMIT 1
+		)`).Scan(&orphan); err != nil {
+			return fmt.Errorf("check %s ticket foreign keys: %w", child, err)
+		}
+		if orphan != 0 {
+			return fmt.Errorf(
+				"migrated playback tickets left orphan rows in %s", child)
+		}
+	}
+	return nil
+}
+
 const playbackMediaSessionColumns = `id, ticket_id, user_id, device_id, file_id,
 	purpose, transport, state, mode, audio_ordinal, video_index, start_seconds, quality,
 	transcode_height, version, created_at, last_used_at, idle_expires_at,
@@ -311,6 +635,19 @@ const playbackMediaSessionColumns = `id, ticket_id, user_id, device_id, file_id,
 // CreatePlaybackTicket inserts a probing ticket with a five-minute absolute
 // expiry. It verifies that the device belongs to the user and the file exists.
 func (s *Store) CreatePlaybackTicket(req models.PlaybackTicketRequest, now time.Time) (*models.PlaybackTicket, error) {
+	return s.CreatePlaybackTicketContext(context.Background(), req, now)
+}
+
+// CreatePlaybackTicketContext is CreatePlaybackTicket with request cancellation
+// propagated through the shared playback writer transaction.
+func (s *Store) CreatePlaybackTicketContext(
+	ctx context.Context,
+	req models.PlaybackTicketRequest,
+	now time.Time,
+) (*models.PlaybackTicket, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	now = playbackTime(now)
 	if req.UserID <= 0 || req.DeviceID <= 0 || req.FileID <= 0 {
 		return nil, ErrInvalidPlaybackTicket
@@ -343,75 +680,93 @@ func (s *Store) CreatePlaybackTicket(req models.PlaybackTicketRequest, now time.
 		return nil, err
 	}
 
-	tx, err := s.DB.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	// Validate the binding only after this transaction owns SQLite's writer
-	// reservation. Reading first would create a snapshot that cannot be
-	// upgraded when another connection commits before the insert below.
-	if _, err := tx.Exec(`UPDATE devices SET last_seen_at = last_seen_at
-		WHERE id = ? AND user_id = ?`, req.DeviceID, req.UserID); err != nil {
-		return nil, err
-	}
+	var created *models.PlaybackTicket
+	err = s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			// Validate the binding only after this transaction owns SQLite's
+			// writer reservation. Reading first would create a snapshot that
+			// cannot be upgraded when another connection commits before the
+			// insert below.
+			_, err := tx.ExecContext(ctx, `UPDATE devices SET last_seen_at = last_seen_at
+				WHERE id = ? AND user_id = ?`, req.DeviceID, req.UserID)
+			return err
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			var exists int
+			if err := tx.QueryRowContext(ctx, `SELECT 1 FROM devices
+				WHERE id = ? AND user_id = ? AND revoked_at IS NULL`,
+				req.DeviceID, req.UserID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+				return false, ErrInvalidPlaybackTicket
+			} else if err != nil {
+				return false, err
+			}
+			if err := tx.QueryRowContext(ctx, `SELECT 1 FROM files WHERE id = ?`,
+				req.FileID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+				return false, ErrInvalidPlaybackTicket
+			} else if err != nil {
+				return false, err
+			}
+			if err := requirePlaybackTicketsAllowedTxContext(ctx, tx, req.DeviceID); err != nil {
+				return false, err
+			}
 
-	var exists int
-	if err := tx.QueryRow(`SELECT 1 FROM devices
-		WHERE id = ? AND user_id = ? AND revoked_at IS NULL`,
-		req.DeviceID, req.UserID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrInvalidPlaybackTicket
-	} else if err != nil {
-		return nil, err
-	}
-	if err := tx.QueryRow(`SELECT 1 FROM files WHERE id = ?`, req.FileID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrInvalidPlaybackTicket
-	} else if err != nil {
-		return nil, err
-	}
-	if err := requirePlaybackTicketsAllowedTx(tx, req.DeviceID); err != nil {
-		return nil, err
-	}
-
-	expiresAt := now.Add(models.PlaybackTicketTTL)
-	res, err := tx.Exec(`INSERT INTO playback_tickets
+			expiresAt := now.Add(models.PlaybackTicketTTL)
+			res, err := tx.ExecContext(ctx, `INSERT INTO playback_tickets
 		(ticket_id, user_id, device_id, file_id, purpose, state,
 		 candidate_transports, attempted_transports, selected_transport,
 		 media_summary_json, client_capabilities_json, subtitle_ids_json,
 		 failure_code, version, created_at, expires_at, updated_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		ticketID, req.UserID, req.DeviceID, req.FileID, purpose,
-		models.PlaybackTicketProbing, string(candidatesJSON), `[]`, "",
-		string(summary), string(capabilities), `[]`, "", 1, now, expiresAt, now)
+				ticketID, req.UserID, req.DeviceID, req.FileID, purpose,
+				models.PlaybackTicketProbing, string(candidatesJSON), `[]`, "",
+				string(summary), string(capabilities), `[]`, "", 1, now, expiresAt, now)
+			if err != nil {
+				return false, err
+			}
+			id, err := res.LastInsertId()
+			if err != nil {
+				return false, err
+			}
+			created = &models.PlaybackTicket{
+				ID: id, TicketID: ticketID, UserID: req.UserID, DeviceID: req.DeviceID,
+				FileID: req.FileID, Purpose: purpose, State: models.PlaybackTicketProbing,
+				CandidateTransports: candidates, AttemptedTransports: []string{},
+				MediaSummary: summary, ClientCapabilities: capabilities, SubtitleIDs: []int64{},
+				VideoIndex: models.PlaybackVideoIndexUnknown,
+				Version:    1, CreatedAt: now, ExpiresAt: expiresAt,
+				UpdatedAt: now,
+			}
+			return true, nil
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return &models.PlaybackTicket{
-		ID: id, TicketID: ticketID, UserID: req.UserID, DeviceID: req.DeviceID,
-		FileID: req.FileID, Purpose: purpose, State: models.PlaybackTicketProbing,
-		CandidateTransports: candidates, AttemptedTransports: []string{},
-		MediaSummary: summary, ClientCapabilities: capabilities, SubtitleIDs: []int64{},
-		VideoIndex: models.PlaybackVideoIndexUnknown,
-		Version:    1, CreatedAt: now, ExpiresAt: expiresAt,
-		UpdatedAt: now,
-	}, nil
+	return created, nil
 }
 
 // PlaybackTicketByID reads only an exact user/device/file/ticket binding. It
 // marks an overdue ticket expired but does not consume or extend it.
 func (s *Store) PlaybackTicketByID(binding models.PlaybackTicketBinding, now time.Time) (*models.PlaybackTicket, error) {
+	return s.PlaybackTicketByIDContext(context.Background(), binding, now)
+}
+
+// PlaybackTicketByIDContext is PlaybackTicketByID with cancellation propagated
+// through a lazy expiry write, when one is required.
+func (s *Store) PlaybackTicketByIDContext(
+	ctx context.Context,
+	binding models.PlaybackTicketBinding,
+	now time.Time,
+) (*models.PlaybackTicket, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	now = playbackTime(now)
 	if err := validatePlaybackTicketBinding(binding); err != nil {
 		return nil, err
 	}
-	ticket, err := scanPlaybackTicket(s.DB.QueryRow(`SELECT `+playbackTicketColumns+`
+	ticket, err := scanPlaybackTicket(s.DB.QueryRowContext(ctx, `SELECT `+playbackTicketColumns+`
 		FROM playback_tickets
 		WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?`,
 		binding.TicketID, binding.UserID, binding.DeviceID, binding.FileID))
@@ -425,20 +780,34 @@ func (s *Store) PlaybackTicketByID(binding models.PlaybackTicketBinding, now tim
 		return ticket, nil
 	}
 
-	res, err := s.DB.Exec(`UPDATE playback_tickets
-		SET state = ?, updated_at = ?, version = version + 1
-		WHERE id = ? AND version = ? AND state IN ('probing','ready','consuming')
-			AND expires_at <= ? AND revoked_at IS NULL`,
-		models.PlaybackTicketExpired, now, ticket.ID, ticket.Version, now)
+	updated := false
+	err = s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return lockPlaybackTicketTxContext(ctx, tx, binding)
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			res, err := tx.ExecContext(ctx, `UPDATE playback_tickets
+				SET state = ?, updated_at = ?, version = version + 1
+				WHERE id = ? AND version = ? AND state IN ('probing','ready','consuming')
+					AND expires_at <= ? AND revoked_at IS NULL`,
+				models.PlaybackTicketExpired, now, ticket.ID, ticket.Version, now)
+			if err != nil {
+				return false, err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return false, err
+			}
+			updated = n == 1
+			return updated, nil
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return nil, err
-	}
-	if n == 0 {
-		reloaded, err := scanPlaybackTicket(s.DB.QueryRow(`SELECT `+playbackTicketColumns+`
+	if !updated {
+		reloaded, err := scanPlaybackTicket(s.DB.QueryRowContext(ctx, `SELECT `+playbackTicketColumns+`
 			FROM playback_tickets
 			WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?`,
 			binding.TicketID, binding.UserID, binding.DeviceID, binding.FileID))
@@ -461,12 +830,27 @@ func (s *Store) PlaybackTicketByPublicID(
 	ticketID string,
 	now time.Time,
 ) (*models.PlaybackTicket, error) {
+	return s.PlaybackTicketByPublicIDContext(
+		context.Background(), userID, deviceID, ticketID, now)
+}
+
+// PlaybackTicketByPublicIDContext is PlaybackTicketByPublicID with cancellation
+// propagated through a lazy expiry write, when one is required.
+func (s *Store) PlaybackTicketByPublicIDContext(
+	ctx context.Context,
+	userID, deviceID int64,
+	ticketID string,
+	now time.Time,
+) (*models.PlaybackTicket, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	now = playbackTime(now)
 	ticketID = strings.TrimSpace(ticketID)
 	if userID <= 0 || deviceID <= 0 || ticketID == "" {
 		return nil, ErrInvalidPlaybackTicket
 	}
-	ticket, err := scanPlaybackTicket(s.DB.QueryRow(`SELECT `+playbackTicketColumns+`
+	ticket, err := scanPlaybackTicket(s.DB.QueryRowContext(ctx, `SELECT `+playbackTicketColumns+`
 		FROM playback_tickets
 		WHERE ticket_id = ? AND user_id = ? AND device_id = ?`,
 		ticketID, userID, deviceID))
@@ -479,20 +863,37 @@ func (s *Store) PlaybackTicketByPublicID(
 	if !playbackTicketExpirable(ticket.State) || now.Before(ticket.ExpiresAt) {
 		return ticket, nil
 	}
-	res, err := s.DB.Exec(`UPDATE playback_tickets
-		SET state = ?, updated_at = ?, version = version + 1
-		WHERE id = ? AND version = ? AND state IN ('probing','ready','consuming')
-			AND expires_at <= ? AND revoked_at IS NULL`,
-		models.PlaybackTicketExpired, now, ticket.ID, ticket.Version, now)
+	binding := models.PlaybackTicketBinding{
+		UserID: userID, DeviceID: deviceID, FileID: ticket.FileID, TicketID: ticketID,
+	}
+	updated := false
+	err = s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return lockPlaybackTicketTxContext(ctx, tx, binding)
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			res, err := tx.ExecContext(ctx, `UPDATE playback_tickets
+				SET state = ?, updated_at = ?, version = version + 1
+				WHERE id = ? AND version = ? AND state IN ('probing','ready','consuming')
+					AND expires_at <= ? AND revoked_at IS NULL`,
+				models.PlaybackTicketExpired, now, ticket.ID, ticket.Version, now)
+			if err != nil {
+				return false, err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return false, err
+			}
+			updated = n == 1
+			return updated, nil
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return nil, err
-	}
-	if n == 0 {
-		reloaded, err := scanPlaybackTicket(s.DB.QueryRow(`SELECT `+playbackTicketColumns+`
+	if !updated {
+		reloaded, err := scanPlaybackTicket(s.DB.QueryRowContext(ctx, `SELECT `+playbackTicketColumns+`
 			FROM playback_tickets
 			WHERE ticket_id = ? AND user_id = ? AND device_id = ?`,
 			ticketID, userID, deviceID))
@@ -528,10 +929,45 @@ func (s *Store) FinishPlaybackTicketProbeContext(
 	result models.PlaybackTicketProbeResult,
 	now time.Time,
 ) (*models.PlaybackTicket, error) {
+	return s.finishPlaybackTicketProbeContext(
+		ctx, binding, expectedVersion, result, nil, now)
+}
+
+// FinishPlaybackTicketProbeWithMetadataContext commits shared probe/subtitle
+// cache rows and the final ticket CAS in one playback write transaction. The
+// ticket is checked first, so a revocation that wins the writer lock leaves the
+// metadata untouched.
+func (s *Store) FinishPlaybackTicketProbeWithMetadataContext(
+	ctx context.Context,
+	binding models.PlaybackTicketBinding,
+	expectedVersion int64,
+	result models.PlaybackTicketProbeResult,
+	metadata *PlaybackTicketProbeMetadata,
+	now time.Time,
+) (*models.PlaybackTicket, error) {
+	if metadata == nil {
+		return nil, ErrInvalidPlaybackTicket
+	}
+	if result.State == models.PlaybackTicketFailed {
+		return nil, ErrInvalidPlaybackTicket
+	}
+	return s.finishPlaybackTicketProbeContext(
+		ctx, binding, expectedVersion, result, metadata, now)
+}
+
+func (s *Store) finishPlaybackTicketProbeContext(
+	ctx context.Context,
+	binding models.PlaybackTicketBinding,
+	expectedVersion int64,
+	result models.PlaybackTicketProbeResult,
+	metadata *PlaybackTicketProbeMetadata,
+	now time.Time,
+) (*models.PlaybackTicket, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	now = playbackTime(now)
+	started := time.Now()
 	if err := validatePlaybackTicketBinding(binding); err != nil {
 		return nil, err
 	}
@@ -576,94 +1012,263 @@ func (s *Store) FinishPlaybackTicketProbeContext(
 	if err != nil {
 		return nil, err
 	}
+	var normalizedMetadata *PlaybackTicketProbeMetadata
+	if metadata != nil {
+		if len(subtitleIDs) != 0 {
+			return nil, ErrInvalidPlaybackTicket
+		}
+		normalizedMetadata, err = normalizePlaybackTicketProbeMetadata(
+			binding.FileID, metadata)
+		if err != nil {
+			return nil, err
+		}
+	}
 	candidatesJSON, err := json.Marshal(candidates)
 	if err != nil {
 		return nil, err
 	}
-	subtitleIDsJSON, err := json.Marshal(subtitleIDs)
-	if err != nil {
-		return nil, err
-	}
 
-	tx, err := s.DB.BeginTx(ctx, nil)
+	var finished *models.PlaybackTicket
+	err = s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return lockPlaybackTicketTxContext(ctx, tx, binding)
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			effectiveNow := playbackTime(now.Add(time.Since(started)))
+			ticket, err := loadPlaybackTicketTxContext(ctx, tx, binding)
+			if err != nil {
+				return false, err
+			}
+			if err := requirePlaybackTicketsAllowedTxContext(ctx, tx, ticket.DeviceID); err != nil {
+				return false, err
+			}
+			switch ticket.State {
+			case models.PlaybackTicketExpired:
+				return false, ErrPlaybackTicketExpired
+			case models.PlaybackTicketRevoked:
+				return false, ErrPlaybackTicketRevoked
+			case models.PlaybackTicketProbing:
+			default:
+				return false, ErrPlaybackTicketConflict
+			}
+			if ticket.Version != expectedVersion {
+				return false, ErrPlaybackTicketConflict
+			}
+			if !effectiveNow.Before(ticket.ExpiresAt) {
+				expired, err := expirePlaybackTicketTxContext(
+					ctx, tx, ticket, effectiveNow)
+				if err != nil {
+					return false, err
+				}
+				if !expired {
+					return false, ErrPlaybackTicketConflict
+				}
+				return true, ErrPlaybackTicketExpired
+			}
+			if normalizedMetadata != nil {
+				subtitleIDs, err = applyPlaybackTicketProbeMetadataTxContext(
+					ctx, tx, ticket.FileID, normalizedMetadata)
+				if err != nil {
+					return false, err
+				}
+			}
+			if err := validatePlaybackSubtitleGrantsTxContext(
+				ctx, tx, ticket.FileID, subtitleIDs); err != nil {
+				return false, err
+			}
+			subtitleIDsJSON, err := json.Marshal(subtitleIDs)
+			if err != nil {
+				return false, err
+			}
+
+			res, err := tx.ExecContext(ctx, `UPDATE playback_tickets
+				SET state = ?, candidate_transports = ?, attempted_transports = ?,
+					selected_transport = '', media_summary_json = ?, failure_code = ?,
+					subtitle_ids_json = ?, video_index = ?, version = version + 1,
+					updated_at = ?
+				WHERE id = ? AND version = ? AND state = ? AND expires_at > ?
+					AND revoked_at IS NULL`,
+				result.State, string(candidatesJSON), `[]`, string(summary), failureCode,
+				string(subtitleIDsJSON), videoIndex, effectiveNow, ticket.ID, expectedVersion,
+				models.PlaybackTicketProbing, effectiveNow)
+			if err != nil {
+				return false, err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return false, err
+			}
+			if n != 1 {
+				return false, ErrPlaybackTicketConflict
+			}
+			ticket.State = result.State
+			ticket.CandidateTransports = candidates
+			ticket.AttemptedTransports = []string{}
+			ticket.SelectedTransport = ""
+			ticket.MediaSummary = summary
+			ticket.SubtitleIDs = subtitleIDs
+			ticket.FailureCode = failureCode
+			ticket.VideoIndex = videoIndex
+			ticket.Version++
+			ticket.UpdatedAt = effectiveNow
+			finished = ticket
+			return true, nil
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
-	if err := lockPlaybackTicketTxContext(ctx, tx, binding); err != nil {
+	return finished, nil
+}
+
+type playbackProbeSubtitleKey struct {
+	path        string
+	streamIndex int
+}
+
+func normalizePlaybackTicketProbeMetadata(
+	fileID int64,
+	metadata *PlaybackTicketProbeMetadata,
+) (*PlaybackTicketProbeMetadata, error) {
+	if metadata == nil || fileID <= 0 {
+		return nil, ErrInvalidPlaybackTicket
+	}
+	if len(metadata.FileProbe) > maxPlaybackProbeJSON ||
+		(metadata.FileProbe != "" && !json.Valid([]byte(metadata.FileProbe))) {
+		return nil, ErrInvalidPlaybackTicket
+	}
+	if (metadata.FileProbe != "" || len(metadata.Subtitles) != 0) &&
+		metadata.FileVersion == nil {
+		return nil, ErrInvalidPlaybackTicket
+	}
+	normalized := &PlaybackTicketProbeMetadata{
+		FileProbe: metadata.FileProbe,
+		Subtitles: make([]models.Subtitle, 0, len(metadata.Subtitles)),
+	}
+	if metadata.FileVersion != nil {
+		version := *metadata.FileVersion
+		normalized.FileVersion = &version
+	}
+	seen := make(map[playbackProbeSubtitleKey]int, len(metadata.Subtitles))
+	for _, sub := range metadata.Subtitles {
+		if sub.FileID != fileID || sub.StreamIdx < 0 {
+			return nil, ErrInvalidPlaybackTicket
+		}
+		key := playbackProbeSubtitleKey{
+			path: sub.Path, streamIndex: sub.StreamIdx,
+		}
+		if index, exists := seen[key]; exists {
+			// Embedded rows are collected last and must replace a colliding
+			// external/driver row, matching the legacy upsert order.
+			normalized.Subtitles[index] = sub
+			continue
+		}
+		if len(normalized.Subtitles) == models.PlaybackMaxSubtitleGrants {
+			return nil, ErrInvalidPlaybackTicket
+		}
+		seen[key] = len(normalized.Subtitles)
+		normalized.Subtitles = append(normalized.Subtitles, sub)
+	}
+	return normalized, nil
+}
+
+func applyPlaybackTicketProbeMetadataTxContext(
+	ctx context.Context,
+	tx *sql.Tx,
+	fileID int64,
+	metadata *PlaybackTicketProbeMetadata,
+) ([]int64, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	ticket, err := loadPlaybackTicketTxContext(ctx, tx, binding)
+	if metadata == nil || metadata.FileProbe == "" && len(metadata.Subtitles) == 0 {
+		return []int64{}, nil
+	}
+	if metadata.FileVersion == nil {
+		return nil, ErrInvalidPlaybackTicket
+	}
+	var size, mtime int64
+	err := tx.QueryRowContext(ctx,
+		`SELECT size, mtime FROM files WHERE id = ?`, fileID).
+		Scan(&size, &mtime)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrInvalidPlaybackTicket
+	}
 	if err != nil {
 		return nil, err
 	}
-	if err := requirePlaybackTicketsAllowedTxContext(ctx, tx, ticket.DeviceID); err != nil {
-		return nil, err
-	}
-	switch ticket.State {
-	case models.PlaybackTicketExpired:
-		return nil, ErrPlaybackTicketExpired
-	case models.PlaybackTicketRevoked:
-		return nil, ErrPlaybackTicketRevoked
-	case models.PlaybackTicketProbing:
-	default:
+	if size != metadata.FileVersion.Size ||
+		mtime != metadata.FileVersion.MTime {
 		return nil, ErrPlaybackTicketConflict
 	}
-	if ticket.Version != expectedVersion {
-		return nil, ErrPlaybackTicketConflict
-	}
-	if err := validatePlaybackSubtitleGrantsTxContext(
-		ctx, tx, ticket.FileID, subtitleIDs); err != nil {
-		return nil, err
-	}
-	if !now.Before(ticket.ExpiresAt) {
-		expired, err := expirePlaybackTicketTxContext(ctx, tx, ticket, now)
+	if metadata.FileProbe != "" {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE files SET probe = ? WHERE id = ?`,
+			metadata.FileProbe, fileID)
 		if err != nil {
 			return nil, err
 		}
-		if !expired {
-			return nil, ErrPlaybackTicketConflict
-		}
-		if err := tx.Commit(); err != nil {
+		n, err := res.RowsAffected()
+		if err != nil {
 			return nil, err
 		}
-		return nil, ErrPlaybackTicketExpired
+		if n != 1 {
+			return nil, ErrInvalidPlaybackTicket
+		}
 	}
 
-	res, err := tx.ExecContext(ctx, `UPDATE playback_tickets
-		SET state = ?, candidate_transports = ?, attempted_transports = ?,
-			selected_transport = '', media_summary_json = ?, failure_code = ?,
-			subtitle_ids_json = ?, video_index = ?, version = version + 1,
-			updated_at = ?
-		WHERE id = ? AND version = ? AND state = ? AND expires_at > ?
-			AND revoked_at IS NULL`,
-		result.State, string(candidatesJSON), `[]`, string(summary), failureCode,
-		string(subtitleIDsJSON), videoIndex, now, ticket.ID, expectedVersion,
-		models.PlaybackTicketProbing, now)
+	keys := make(map[playbackProbeSubtitleKey]struct{}, len(metadata.Subtitles))
+	for _, sub := range metadata.Subtitles {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO subtitles
+			(file_id, path, lang, title, format, embedded, stream_idx, convertible)
+			VALUES (?,?,?,?,?,?,?,?)
+			ON CONFLICT(file_id, path, stream_idx) DO UPDATE SET
+				lang=excluded.lang, title=excluded.title, format=excluded.format,
+				embedded=excluded.embedded, convertible=excluded.convertible`,
+			fileID, sub.Path, sub.Lang, sub.Title, sub.Format,
+			sub.Embedded, sub.StreamIdx, sub.Convertible); err != nil {
+			return nil, err
+		}
+		keys[playbackProbeSubtitleKey{
+			path: sub.Path, streamIndex: sub.StreamIdx,
+		}] = struct{}{}
+	}
+	if len(keys) == 0 {
+		return []int64{}, nil
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT id, path, stream_idx
+		FROM subtitles WHERE file_id = ? ORDER BY id`, fileID)
 	if err != nil {
 		return nil, err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
+	defer rows.Close()
+	ids := make([]int64, 0, len(keys))
+	for rows.Next() {
+		var (
+			id          int64
+			path        string
+			streamIndex int
+		)
+		if err := rows.Scan(&id, &path, &streamIndex); err != nil {
+			return nil, err
+		}
+		key := playbackProbeSubtitleKey{path: path, streamIndex: streamIndex}
+		if _, ok := keys[key]; ok {
+			ids = append(ids, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if n != 1 {
-		return nil, ErrPlaybackTicketConflict
-	}
-	if err := tx.Commit(); err != nil {
+	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	ticket.State = result.State
-	ticket.CandidateTransports = candidates
-	ticket.AttemptedTransports = []string{}
-	ticket.SelectedTransport = ""
-	ticket.MediaSummary = summary
-	ticket.SubtitleIDs = subtitleIDs
-	ticket.FailureCode = failureCode
-	ticket.VideoIndex = videoIndex
-	ticket.Version++
-	ticket.UpdatedAt = now
-	return ticket, nil
+	if len(ids) != len(keys) {
+		return nil, ErrInvalidPlaybackTicket
+	}
+	return normalizePlaybackSubtitleIDs(ids)
 }
 
 // CheckPlaybackTicketProbeActive verifies, without mutating ticket state, that
@@ -750,182 +1355,151 @@ func (s *Store) ClaimNextPlaybackTransport(
 		return nil, err
 	}
 
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := lockPlaybackTicketTxContext(ctx, tx, binding); err != nil {
-		return nil, err
-	}
-	ticket, err := loadPlaybackTicketTxContext(ctx, tx, binding)
-	if err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := requirePlaybackTicketsAllowedTx(tx, ticket.DeviceID); err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	switch ticket.State {
-	case models.PlaybackTicketExpired:
-		return nil, ErrPlaybackTicketExpired
-	case models.PlaybackTicketRevoked:
-		return nil, ErrPlaybackTicketRevoked
-	case models.PlaybackTicketReady, models.PlaybackTicketConsuming:
-	default:
-		return nil, ErrPlaybackTicketConflict
-	}
-	if !now.Before(ticket.ExpiresAt) {
-		expired, err := expirePlaybackTicketTxContext(ctx, tx, ticket, now)
-		if err != nil {
-			return nil, err
-		}
-		if !expired {
-			return nil, ErrPlaybackTicketConflict
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		if err := ctx.Err(); err != nil {
-			return ticket, err
-		}
-		return ticket, ErrPlaybackTicketExpired
-	}
-	if ticket.Version != expectedVersion {
-		return nil, ErrPlaybackTicketConflict
-	}
-	if ticket.ClaimToken != "" && ticket.ClaimExpiresAt != nil &&
-		now.Before(*ticket.ClaimExpiresAt) {
-		return nil, ErrPlaybackTicketConflict
-	}
-	if _, err := normalizePlaybackTransports(ticket.CandidateTransports, false); err != nil {
-		return nil, err
-	}
-	attempted, err := normalizePlaybackTransports(ticket.AttemptedTransports, true)
-	if err != nil {
-		return nil, err
-	}
-	candidates := append([]string(nil), ticket.CandidateTransports...)
-	attemptedSet := make(map[string]struct{}, len(attempted))
-	for _, transport := range attempted {
-		attemptedSet[transport] = struct{}{}
-	}
-	next := ""
-	for _, transport := range candidates {
-		if _, seen := attemptedSet[transport]; !seen {
-			next = transport
-			break
-		}
-	}
-	if next == "" {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		res, err := tx.ExecContext(ctx, `UPDATE playback_tickets
-			SET state = ?, claim_token = '', claim_expires_at = NULL,
-				version = version + 1, updated_at = ?
-			WHERE id = ? AND version = ? AND state IN (?,?)
-				AND expires_at > ? AND revoked_at IS NULL`,
-			models.PlaybackTicketExhausted, now, ticket.ID, expectedVersion,
-			models.PlaybackTicketReady, models.PlaybackTicketConsuming, now)
-		if err != nil {
-			return nil, err
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return nil, err
-		}
-		if n != 1 {
-			return nil, ErrPlaybackTicketConflict
-		}
-		ticket.State = models.PlaybackTicketExhausted
-		ticket.AttemptedTransports = attempted
-		ticket.ClaimToken = ""
-		ticket.ClaimExpiresAt = nil
-		ticket.Version++
-		ticket.UpdatedAt = now
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		if err := ctx.Err(); err != nil {
-			return ticket, err
-		}
-		return ticket, ErrPlaybackTicketExhausted
-	}
-	if err := requirePlaybackTransportAllowedTx(tx, ticket.DeviceID, next); err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+	var claimed *models.PlaybackTicket
+	err = s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return lockPlaybackTicketTxContext(ctx, tx, binding)
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			ticket, err := loadPlaybackTicketTxContext(ctx, tx, binding)
+			if err != nil {
+				return false, err
+			}
+			if err := requirePlaybackTicketsAllowedTxContext(ctx, tx, ticket.DeviceID); err != nil {
+				return false, err
+			}
+			switch ticket.State {
+			case models.PlaybackTicketExpired:
+				return false, ErrPlaybackTicketExpired
+			case models.PlaybackTicketRevoked:
+				return false, ErrPlaybackTicketRevoked
+			case models.PlaybackTicketReady, models.PlaybackTicketConsuming:
+			default:
+				return false, ErrPlaybackTicketConflict
+			}
+			if !now.Before(ticket.ExpiresAt) {
+				expired, err := expirePlaybackTicketTxContext(ctx, tx, ticket, now)
+				if err != nil {
+					return false, err
+				}
+				if !expired {
+					return false, ErrPlaybackTicketConflict
+				}
+				claimed = ticket
+				return true, ErrPlaybackTicketExpired
+			}
+			if ticket.Version != expectedVersion {
+				return false, ErrPlaybackTicketConflict
+			}
+			if ticket.ClaimToken != "" && ticket.ClaimExpiresAt != nil &&
+				now.Before(*ticket.ClaimExpiresAt) {
+				return false, ErrPlaybackTicketConflict
+			}
+			if _, err := normalizePlaybackTransports(ticket.CandidateTransports, false); err != nil {
+				return false, err
+			}
+			attempted, err := normalizePlaybackTransports(ticket.AttemptedTransports, true)
+			if err != nil {
+				return false, err
+			}
+			candidates := append([]string(nil), ticket.CandidateTransports...)
+			attemptedSet := make(map[string]struct{}, len(attempted))
+			for _, transport := range attempted {
+				attemptedSet[transport] = struct{}{}
+			}
+			next := ""
+			for _, transport := range candidates {
+				if _, seen := attemptedSet[transport]; !seen {
+					next = transport
+					break
+				}
+			}
+			if next == "" {
+				res, err := tx.ExecContext(ctx, `UPDATE playback_tickets
+					SET state = ?, claim_token = '', claim_expires_at = NULL,
+						version = version + 1, updated_at = ?
+					WHERE id = ? AND version = ? AND state IN (?,?)
+						AND expires_at > ? AND revoked_at IS NULL`,
+					models.PlaybackTicketExhausted, now, ticket.ID, expectedVersion,
+					models.PlaybackTicketReady, models.PlaybackTicketConsuming, now)
+				if err != nil {
+					return false, err
+				}
+				n, err := res.RowsAffected()
+				if err != nil {
+					return false, err
+				}
+				if n != 1 {
+					return false, ErrPlaybackTicketConflict
+				}
+				ticket.State = models.PlaybackTicketExhausted
+				ticket.AttemptedTransports = attempted
+				ticket.ClaimToken = ""
+				ticket.ClaimExpiresAt = nil
+				ticket.Version++
+				ticket.UpdatedAt = now
+				claimed = ticket
+				return true, ErrPlaybackTicketExhausted
+			}
+			if err := requirePlaybackTransportAllowedTxContext(
+				ctx, tx, ticket.DeviceID, next); err != nil {
+				return false, err
+			}
 
-	attempted = append(attempted, next)
-	attemptedJSON, err := json.Marshal(attempted)
+			attempted = append(attempted, next)
+			attemptedJSON, err := json.Marshal(attempted)
+			if err != nil {
+				return false, err
+			}
+			claimExpiresAt := now.Add(models.PlaybackTransportClaimTTL)
+			if claimExpiresAt.After(ticket.ExpiresAt) {
+				claimExpiresAt = ticket.ExpiresAt
+			}
+			res, err := tx.ExecContext(ctx, `UPDATE playback_tickets
+				SET state = ?, attempted_transports = ?, selected_transport = ?,
+					consumed_at = COALESCE(consumed_at, ?), claim_token = ?,
+					claim_expires_at = ?, version = version + 1, updated_at = ?
+				WHERE id = ? AND version = ? AND state IN (?,?) AND expires_at > ?
+					AND revoked_at IS NULL`,
+				models.PlaybackTicketConsuming, string(attemptedJSON), next, now,
+				claimToken, claimExpiresAt, now, ticket.ID, expectedVersion,
+				models.PlaybackTicketReady,
+				models.PlaybackTicketConsuming, now)
+			if err != nil {
+				return false, err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return false, err
+			}
+			if n != 1 {
+				return false, ErrPlaybackTicketConflict
+			}
+			ticket.State = models.PlaybackTicketConsuming
+			ticket.AttemptedTransports = attempted
+			ticket.SelectedTransport = next
+			ticket.ClaimToken = claimToken
+			ticket.ClaimExpiresAt = timePointer(claimExpiresAt)
+			ticket.Version++
+			ticket.UpdatedAt = now
+			if ticket.ConsumedAt == nil {
+				consumed := now
+				ticket.ConsumedAt = &consumed
+			}
+			claimed = ticket
+			return true, nil
+		},
+	)
 	if err != nil {
+		if claimed != nil &&
+			(errors.Is(err, ErrPlaybackTicketExpired) ||
+				errors.Is(err, ErrPlaybackTicketExhausted)) {
+			return claimed, err
+		}
 		return nil, err
 	}
-	claimExpiresAt := now.Add(models.PlaybackTransportClaimTTL)
-	if claimExpiresAt.After(ticket.ExpiresAt) {
-		claimExpiresAt = ticket.ExpiresAt
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	res, err := tx.ExecContext(ctx, `UPDATE playback_tickets
-		SET state = ?, attempted_transports = ?, selected_transport = ?,
-			consumed_at = COALESCE(consumed_at, ?), claim_token = ?,
-			claim_expires_at = ?, version = version + 1, updated_at = ?
-		WHERE id = ? AND version = ? AND state IN (?,?) AND expires_at > ?
-			AND revoked_at IS NULL`,
-		models.PlaybackTicketConsuming, string(attemptedJSON), next, now,
-		claimToken, claimExpiresAt, now, ticket.ID, expectedVersion,
-		models.PlaybackTicketReady,
-		models.PlaybackTicketConsuming, now)
-	if err != nil {
-		return nil, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return nil, err
-	}
-	if n != 1 {
-		return nil, ErrPlaybackTicketConflict
-	}
-	ticket.State = models.PlaybackTicketConsuming
-	ticket.AttemptedTransports = attempted
-	ticket.SelectedTransport = next
-	ticket.ClaimToken = claimToken
-	ticket.ClaimExpiresAt = timePointer(claimExpiresAt)
-	ticket.Version++
-	ticket.UpdatedAt = now
-	if ticket.ConsumedAt == nil {
-		consumed := now
-		ticket.ConsumedAt = &consumed
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return ticket, err
-	}
-	return ticket, nil
+	return claimed, nil
 }
 
 // ValidatePlaybackTransportIssuance rechecks and consumes the exact issuance
@@ -952,90 +1526,67 @@ func (s *Store) ValidatePlaybackTransportIssuance(
 		return ErrInvalidPlaybackTransport
 	}
 
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := lockPlaybackTicketTxContext(ctx, tx, binding); err != nil {
-		return err
-	}
-	ticket, err := loadPlaybackTicketTxContext(ctx, tx, binding)
-	if err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	switch ticket.State {
-	case models.PlaybackTicketRevoked:
-		return ErrPlaybackTicketRevoked
-	case models.PlaybackTicketExpired:
-		return ErrPlaybackTicketExpired
-	case models.PlaybackTicketConsuming:
-	default:
-		return ErrPlaybackTicketConflict
-	}
-	if !now.Before(ticket.ExpiresAt) {
-		expired, err := expirePlaybackTicketTxContext(ctx, tx, ticket, now)
-		if err != nil {
-			return err
-		}
-		if !expired {
-			return ErrPlaybackTicketConflict
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		return ErrPlaybackTicketExpired
-	}
-	if ticket.Version != expectedVersion || ticket.SelectedTransport != transport {
-		return ErrPlaybackTicketConflict
-	}
-	if ticket.ClaimToken != claimToken || ticket.ClaimExpiresAt == nil ||
-		!now.Before(*ticket.ClaimExpiresAt) {
-		return ErrPlaybackTicketConflict
-	}
-	if err := requirePlaybackTransportAllowedTx(tx, ticket.DeviceID, transport); err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	res, err := tx.ExecContext(ctx, `UPDATE playback_tickets
-		SET claim_token = '', claim_expires_at = NULL, version = version + 1,
-			updated_at = ?
-		WHERE id = ? AND version = ? AND state = ? AND selected_transport = ?
-			AND claim_token = ? AND claim_expires_at > ? AND expires_at > ?
-			AND revoked_at IS NULL`,
-		now, ticket.ID, expectedVersion, models.PlaybackTicketConsuming,
-		transport, claimToken, now, now)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n != 1 {
-		return ErrPlaybackTicketConflict
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return nil
+	return s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return lockPlaybackTicketTxContext(ctx, tx, binding)
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			ticket, err := loadPlaybackTicketTxContext(ctx, tx, binding)
+			if err != nil {
+				return false, err
+			}
+			switch ticket.State {
+			case models.PlaybackTicketRevoked:
+				return false, ErrPlaybackTicketRevoked
+			case models.PlaybackTicketExpired:
+				return false, ErrPlaybackTicketExpired
+			case models.PlaybackTicketConsuming:
+			default:
+				return false, ErrPlaybackTicketConflict
+			}
+			if !now.Before(ticket.ExpiresAt) {
+				expired, err := expirePlaybackTicketTxContext(ctx, tx, ticket, now)
+				if err != nil {
+					return false, err
+				}
+				if !expired {
+					return false, ErrPlaybackTicketConflict
+				}
+				return true, ErrPlaybackTicketExpired
+			}
+			if ticket.Version != expectedVersion || ticket.SelectedTransport != transport {
+				return false, ErrPlaybackTicketConflict
+			}
+			if ticket.ClaimToken != claimToken || ticket.ClaimExpiresAt == nil ||
+				!now.Before(*ticket.ClaimExpiresAt) {
+				return false, ErrPlaybackTicketConflict
+			}
+			if err := requirePlaybackTransportAllowedTxContext(
+				ctx, tx, ticket.DeviceID, transport); err != nil {
+				return false, err
+			}
+			res, err := tx.ExecContext(ctx, `UPDATE playback_tickets
+				SET claim_token = '', claim_expires_at = NULL, version = version + 1,
+					updated_at = ?
+				WHERE id = ? AND version = ? AND state = ? AND selected_transport = ?
+					AND claim_token = ? AND claim_expires_at > ? AND expires_at > ?
+					AND revoked_at IS NULL`,
+				now, ticket.ID, expectedVersion, models.PlaybackTicketConsuming,
+				transport, claimToken, now, now)
+			if err != nil {
+				return false, err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return false, err
+			}
+			if n != 1 {
+				return false, ErrPlaybackTicketConflict
+			}
+			return true, nil
+		},
+	)
 }
 
 // ReleasePlaybackTransportClaim clears one exact unexpired issuance lease so
@@ -1060,27 +1611,35 @@ func (s *Store) ReleasePlaybackTransportClaim(
 		strings.TrimSpace(claimToken) == "" {
 		return ErrInvalidPlaybackTransport
 	}
-	res, err := s.DB.ExecContext(ctx, `UPDATE playback_tickets
-		SET claim_token = '', claim_expires_at = NULL, version = version + 1,
-			updated_at = ?
-		WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?
-			AND version = ? AND state = ? AND selected_transport = ?
-			AND claim_token = ? AND claim_expires_at > ? AND expires_at > ?
-			AND revoked_at IS NULL`,
-		now, binding.TicketID, binding.UserID, binding.DeviceID, binding.FileID,
-		expectedVersion, models.PlaybackTicketConsuming, transport, claimToken,
-		now, now)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n != 1 {
-		return ErrPlaybackTicketConflict
-	}
-	return nil
+	return s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return lockPlaybackTicketTxContext(ctx, tx, binding)
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			res, err := tx.ExecContext(ctx, `UPDATE playback_tickets
+				SET claim_token = '', claim_expires_at = NULL, version = version + 1,
+					updated_at = ?
+				WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?
+					AND version = ? AND state = ? AND selected_transport = ?
+					AND claim_token = ? AND claim_expires_at > ? AND expires_at > ?
+					AND revoked_at IS NULL`,
+				now, binding.TicketID, binding.UserID, binding.DeviceID, binding.FileID,
+				expectedVersion, models.PlaybackTicketConsuming, transport, claimToken,
+				now, now)
+			if err != nil {
+				return false, err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return false, err
+			}
+			if n != 1 {
+				return false, ErrPlaybackTicketConflict
+			}
+			return true, nil
+		},
+	)
 }
 
 // RevokePlaybackTicket revokes one exact ticket binding and all active media
@@ -1090,6 +1649,21 @@ func (s *Store) RevokePlaybackTicket(
 	expectedVersion int64,
 	now time.Time,
 ) (*models.PlaybackTicket, error) {
+	return s.RevokePlaybackTicketContext(
+		context.Background(), binding, expectedVersion, now)
+}
+
+// RevokePlaybackTicketContext is RevokePlaybackTicket with cancellation and the
+// shared write budget covering the ticket, media, and subtitle revocations.
+func (s *Store) RevokePlaybackTicketContext(
+	ctx context.Context,
+	binding models.PlaybackTicketBinding,
+	expectedVersion int64,
+	now time.Time,
+) (*models.PlaybackTicket, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	now = playbackTime(now)
 	if err := validatePlaybackTicketBinding(binding); err != nil {
 		return nil, err
@@ -1097,65 +1671,69 @@ func (s *Store) RevokePlaybackTicket(
 	if expectedVersion <= 0 {
 		return nil, ErrPlaybackTicketConflict
 	}
-	tx, err := s.DB.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	if err := lockPlaybackTicketTx(tx, binding); err != nil {
-		return nil, err
-	}
-	ticket, err := loadPlaybackTicketTx(tx, binding)
-	if err != nil {
-		return nil, err
-	}
-	if ticket.State == models.PlaybackTicketRevoked {
-		return nil, ErrPlaybackTicketRevoked
-	}
-	if ticket.Version != expectedVersion {
-		return nil, ErrPlaybackTicketConflict
-	}
+	var revoked *models.PlaybackTicket
+	err := s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return lockPlaybackTicketTxContext(ctx, tx, binding)
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			ticket, err := loadPlaybackTicketTxContext(ctx, tx, binding)
+			if err != nil {
+				return false, err
+			}
+			if ticket.State == models.PlaybackTicketRevoked {
+				return false, ErrPlaybackTicketRevoked
+			}
+			if ticket.Version != expectedVersion {
+				return false, ErrPlaybackTicketConflict
+			}
 
-	res, err := tx.Exec(`UPDATE playback_tickets
-		SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
-		WHERE id = ? AND version = ? AND state <> ?`,
-		models.PlaybackTicketRevoked, now, now, ticket.ID, expectedVersion,
-		models.PlaybackTicketRevoked)
+			res, err := tx.ExecContext(ctx, `UPDATE playback_tickets
+				SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
+				WHERE id = ? AND version = ? AND state <> ?`,
+				models.PlaybackTicketRevoked, now, now, ticket.ID, expectedVersion,
+				models.PlaybackTicketRevoked)
+			if err != nil {
+				return false, err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return false, err
+			}
+			if n != 1 {
+				return false, ErrPlaybackTicketConflict
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE playback_media_sessions
+				SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
+				WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?
+					AND state = ?`,
+				models.PlaybackMediaSessionRevoked, now, now, binding.TicketID,
+				binding.UserID, binding.DeviceID, binding.FileID,
+				models.PlaybackMediaSessionActive); err != nil {
+				return false, err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE playback_subtitle_sessions
+				SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
+				WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?
+					AND state = ?`,
+				models.PlaybackSubtitleSessionRevoked, now, now, binding.TicketID,
+				binding.UserID, binding.DeviceID, binding.FileID,
+				models.PlaybackSubtitleSessionActive); err != nil {
+				return false, err
+			}
+			ticket.State = models.PlaybackTicketRevoked
+			ticket.RevokedAt = timePointer(now)
+			ticket.Version++
+			ticket.UpdatedAt = now
+			revoked = ticket
+			return true, nil
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return nil, err
-	}
-	if n != 1 {
-		return nil, ErrPlaybackTicketConflict
-	}
-	if _, err := tx.Exec(`UPDATE playback_media_sessions
-		SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
-		WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?
-			AND state = ?`,
-		models.PlaybackMediaSessionRevoked, now, now, binding.TicketID,
-		binding.UserID, binding.DeviceID, binding.FileID, models.PlaybackMediaSessionActive); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(`UPDATE playback_subtitle_sessions
-		SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
-		WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?
-			AND state = ?`,
-		models.PlaybackSubtitleSessionRevoked, now, now, binding.TicketID,
-		binding.UserID, binding.DeviceID, binding.FileID,
-		models.PlaybackSubtitleSessionActive); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	ticket.State = models.PlaybackTicketRevoked
-	ticket.RevokedAt = timePointer(now)
-	ticket.Version++
-	ticket.UpdatedAt = now
-	return ticket, nil
+	return revoked, nil
 }
 
 // ExpirePlaybackTickets conditionally expires tickets past their absolute TTL.
@@ -1171,6 +1749,43 @@ func (s *Store) ExpirePlaybackTickets(now time.Time) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// FailInterruptedPlaybackProbes converges probing tickets left by a previous
+// process. Probe workers are intentionally in-memory, so startup is the point
+// at which every remaining probing row is known to have no worker. Overdue rows
+// become expired; live rows become failed and bump their version so an old
+// worker can never complete them. The operation is idempotent.
+func (s *Store) FailInterruptedPlaybackProbes(now time.Time) (int64, error) {
+	now = playbackTime(now)
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE playback_tickets
+		SET state = ?, version = version + 1, updated_at = ?
+		WHERE state = ? AND expires_at <= ? AND revoked_at IS NULL`,
+		models.PlaybackTicketExpired, now, models.PlaybackTicketProbing, now); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`UPDATE playback_tickets
+		SET state = ?, failure_code = 'probe_interrupted',
+			selected_transport = '', claim_token = '', claim_expires_at = NULL,
+			version = version + 1, updated_at = ?
+		WHERE state = ? AND expires_at > ? AND revoked_at IS NULL`,
+		models.PlaybackTicketFailed, now, models.PlaybackTicketProbing, now)
+	if err != nil {
+		return 0, err
+	}
+	interrupted, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return interrupted, nil
 }
 
 // CreatePlaybackMediaSession issues a capability once and persists only its
@@ -1196,146 +1811,130 @@ func (s *Store) CreatePlaybackMediaSession(
 		return nil, err
 	}
 
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := lockPlaybackTicketTxContext(ctx, tx, req.Ticket); err != nil {
-		return nil, err
-	}
-	ticket, err := loadPlaybackTicketTxContext(ctx, tx, req.Ticket)
-	if err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := requirePlaybackTransportAllowedTx(tx, ticket.DeviceID, req.Transport); err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	switch ticket.State {
-	case models.PlaybackTicketExpired:
-		return nil, ErrPlaybackTicketExpired
-	case models.PlaybackTicketRevoked:
-		return nil, ErrPlaybackTicketRevoked
-	case models.PlaybackTicketConsuming:
-	default:
-		return nil, ErrPlaybackTicketConflict
-	}
-	if !now.Before(ticket.ExpiresAt) {
-		expired, err := expirePlaybackTicketTxContext(ctx, tx, ticket, now)
-		if err != nil {
-			return nil, err
-		}
-		if !expired {
-			return nil, ErrPlaybackTicketConflict
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		return nil, ErrPlaybackTicketExpired
-	}
-	if ticket.SelectedTransport != req.Transport {
-		return nil, ErrInvalidPlaybackMediaSession
-	}
-	if ticket.VideoIndex < models.PlaybackVideoIndexUnknown {
-		return nil, ErrInvalidPlaybackMediaSession
-	}
-	if req.Transport == models.PlaybackTransportServerHLS &&
-		ticket.VideoIndex == models.PlaybackVideoIndexUnknown {
-		// A legacy ticket has no trustworthy video snapshot. HLS must not infer
-		// one from whatever ffprobe returns for a later segment.
-		return nil, ErrInvalidPlaybackMediaSession
-	}
-	foundAttempt := false
-	for _, transport := range ticket.AttemptedTransports {
-		if transport == req.Transport {
-			foundAttempt = true
-			break
-		}
-	}
-	if !foundAttempt {
-		return nil, ErrInvalidPlaybackMediaSession
-	}
-	var existing int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM playback_media_sessions
-		WHERE ticket_id = ? AND transport = ? AND state = ?`,
-		req.Ticket.TicketID, req.Transport, models.PlaybackMediaSessionActive).Scan(&existing)
-	if err == nil {
-		return nil, ErrPlaybackMediaSessionConflict
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+	var grant *models.PlaybackMediaSessionGrant
+	commitAttempted := false
+	err = s.withPlaybackWriteTxConfiguredAndCommit(
+		ctx,
+		playbackWriteLockBudget,
+		restorePlaybackBusyTimeout,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return lockPlaybackTicketTxContext(ctx, tx, req.Ticket)
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			ticket, err := loadPlaybackTicketTxContext(ctx, tx, req.Ticket)
+			if err != nil {
+				return false, err
+			}
+			if err := requirePlaybackTransportAllowedTxContext(
+				ctx, tx, ticket.DeviceID, req.Transport); err != nil {
+				return false, err
+			}
+			switch ticket.State {
+			case models.PlaybackTicketExpired:
+				return false, ErrPlaybackTicketExpired
+			case models.PlaybackTicketRevoked:
+				return false, ErrPlaybackTicketRevoked
+			case models.PlaybackTicketConsuming:
+			default:
+				return false, ErrPlaybackTicketConflict
+			}
+			if !now.Before(ticket.ExpiresAt) {
+				expired, err := expirePlaybackTicketTxContext(ctx, tx, ticket, now)
+				if err != nil {
+					return false, err
+				}
+				if !expired {
+					return false, ErrPlaybackTicketConflict
+				}
+				return true, ErrPlaybackTicketExpired
+			}
+			if ticket.SelectedTransport != req.Transport {
+				return false, ErrInvalidPlaybackMediaSession
+			}
+			if ticket.VideoIndex < models.PlaybackVideoIndexUnknown {
+				return false, ErrInvalidPlaybackMediaSession
+			}
+			if req.Transport == models.PlaybackTransportServerHLS &&
+				ticket.VideoIndex == models.PlaybackVideoIndexUnknown {
+				// A legacy ticket has no trustworthy video snapshot. HLS must not
+				// infer one from whatever ffprobe returns for a later segment.
+				return false, ErrInvalidPlaybackMediaSession
+			}
+			foundAttempt := false
+			for _, transport := range ticket.AttemptedTransports {
+				if transport == req.Transport {
+					foundAttempt = true
+					break
+				}
+			}
+			if !foundAttempt {
+				return false, ErrInvalidPlaybackMediaSession
+			}
+			var existing int
+			err = tx.QueryRowContext(ctx, `SELECT 1 FROM playback_media_sessions
+				WHERE ticket_id = ? AND transport = ? AND state = ?`,
+				req.Ticket.TicketID, req.Transport,
+				models.PlaybackMediaSessionActive).Scan(&existing)
+			if err == nil {
+				return false, ErrPlaybackMediaSessionConflict
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return false, err
+			}
 
-	absoluteExpiresAt := now.Add(models.PlaybackMediaSessionAbsoluteTTL)
-	idleExpiresAt := now.Add(models.PlaybackMediaSessionIdleTTL)
-	if idleExpiresAt.After(absoluteExpiresAt) {
-		idleExpiresAt = absoluteExpiresAt
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	res, err := tx.ExecContext(ctx, `INSERT INTO playback_media_sessions
-		(capability_hash, ticket_id, user_id, device_id, file_id, purpose,
-		 transport, state, mode, audio_ordinal, video_index, start_seconds,
-		 quality, transcode_height, version, created_at, idle_expires_at,
-		 absolute_expires_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		hashPlaybackCapability(capability), req.Ticket.TicketID,
-		req.Ticket.UserID, req.Ticket.DeviceID, req.Ticket.FileID,
-		models.PlaybackPurposePlayback, req.Transport,
-		models.PlaybackMediaSessionActive, req.Mode, req.AudioOrdinal,
-		ticket.VideoIndex, req.StartSeconds, nullablePlaybackString(req.Quality),
-		nullablePlaybackInt(req.TranscodeHeight), 1, now, idleExpiresAt,
-		absoluteExpiresAt, now)
+			absoluteExpiresAt := now.Add(models.PlaybackMediaSessionAbsoluteTTL)
+			idleExpiresAt := now.Add(models.PlaybackMediaSessionIdleTTL)
+			if idleExpiresAt.After(absoluteExpiresAt) {
+				idleExpiresAt = absoluteExpiresAt
+			}
+			res, err := tx.ExecContext(ctx, `INSERT INTO playback_media_sessions
+				(capability_hash, ticket_id, user_id, device_id, file_id, purpose,
+				 transport, state, mode, audio_ordinal, video_index, start_seconds,
+				 quality, transcode_height, version, created_at, idle_expires_at,
+				 absolute_expires_at, updated_at)
+				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				hashPlaybackCapability(capability), req.Ticket.TicketID,
+				req.Ticket.UserID, req.Ticket.DeviceID, req.Ticket.FileID,
+				models.PlaybackPurposePlayback, req.Transport,
+				models.PlaybackMediaSessionActive, req.Mode, req.AudioOrdinal,
+				ticket.VideoIndex, req.StartSeconds, nullablePlaybackString(req.Quality),
+				nullablePlaybackInt(req.TranscodeHeight), 1, now, idleExpiresAt,
+				absoluteExpiresAt, now)
+			if err != nil {
+				return false, err
+			}
+			id, err := res.LastInsertId()
+			if err != nil {
+				return false, err
+			}
+			session := &models.PlaybackMediaSession{
+				ID: id, TicketID: req.Ticket.TicketID, UserID: req.Ticket.UserID,
+				DeviceID: req.Ticket.DeviceID, FileID: req.Ticket.FileID,
+				Purpose: models.PlaybackPurposePlayback, Transport: req.Transport,
+				State: models.PlaybackMediaSessionActive, Mode: req.Mode,
+				AudioOrdinal: req.AudioOrdinal, VideoIndex: ticket.VideoIndex,
+				StartSeconds: req.StartSeconds,
+				Quality:      req.Quality, TranscodeHeight: req.TranscodeHeight, Version: 1,
+				CreatedAt: now, IdleExpiresAt: idleExpiresAt,
+				AbsoluteExpiresAt: absoluteExpiresAt, UpdatedAt: now,
+			}
+			grant = &models.PlaybackMediaSessionGrant{
+				Session: session, Capability: capability,
+			}
+			return true, nil
+		},
+		func(tx *sql.Tx) error {
+			commitAttempted = true
+			return tx.Commit()
+		},
+	)
 	if err != nil {
+		if grant != nil && commitAttempted {
+			// The insert may have committed before the context-visible error.
+			// Return the grant so the caller can revoke any committed capability.
+			return grant, err
+		}
 		return nil, err
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return nil, err
-	}
-	session := &models.PlaybackMediaSession{
-		ID: id, TicketID: req.Ticket.TicketID, UserID: req.Ticket.UserID,
-		DeviceID: req.Ticket.DeviceID, FileID: req.Ticket.FileID,
-		Purpose: models.PlaybackPurposePlayback, Transport: req.Transport,
-		State: models.PlaybackMediaSessionActive, Mode: req.Mode,
-		AudioOrdinal: req.AudioOrdinal, VideoIndex: ticket.VideoIndex,
-		StartSeconds: req.StartSeconds,
-		Quality:      req.Quality, TranscodeHeight: req.TranscodeHeight, Version: 1,
-		CreatedAt: now, IdleExpiresAt: idleExpiresAt,
-		AbsoluteExpiresAt: absoluteExpiresAt, UpdatedAt: now,
-	}
-	grant := &models.PlaybackMediaSessionGrant{
-		Session: session, Capability: capability,
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		// The insert may have committed before the context-visible error. Return
-		// the grant so the caller can revoke any committed capability.
-		return grant, err
-	}
-	if err := ctx.Err(); err != nil {
-		return grant, err
 	}
 	return grant, nil
 }
@@ -1348,11 +1947,27 @@ func (s *Store) PlaybackMediaSessionByCapability(
 	capability string,
 	now time.Time,
 ) (*models.PlaybackMediaSession, error) {
+	return s.PlaybackMediaSessionByCapabilityContext(
+		context.Background(), binding, capability, now)
+}
+
+// PlaybackMediaSessionByCapabilityContext is
+// PlaybackMediaSessionByCapability with cancellation propagated through a lazy
+// expiry write, when one is required.
+func (s *Store) PlaybackMediaSessionByCapabilityContext(
+	ctx context.Context,
+	binding models.PlaybackMediaSessionBinding,
+	capability string,
+	now time.Time,
+) (*models.PlaybackMediaSession, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	now = playbackTime(now)
 	if err := validatePlaybackMediaSessionBinding(binding); err != nil {
 		return nil, ErrPlaybackMediaSessionNotFound
 	}
-	session, err := scanPlaybackMediaSession(s.DB.QueryRow(`SELECT `+
+	session, err := scanPlaybackMediaSession(s.DB.QueryRowContext(ctx, `SELECT `+
 		playbackMediaSessionColumns+`
 		FROM playback_media_sessions
 		WHERE capability_hash = ? AND ticket_id = ? AND user_id = ?
@@ -1369,25 +1984,39 @@ func (s *Store) PlaybackMediaSessionByCapability(
 	if session.State != models.PlaybackMediaSessionActive ||
 		(!now.Before(session.IdleExpiresAt) || !now.Before(session.AbsoluteExpiresAt)) {
 		if session.State == models.PlaybackMediaSessionActive {
-			res, err := s.DB.Exec(`UPDATE playback_media_sessions
-				SET state = ?, version = version + 1, updated_at = ?
-				WHERE id = ? AND version = ? AND state = ?
-					AND (idle_expires_at <= ? OR absolute_expires_at <= ?)`,
-				models.PlaybackMediaSessionExpired, now, session.ID,
-				session.Version, models.PlaybackMediaSessionActive, now, now)
+			updated := false
+			err := s.withPlaybackWriteTx(
+				ctx,
+				func(ctx context.Context, tx *sql.Tx) error {
+					return lockPlaybackMediaSessionTxContext(ctx, tx, capability)
+				},
+				func(ctx context.Context, tx *sql.Tx) (bool, error) {
+					res, err := tx.ExecContext(ctx, `UPDATE playback_media_sessions
+						SET state = ?, version = version + 1, updated_at = ?
+						WHERE id = ? AND version = ? AND state = ?
+							AND (idle_expires_at <= ? OR absolute_expires_at <= ?)`,
+						models.PlaybackMediaSessionExpired, now, session.ID,
+						session.Version, models.PlaybackMediaSessionActive, now, now)
+					if err != nil {
+						return false, err
+					}
+					n, err := res.RowsAffected()
+					if err != nil {
+						return false, err
+					}
+					updated = n == 1
+					return updated, nil
+				},
+			)
 			if err != nil {
 				return nil, err
 			}
-			n, err := res.RowsAffected()
-			if err != nil {
-				return nil, err
-			}
-			if n == 1 {
+			if updated {
 				session.State = models.PlaybackMediaSessionExpired
 				session.Version++
 				session.UpdatedAt = now
 			} else {
-				reloaded, err := scanPlaybackMediaSession(s.DB.QueryRow(`SELECT `+
+				reloaded, err := scanPlaybackMediaSession(s.DB.QueryRowContext(ctx, `SELECT `+
 					playbackMediaSessionColumns+`
 					FROM playback_media_sessions
 					WHERE capability_hash = ? AND ticket_id = ? AND user_id = ?
@@ -1436,131 +2065,129 @@ func (s *Store) AuthorizePlaybackMediaSessionContext(
 	if strings.TrimSpace(capability) == "" {
 		return nil, ErrPlaybackMediaSessionNotFound
 	}
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	if err := lockPlaybackMediaSessionTxContext(ctx, tx, capability); err != nil {
-		return nil, err
-	}
+	var access *PlaybackMediaSessionAccess
+	if err := s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return lockPlaybackMediaSessionTxContext(ctx, tx, capability)
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			session, err := scanPlaybackMediaSession(tx.QueryRowContext(ctx, `SELECT `+
+				playbackMediaSessionColumns+`
+				FROM playback_media_sessions WHERE capability_hash = ?`,
+				hashPlaybackCapability(capability)))
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, ErrPlaybackMediaSessionNotFound
+			}
+			if err != nil {
+				return false, err
+			}
+			switch session.State {
+			case models.PlaybackMediaSessionRevoked:
+				return false, ErrPlaybackMediaSessionRevoked
+			case models.PlaybackMediaSessionExpired:
+				return false, ErrPlaybackMediaSessionExpired
+			case models.PlaybackMediaSessionActive:
+			default:
+				return false, ErrPlaybackMediaSessionConflict
+			}
+			if !now.Before(session.IdleExpiresAt) || !now.Before(session.AbsoluteExpiresAt) {
+				res, err := tx.ExecContext(ctx, `UPDATE playback_media_sessions
+					SET state = ?, version = version + 1, updated_at = ?
+					WHERE id = ? AND version = ? AND state = ?
+						AND (idle_expires_at <= ? OR absolute_expires_at <= ?)`,
+					models.PlaybackMediaSessionExpired, now, session.ID, session.Version,
+					models.PlaybackMediaSessionActive, now, now)
+				if err != nil {
+					return false, err
+				}
+				n, err := res.RowsAffected()
+				if err != nil {
+					return false, err
+				}
+				if n != 1 {
+					return false, ErrPlaybackMediaSessionConflict
+				}
+				return true, ErrPlaybackMediaSessionExpired
+			}
 
-	session, err := scanPlaybackMediaSession(tx.QueryRowContext(ctx, `SELECT `+
-		playbackMediaSessionColumns+`
-		FROM playback_media_sessions WHERE capability_hash = ?`,
-		hashPlaybackCapability(capability)))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrPlaybackMediaSessionNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	switch session.State {
-	case models.PlaybackMediaSessionRevoked:
-		return nil, ErrPlaybackMediaSessionRevoked
-	case models.PlaybackMediaSessionExpired:
-		return nil, ErrPlaybackMediaSessionExpired
-	case models.PlaybackMediaSessionActive:
-	default:
-		return nil, ErrPlaybackMediaSessionConflict
-	}
-	if !now.Before(session.IdleExpiresAt) || !now.Before(session.AbsoluteExpiresAt) {
-		res, err := tx.ExecContext(ctx, `UPDATE playback_media_sessions
-			SET state = ?, version = version + 1, updated_at = ?
-			WHERE id = ? AND version = ? AND state = ?
-				AND (idle_expires_at <= ? OR absolute_expires_at <= ?)`,
-			models.PlaybackMediaSessionExpired, now, session.ID, session.Version,
-			models.PlaybackMediaSessionActive, now, now)
-		if err != nil {
-			return nil, err
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return nil, err
-		}
-		if n != 1 {
-			return nil, ErrPlaybackMediaSessionConflict
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		return nil, ErrPlaybackMediaSessionExpired
-	}
+			var (
+				user          models.User
+				emailVerified int
+				device        models.Device
+				deviceRevoked sql.NullTime
+			)
+			err = tx.QueryRowContext(ctx, `SELECT
+				u.id, u.name, u.status, u.email, u.email_verified,
+				d.id, d.public_id, d.user_id, d.name, d.platform, d.client_version,
+				d.created_at, d.last_seen_at, d.revoked_at
+				FROM users u JOIN devices d ON d.user_id = u.id
+				WHERE u.id = ? AND d.id = ?`,
+				session.UserID, session.DeviceID).
+				Scan(&user.ID, &user.Name, &user.Status, &user.Email, &emailVerified,
+					&device.ID, &device.PublicID, &device.UserID, &device.Name,
+					&device.Platform, &device.ClientVersion, &device.CreatedAt,
+					&device.LastSeenAt, &deviceRevoked)
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, ErrDeviceUserUnavailable
+			}
+			if err != nil {
+				return false, err
+			}
+			user.EmailVerified = emailVerified != 0
+			if !deviceAuthUserAllowed(user.Status, user.Email, user.EmailVerified, requireEmailVerification) {
+				return false, ErrDeviceUserUnavailable
+			}
+			if deviceRevoked.Valid {
+				return false, ErrDeviceRevoked
+			}
+			overrides, err := loadDeviceFeatureOverridesContext(ctx, tx, device.ID)
+			if err != nil {
+				return false, err
+			}
+			if overrides.DisablesPlaybackTickets() ||
+				overrides.DisablesPlaybackTransport(session.Transport) {
+				return false, ErrDevicePlaybackDisabled
+			}
 
-	var (
-		user          models.User
-		emailVerified int
-		device        models.Device
-		deviceRevoked sql.NullTime
-	)
-	err = tx.QueryRowContext(ctx, `SELECT
-		u.id, u.name, u.status, u.email, u.email_verified,
-		d.id, d.public_id, d.user_id, d.name, d.platform, d.client_version,
-		d.created_at, d.last_seen_at, d.revoked_at
-		FROM users u JOIN devices d ON d.user_id = u.id
-		WHERE u.id = ? AND d.id = ?`,
-		session.UserID, session.DeviceID).
-		Scan(&user.ID, &user.Name, &user.Status, &user.Email, &emailVerified,
-			&device.ID, &device.PublicID, &device.UserID, &device.Name,
-			&device.Platform, &device.ClientVersion, &device.CreatedAt,
-			&device.LastSeenAt, &deviceRevoked)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrDeviceUserUnavailable
-	}
-	if err != nil {
+			idleExpiresAt := now.Add(models.PlaybackMediaSessionIdleTTL)
+			if idleExpiresAt.After(session.AbsoluteExpiresAt) {
+				idleExpiresAt = session.AbsoluteExpiresAt
+			}
+			res, err := tx.ExecContext(ctx, `UPDATE playback_media_sessions
+				SET last_used_at = ?, idle_expires_at = ?, version = version + 1,
+					updated_at = ?
+				WHERE id = ? AND version = ? AND state = ?
+					AND idle_expires_at > ? AND absolute_expires_at > ?`,
+				now, idleExpiresAt, now, session.ID, session.Version,
+				models.PlaybackMediaSessionActive, now, now)
+			if err != nil {
+				return false, err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return false, err
+			}
+			if n != 1 {
+				return false, ErrPlaybackMediaSessionConflict
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE devices SET last_seen_at = ?
+				WHERE id = ? AND revoked_at IS NULL`, now, device.ID); err != nil {
+				return false, err
+			}
+			session.LastUsedAt = timePointer(now)
+			session.IdleExpiresAt = idleExpiresAt
+			session.Version++
+			session.UpdatedAt = now
+			access = &PlaybackMediaSessionAccess{
+				Session: session, User: &user, Device: &device,
+			}
+			return true, nil
+		},
+	); err != nil {
 		return nil, err
 	}
-	user.EmailVerified = emailVerified != 0
-	if !deviceAuthUserAllowed(user.Status, user.Email, user.EmailVerified, requireEmailVerification) {
-		return nil, ErrDeviceUserUnavailable
-	}
-	if deviceRevoked.Valid {
-		return nil, ErrDeviceRevoked
-	}
-	overrides, err := loadDeviceFeatureOverridesContext(ctx, tx, device.ID)
-	if err != nil {
-		return nil, err
-	}
-	if overrides.DisablesPlaybackTickets() ||
-		overrides.DisablesPlaybackTransport(session.Transport) {
-		return nil, ErrDevicePlaybackDisabled
-	}
-
-	idleExpiresAt := now.Add(models.PlaybackMediaSessionIdleTTL)
-	if idleExpiresAt.After(session.AbsoluteExpiresAt) {
-		idleExpiresAt = session.AbsoluteExpiresAt
-	}
-	res, err := tx.ExecContext(ctx, `UPDATE playback_media_sessions
-		SET last_used_at = ?, idle_expires_at = ?, version = version + 1,
-			updated_at = ?
-		WHERE id = ? AND version = ? AND state = ?
-			AND idle_expires_at > ? AND absolute_expires_at > ?`,
-		now, idleExpiresAt, now, session.ID, session.Version,
-		models.PlaybackMediaSessionActive, now, now)
-	if err != nil {
-		return nil, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return nil, err
-	}
-	if n != 1 {
-		return nil, ErrPlaybackMediaSessionConflict
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE devices SET last_seen_at = ?
-		WHERE id = ? AND revoked_at IS NULL`, now, device.ID); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	session.LastUsedAt = timePointer(now)
-	session.IdleExpiresAt = idleExpiresAt
-	session.Version++
-	session.UpdatedAt = now
-	return &PlaybackMediaSessionAccess{
-		Session: session, User: &user, Device: &device,
-	}, nil
+	return access, nil
 }
 
 // TouchPlaybackMediaSession authorizes one media request and slides the idle
@@ -1570,101 +2197,116 @@ func (s *Store) TouchPlaybackMediaSession(
 	capability string,
 	now time.Time,
 ) (*models.PlaybackMediaSession, error) {
+	return s.TouchPlaybackMediaSessionContext(
+		context.Background(), binding, capability, now)
+}
+
+// TouchPlaybackMediaSessionContext is TouchPlaybackMediaSession with
+// cancellation covering the shared writer wait and the session CAS.
+func (s *Store) TouchPlaybackMediaSessionContext(
+	ctx context.Context,
+	binding models.PlaybackMediaSessionBinding,
+	capability string,
+	now time.Time,
+) (*models.PlaybackMediaSession, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	now = playbackTime(now)
 	if err := validatePlaybackMediaSessionBinding(binding); err != nil {
 		return nil, ErrPlaybackMediaSessionNotFound
 	}
-	tx, err := s.DB.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	if err := lockPlaybackMediaSessionTx(tx, capability); err != nil {
-		return nil, err
-	}
-	session, err := scanPlaybackMediaSession(tx.QueryRow(`SELECT `+
-		playbackMediaSessionColumns+`
-		FROM playback_media_sessions
-		WHERE capability_hash = ? AND ticket_id = ? AND user_id = ?
-			AND device_id = ? AND file_id = ? AND transport = ?`,
-		hashPlaybackCapability(capability), binding.Ticket.TicketID,
-		binding.Ticket.UserID, binding.Ticket.DeviceID, binding.Ticket.FileID,
-		binding.Transport))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrPlaybackMediaSessionNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	switch session.State {
-	case models.PlaybackMediaSessionRevoked:
-		return nil, ErrPlaybackMediaSessionRevoked
-	case models.PlaybackMediaSessionExpired:
-		return nil, ErrPlaybackMediaSessionExpired
-	case models.PlaybackMediaSessionActive:
-	default:
-		return nil, ErrPlaybackMediaSessionConflict
-	}
-	if !now.Before(session.IdleExpiresAt) || !now.Before(session.AbsoluteExpiresAt) {
-		res, err := tx.Exec(`UPDATE playback_media_sessions
-			SET state = ?, version = version + 1, updated_at = ?
-			WHERE id = ? AND version = ? AND state = ?
-				AND (idle_expires_at <= ? OR absolute_expires_at <= ?)`,
-			models.PlaybackMediaSessionExpired, now, session.ID, session.Version,
-			models.PlaybackMediaSessionActive, now, now)
-		if err != nil {
-			return nil, err
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return nil, err
-		}
-		if n != 1 {
-			return nil, ErrPlaybackMediaSessionConflict
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		return nil, ErrPlaybackMediaSessionExpired
-	}
-	overrides, err := loadDeviceFeatureOverrides(tx, session.DeviceID)
-	if err != nil {
-		return nil, err
-	}
-	if overrides.DisablesPlaybackTickets() ||
-		overrides.DisablesPlaybackTransport(session.Transport) {
-		return nil, ErrDevicePlaybackDisabled
-	}
+	var touched *models.PlaybackMediaSession
+	err := s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return lockPlaybackMediaSessionTxContext(ctx, tx, capability)
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			session, err := scanPlaybackMediaSession(tx.QueryRowContext(ctx, `SELECT `+
+				playbackMediaSessionColumns+`
+				FROM playback_media_sessions
+				WHERE capability_hash = ? AND ticket_id = ? AND user_id = ?
+					AND device_id = ? AND file_id = ? AND transport = ?`,
+				hashPlaybackCapability(capability), binding.Ticket.TicketID,
+				binding.Ticket.UserID, binding.Ticket.DeviceID, binding.Ticket.FileID,
+				binding.Transport))
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, ErrPlaybackMediaSessionNotFound
+			}
+			if err != nil {
+				return false, err
+			}
+			switch session.State {
+			case models.PlaybackMediaSessionRevoked:
+				return false, ErrPlaybackMediaSessionRevoked
+			case models.PlaybackMediaSessionExpired:
+				return false, ErrPlaybackMediaSessionExpired
+			case models.PlaybackMediaSessionActive:
+			default:
+				return false, ErrPlaybackMediaSessionConflict
+			}
+			if !now.Before(session.IdleExpiresAt) || !now.Before(session.AbsoluteExpiresAt) {
+				res, err := tx.ExecContext(ctx, `UPDATE playback_media_sessions
+					SET state = ?, version = version + 1, updated_at = ?
+					WHERE id = ? AND version = ? AND state = ?
+						AND (idle_expires_at <= ? OR absolute_expires_at <= ?)`,
+					models.PlaybackMediaSessionExpired, now, session.ID, session.Version,
+					models.PlaybackMediaSessionActive, now, now)
+				if err != nil {
+					return false, err
+				}
+				n, err := res.RowsAffected()
+				if err != nil {
+					return false, err
+				}
+				if n != 1 {
+					return false, ErrPlaybackMediaSessionConflict
+				}
+				return true, ErrPlaybackMediaSessionExpired
+			}
+			overrides, err := loadDeviceFeatureOverridesContext(ctx, tx, session.DeviceID)
+			if err != nil {
+				return false, err
+			}
+			if overrides.DisablesPlaybackTickets() ||
+				overrides.DisablesPlaybackTransport(session.Transport) {
+				return false, ErrDevicePlaybackDisabled
+			}
 
-	idleExpiresAt := now.Add(models.PlaybackMediaSessionIdleTTL)
-	if idleExpiresAt.After(session.AbsoluteExpiresAt) {
-		idleExpiresAt = session.AbsoluteExpiresAt
-	}
-	res, err := tx.Exec(`UPDATE playback_media_sessions
-		SET last_used_at = ?, idle_expires_at = ?, version = version + 1,
-			updated_at = ?
-		WHERE id = ? AND version = ? AND state = ?
-			AND idle_expires_at > ? AND absolute_expires_at > ?`,
-		now, idleExpiresAt, now, session.ID, session.Version,
-		models.PlaybackMediaSessionActive, now, now)
+			idleExpiresAt := now.Add(models.PlaybackMediaSessionIdleTTL)
+			if idleExpiresAt.After(session.AbsoluteExpiresAt) {
+				idleExpiresAt = session.AbsoluteExpiresAt
+			}
+			res, err := tx.ExecContext(ctx, `UPDATE playback_media_sessions
+				SET last_used_at = ?, idle_expires_at = ?, version = version + 1,
+					updated_at = ?
+				WHERE id = ? AND version = ? AND state = ?
+					AND idle_expires_at > ? AND absolute_expires_at > ?`,
+				now, idleExpiresAt, now, session.ID, session.Version,
+				models.PlaybackMediaSessionActive, now, now)
+			if err != nil {
+				return false, err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return false, err
+			}
+			if n != 1 {
+				return false, ErrPlaybackMediaSessionConflict
+			}
+			session.LastUsedAt = timePointer(now)
+			session.IdleExpiresAt = idleExpiresAt
+			session.Version++
+			session.UpdatedAt = now
+			touched = session
+			return true, nil
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return nil, err
-	}
-	if n != 1 {
-		return nil, ErrPlaybackMediaSessionConflict
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	session.LastUsedAt = timePointer(now)
-	session.IdleExpiresAt = idleExpiresAt
-	session.Version++
-	session.UpdatedAt = now
-	return session, nil
+	return touched, nil
 }
 
 // RevokePlaybackMediaSession revokes one capability using an exact binding and
@@ -1675,6 +2317,22 @@ func (s *Store) RevokePlaybackMediaSession(
 	expectedVersion int64,
 	now time.Time,
 ) (*models.PlaybackMediaSession, error) {
+	return s.RevokePlaybackMediaSessionContext(
+		context.Background(), binding, capability, expectedVersion, now)
+}
+
+// RevokePlaybackMediaSessionContext is RevokePlaybackMediaSession with
+// cancellation covering the shared writer wait and the version CAS.
+func (s *Store) RevokePlaybackMediaSessionContext(
+	ctx context.Context,
+	binding models.PlaybackMediaSessionBinding,
+	capability string,
+	expectedVersion int64,
+	now time.Time,
+) (*models.PlaybackMediaSession, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	now = playbackTime(now)
 	if err := validatePlaybackMediaSessionBinding(binding); err != nil {
 		return nil, ErrPlaybackMediaSessionNotFound
@@ -1682,60 +2340,63 @@ func (s *Store) RevokePlaybackMediaSession(
 	if expectedVersion <= 0 {
 		return nil, ErrPlaybackMediaSessionConflict
 	}
-	tx, err := s.DB.Begin()
+	var revoked *models.PlaybackMediaSession
+	err := s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return lockPlaybackMediaSessionTxContext(ctx, tx, capability)
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			session, err := scanPlaybackMediaSession(tx.QueryRowContext(ctx, `SELECT `+
+				playbackMediaSessionColumns+`
+				FROM playback_media_sessions
+				WHERE capability_hash = ? AND ticket_id = ? AND user_id = ?
+					AND device_id = ? AND file_id = ? AND transport = ?`,
+				hashPlaybackCapability(capability), binding.Ticket.TicketID,
+				binding.Ticket.UserID, binding.Ticket.DeviceID, binding.Ticket.FileID,
+				binding.Transport))
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, ErrPlaybackMediaSessionNotFound
+			}
+			if err != nil {
+				return false, err
+			}
+			switch session.State {
+			case models.PlaybackMediaSessionRevoked:
+				return false, ErrPlaybackMediaSessionRevoked
+			case models.PlaybackMediaSessionExpired:
+				return false, ErrPlaybackMediaSessionExpired
+			}
+			if session.Version != expectedVersion {
+				return false, ErrPlaybackMediaSessionConflict
+			}
+			res, err := tx.ExecContext(ctx, `UPDATE playback_media_sessions
+				SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
+				WHERE id = ? AND version = ? AND state = ?`,
+				models.PlaybackMediaSessionRevoked, now, now, session.ID,
+				expectedVersion, models.PlaybackMediaSessionActive)
+			if err != nil {
+				return false, err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return false, err
+			}
+			if n != 1 {
+				return false, ErrPlaybackMediaSessionConflict
+			}
+			session.State = models.PlaybackMediaSessionRevoked
+			session.RevokedAt = timePointer(now)
+			session.Version++
+			session.UpdatedAt = now
+			revoked = session
+			return true, nil
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
-	if err := lockPlaybackMediaSessionTx(tx, capability); err != nil {
-		return nil, err
-	}
-	session, err := scanPlaybackMediaSession(tx.QueryRow(`SELECT `+
-		playbackMediaSessionColumns+`
-		FROM playback_media_sessions
-		WHERE capability_hash = ? AND ticket_id = ? AND user_id = ?
-			AND device_id = ? AND file_id = ? AND transport = ?`,
-		hashPlaybackCapability(capability), binding.Ticket.TicketID,
-		binding.Ticket.UserID, binding.Ticket.DeviceID, binding.Ticket.FileID,
-		binding.Transport))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrPlaybackMediaSessionNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	switch session.State {
-	case models.PlaybackMediaSessionRevoked:
-		return nil, ErrPlaybackMediaSessionRevoked
-	case models.PlaybackMediaSessionExpired:
-		return nil, ErrPlaybackMediaSessionExpired
-	}
-	if session.Version != expectedVersion {
-		return nil, ErrPlaybackMediaSessionConflict
-	}
-	res, err := tx.Exec(`UPDATE playback_media_sessions
-		SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
-		WHERE id = ? AND version = ? AND state = ?`,
-		models.PlaybackMediaSessionRevoked, now, now, session.ID,
-		expectedVersion, models.PlaybackMediaSessionActive)
-	if err != nil {
-		return nil, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return nil, err
-	}
-	if n != 1 {
-		return nil, ErrPlaybackMediaSessionConflict
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	session.State = models.PlaybackMediaSessionRevoked
-	session.RevokedAt = timePointer(now)
-	session.Version++
-	session.UpdatedAt = now
-	return session, nil
+	return revoked, nil
 }
 
 // RevokePlaybackMediaSessionsForTicket revokes all active sessions for one
@@ -1745,21 +2406,53 @@ func (s *Store) RevokePlaybackMediaSessionsForTicket(
 	binding models.PlaybackTicketBinding,
 	now time.Time,
 ) (int64, error) {
+	return s.RevokePlaybackMediaSessionsForTicketContext(
+		context.Background(), binding, now)
+}
+
+// RevokePlaybackMediaSessionsForTicketContext is
+// RevokePlaybackMediaSessionsForTicket using the shared playback writer budget.
+func (s *Store) RevokePlaybackMediaSessionsForTicketContext(
+	ctx context.Context,
+	binding models.PlaybackTicketBinding,
+	now time.Time,
+) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	now = playbackTime(now)
 	if err := validatePlaybackTicketBinding(binding); err != nil {
 		return 0, err
 	}
-	res, err := s.DB.Exec(`UPDATE playback_media_sessions
-		SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
-		WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?
-			AND state = ?`,
-		models.PlaybackMediaSessionRevoked, now, now, binding.TicketID,
-		binding.UserID, binding.DeviceID, binding.FileID,
-		models.PlaybackMediaSessionActive)
+	var revoked int64
+	err := s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `UPDATE playback_media_sessions
+				SET version = version
+				WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?`,
+				binding.TicketID, binding.UserID, binding.DeviceID, binding.FileID)
+			return err
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			res, err := tx.ExecContext(ctx, `UPDATE playback_media_sessions
+				SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
+				WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?
+					AND state = ?`,
+				models.PlaybackMediaSessionRevoked, now, now, binding.TicketID,
+				binding.UserID, binding.DeviceID, binding.FileID,
+				models.PlaybackMediaSessionActive)
+			if err != nil {
+				return false, err
+			}
+			revoked, err = res.RowsAffected()
+			return err == nil, err
+		},
+	)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	return revoked, nil
 }
 
 // RevokePlaybackMediaSessionsForTicketTransport revokes only the media sessions
@@ -1770,6 +2463,22 @@ func (s *Store) RevokePlaybackMediaSessionsForTicketTransport(
 	transport string,
 	now time.Time,
 ) (int64, error) {
+	return s.RevokePlaybackMediaSessionsForTicketTransportContext(
+		context.Background(), binding, transport, now)
+}
+
+// RevokePlaybackMediaSessionsForTicketTransportContext is
+// RevokePlaybackMediaSessionsForTicketTransport using the shared playback
+// writer budget.
+func (s *Store) RevokePlaybackMediaSessionsForTicketTransportContext(
+	ctx context.Context,
+	binding models.PlaybackTicketBinding,
+	transport string,
+	now time.Time,
+) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	now = playbackTime(now)
 	if err := validatePlaybackTicketBinding(binding); err != nil {
 		return 0, err
@@ -1777,17 +2486,37 @@ func (s *Store) RevokePlaybackMediaSessionsForTicketTransport(
 	if !validPlaybackTransport(transport) {
 		return 0, ErrInvalidPlaybackTransport
 	}
-	res, err := s.DB.Exec(`UPDATE playback_media_sessions
-		SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
-		WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?
-			AND transport = ? AND state = ?`,
-		models.PlaybackMediaSessionRevoked, now, now, binding.TicketID,
-		binding.UserID, binding.DeviceID, binding.FileID, transport,
-		models.PlaybackMediaSessionActive)
+	var revoked int64
+	err := s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `UPDATE playback_media_sessions
+				SET version = version
+				WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?
+					AND transport = ?`,
+				binding.TicketID, binding.UserID, binding.DeviceID, binding.FileID,
+				transport)
+			return err
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			res, err := tx.ExecContext(ctx, `UPDATE playback_media_sessions
+				SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
+				WHERE ticket_id = ? AND user_id = ? AND device_id = ? AND file_id = ?
+					AND transport = ? AND state = ?`,
+				models.PlaybackMediaSessionRevoked, now, now, binding.TicketID,
+				binding.UserID, binding.DeviceID, binding.FileID, transport,
+				models.PlaybackMediaSessionActive)
+			if err != nil {
+				return false, err
+			}
+			revoked, err = res.RowsAffected()
+			return err == nil, err
+		},
+	)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	return revoked, nil
 }
 
 // RevokePlaybackMediaSessionsForTransport revokes every active media session
@@ -1797,20 +2526,51 @@ func (s *Store) RevokePlaybackMediaSessionsForTransport(
 	transport string,
 	now time.Time,
 ) (int64, error) {
+	return s.RevokePlaybackMediaSessionsForTransportContext(
+		context.Background(), transport, now)
+}
+
+// RevokePlaybackMediaSessionsForTransportContext is
+// RevokePlaybackMediaSessionsForTransport using the shared playback writer
+// budget.
+func (s *Store) RevokePlaybackMediaSessionsForTransportContext(
+	ctx context.Context,
+	transport string,
+	now time.Time,
+) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if transport != models.PlaybackTransportServerProxy &&
 		transport != models.PlaybackTransportServerHLS {
 		return 0, ErrInvalidPlaybackTransport
 	}
 	now = playbackTime(now)
-	res, err := s.DB.Exec(`UPDATE playback_media_sessions
-		SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
-		WHERE transport = ? AND state = ?`,
-		models.PlaybackMediaSessionRevoked, now, now, transport,
-		models.PlaybackMediaSessionActive)
+	var revoked int64
+	err := s.withPlaybackWriteTx(
+		ctx,
+		func(ctx context.Context, tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `UPDATE playback_media_sessions
+				SET version = version WHERE transport = ?`, transport)
+			return err
+		},
+		func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			res, err := tx.ExecContext(ctx, `UPDATE playback_media_sessions
+				SET state = ?, revoked_at = ?, version = version + 1, updated_at = ?
+				WHERE transport = ? AND state = ?`,
+				models.PlaybackMediaSessionRevoked, now, now, transport,
+				models.PlaybackMediaSessionActive)
+			if err != nil {
+				return false, err
+			}
+			revoked, err = res.RowsAffected()
+			return err == nil, err
+		},
+	)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	return revoked, nil
 }
 
 // ExpirePlaybackMediaSessions conditionally expires sessions that reached
@@ -1845,6 +2605,188 @@ func loadPlaybackTicketTxContext(
 		return nil, ErrPlaybackTicketNotFound
 	}
 	return ticket, err
+}
+
+type playbackBusyTimeoutRestorer func(*sql.Conn, *sql.Tx) error
+
+// withPlaybackWriteTx keeps cancellation responsive while waiting for SQLite's
+// writer lock. The busy handler sleeps without observing interrupts, so the
+// request context cannot interrupt its default 10 second wait. Pin one
+// connection, disable that handler only there, and retry locked no-op updates
+// with Go-side backoff.
+func (s *Store) withPlaybackWriteTx(
+	ctx context.Context,
+	lock func(context.Context, *sql.Tx) error,
+	fn func(context.Context, *sql.Tx) (bool, error),
+) error {
+	return s.withPlaybackWriteTxConfigured(
+		ctx, playbackWriteLockBudget, restorePlaybackBusyTimeout, lock, fn)
+}
+
+func (s *Store) withPlaybackWriteTxConfigured(
+	ctx context.Context,
+	budget time.Duration,
+	restore playbackBusyTimeoutRestorer,
+	lock func(context.Context, *sql.Tx) error,
+	fn func(context.Context, *sql.Tx) (bool, error),
+) error {
+	return s.withPlaybackWriteTxConfiguredAndCommit(
+		ctx, budget, restore, lock, fn, func(tx *sql.Tx) error {
+			return tx.Commit()
+		})
+}
+
+func (s *Store) withPlaybackWriteTxConfiguredAndCommit(
+	ctx context.Context,
+	budget time.Duration,
+	restore playbackBusyTimeoutRestorer,
+	lock func(context.Context, *sql.Tx) error,
+	fn func(context.Context, *sql.Tx) (bool, error),
+	commitTx func(*sql.Tx) error,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.playbackWriteSem == nil {
+		return errors.New("playback write semaphore is not initialized")
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	select {
+	case s.playbackWriteSem <- struct{}{}:
+		defer func() { <-s.playbackWriteSem }()
+	case <-operationCtx.Done():
+		return operationCtx.Err()
+	}
+
+	conn, err := s.DB.Conn(operationCtx)
+	if err != nil {
+		return playbackContextError(operationCtx, err)
+	}
+
+	var tx *sql.Tx
+	restored := false
+	discard := false
+	defer func() {
+		if tx != nil {
+			if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+				discard = true
+			}
+		}
+		if !restored && !discard {
+			if err := restore(conn, nil); err != nil {
+				discard = true
+			}
+		}
+		if discard {
+			discardPlaybackSQLConn(conn)
+		}
+		_ = conn.Close()
+	}()
+
+	if _, err := conn.ExecContext(operationCtx, "PRAGMA busy_timeout=0"); err != nil {
+		return playbackContextError(operationCtx, err)
+	}
+
+	lockDeadline, _ := operationCtx.Deadline()
+	backoff := playbackWriteLockMinBackoff
+	for {
+		if err := operationCtx.Err(); err != nil {
+			return err
+		}
+		tx, err = conn.BeginTx(operationCtx, nil)
+		if err != nil {
+			return playbackContextError(operationCtx, err)
+		}
+		err = lock(operationCtx, tx)
+		if err == nil {
+			break
+		}
+		rollbackErr := tx.Rollback()
+		tx = nil
+		if rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			discard = true
+			return playbackContextError(operationCtx, rollbackErr)
+		}
+		if !isSQLiteBusy(err) {
+			return playbackContextError(operationCtx, err)
+		}
+
+		remaining := time.Until(lockDeadline)
+		if remaining <= 0 {
+			if err := operationCtx.Err(); err != nil {
+				return err
+			}
+			return context.DeadlineExceeded
+		}
+		wait := backoff
+		if wait > remaining {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-operationCtx.Done():
+			timer.Stop()
+			return operationCtx.Err()
+		case <-timer.C:
+		}
+		backoff *= 2
+		if backoff > playbackWriteLockMaxBackoff {
+			backoff = playbackWriteLockMaxBackoff
+		}
+	}
+
+	commit, operationErr := fn(operationCtx, tx)
+	if err := operationCtx.Err(); err != nil {
+		return err
+	}
+	if !commit {
+		return operationErr
+	}
+	if err := restore(conn, tx); err != nil {
+		return playbackContextError(operationCtx, err)
+	}
+	restored = true
+	if err := operationCtx.Err(); err != nil {
+		return err
+	}
+	// Commit has no context. Once COMMIT starts, persistence wins over a
+	// concurrent cancellation; checking the context afterward would report a
+	// canceled request even though the write succeeded.
+	if err := commitTx(tx); err != nil {
+		return playbackContextError(operationCtx, err)
+	}
+	tx = nil
+	return operationErr
+}
+
+func playbackContextError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
+}
+
+func restorePlaybackBusyTimeout(conn *sql.Conn, tx *sql.Tx) error {
+	ctx, cancel := context.WithTimeout(
+		context.Background(), playbackSQLiteBusyTimeoutCleanup)
+	defer cancel()
+	expression := fmt.Sprintf("PRAGMA busy_timeout=%d", playbackSQLiteBusyTimeout)
+	var err error
+	if tx != nil {
+		_, err = tx.ExecContext(ctx, expression)
+	} else {
+		_, err = conn.ExecContext(ctx, expression)
+	}
+	return err
+}
+
+func discardPlaybackSQLConn(conn *sql.Conn) {
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	_ = conn.Close()
 }
 
 // Acquiring a no-op write before reading turns the short ticket transaction
@@ -2068,6 +3010,7 @@ func normalizePlaybackTransports(transports []string, allowEmpty bool) ([]string
 func validPlaybackTransport(transport string) bool {
 	switch transport {
 	case models.PlaybackTransportDirectHTTP,
+		models.PlaybackTransportDirectDASH,
 		models.PlaybackTransportServerProxy,
 		models.PlaybackTransportServerHLS:
 		return true

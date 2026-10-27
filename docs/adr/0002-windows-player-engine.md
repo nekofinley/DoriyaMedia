@@ -1,9 +1,9 @@
 # ADR 0002: Windows 播放内核选型
 
 - 状态：Proposed / 待真机验证
-- 日期：2026-10-27
+- 日期：2026-10-28
 - 范围：Windows W0 播放内核 Spike
-- 决策性质：架构提案与门禁，不是最终选型，也不表示任何原型或测试已经完成
+- 决策性质：架构提案与门禁，不是最终选型；机制原型已完成本机验证，但真实播放与发布门禁未完成
 
 ## 1. 决策摘要
 
@@ -80,7 +80,26 @@ WinUI 3 C# UI
 
 ## 4. 评估证据与验收门禁
 
-### 4.1 证据要求
+### 4.1 当前机制证据
+
+截至 2026-10-28，两个隔离原型均已创建并通过以下本机验证：
+
+| 候选 | 已通过 | 证据边界 |
+| --- | --- | --- |
+| Tauri 2 + mpv | pnpm frozen install/build；cargo fmt；clippy `-D warnings`；32 个 Rust tests 通过（另 1 个真实 mpv 测试需显式启用）；真实 mpv 空载 JSON IPC 1/1；Tauri debug exe 构建及交互会话 GUI 启动/退出 smoke | 只证明宿主、sidecar、IPC、输入边界、异步装载状态和退出清理可运行，未加载真实媒体 |
+| WinUI 3 + LibVLCSharp | .NET restore/build 0 warnings/0 errors；91 个 xUnit tests；LibVLC 3.0.19 probe（含 audio slave/Header 构造）；Windows App SDK self-contained app smoke；两个 loopback 合成源的 GUI `Opening -> Playing` smoke | 只证明窗口、LibVLC 初始化、白名单 Header 和本地双源机制可运行；不是真实 S1-S5、音画同步或长时结果 |
+
+当前实现边界：
+
+- Tauri 和 WinUI 都接受 HTTPS；plain HTTP 只允许显式启用的精确 loopback 测试模式。
+- Tauri 已实现 Header 白名单和双流的命令基础；mpv 子进程使用清空后的最小环境，命名管道由 128 位 CSPRNG 生成并校验服务端 PID，Tauri capability 权限为空。IPC 请求在 worker 中执行并受固定 5 秒期限约束，`start-file`/`file-loaded`/`end-file` 驱动状态，超时会强制清理 sidecar。真实媒体 Header/双流尚未验证。
+- WinUI 已通过 `Media.AddSlave` 实现音频 slave，并支持 `Referer`/`User-Agent` media option。VLC 3.0.19 没有安全的 `Origin`/`Accept`/`Accept-Language` 注入路径，media option 也不能表达两流不同 Header，因此这些场景 fail-closed；不能据此认为 S4/S5 已通过。
+- Tauri 仍需完成完整 DACL/SID/session 对端信任、Windows Job Object 崩溃清理、sidecar 可执行文件身份校验和重定向策略。WinUI 仍需验证真实来源、跨源重定向、音画同步和长时行为。
+- API 37 Android ATD 的 Media3 机制结果与本文无关，不能替代任何 Windows 候选。
+
+这些结果只把 W0 从“未开始”推进到“机制原型可构建、可启动、可探针”；S1-S5、稳定性、音画差、DPI/多显示器、Windows 11、Intel GPU、网络和许可证门禁仍未执行。
+
+### 4.2 证据要求
 
 每个候选分别提供：
 
@@ -93,7 +112,7 @@ WinUI 3 C# UI
 - 脱敏日志、崩溃/恢复证据、CPU/GPU/内存观察值。
 - 依赖图、构建参数、许可证文本、SBOM/第三方声明和分发模型。
 
-### 4.2 硬门禁
+### 4.3 硬门禁
 
 | 门禁 | 通过条件 | 失败处理 |
 | --- | --- | --- |
@@ -105,7 +124,7 @@ WinUI 3 C# UI
 | G5 安全/运维 | 凭据不进入 WebView/IPC/命令行/日志；播放器崩溃可隔离；退出无残留进程；构建和更新可复现 | 候选不通过或需修复后重测 |
 | G6 许可证/发布 | mpv、FFmpeg、LibVLCSharp、libVLC/VLC、解码器和所有再分发组件完成发布前复核，义务可履行 | 禁止制作可分发安装包；必要时更换构建或候选 |
 
-### 4.3 选择规则
+### 4.4 选择规则
 
 1. 两个候选都通过 G0-G6：优先 Tauri 2 + mpv，因其复用 Vue UI 且符合当前规划偏好。
 2. Tauri 通过 G1-G3/G5，但 G4 的原生窗口融合无法稳定解决：若 WinUI 通过全部门禁，选 WinUI。
@@ -186,9 +205,10 @@ G1-G5 的功能结论和 G6 的许可证结论必须分开记录。功能通过�
 
 ## 7. 待决事项
 
-- 两个原型尚未创建，S1-S5、30 分钟、seek、音画差和 DPI 矩阵均未执行。
-- 本机缺 mpv 与 .NET SDK；是否配置这些依赖需另行批准，本次预检不安装。
+- 两个原型已创建并完成机制级构建/启动验证，但 S1-S5、30 分钟、seek、音画差和 DPI 矩阵均未执行。
+- 本机已配置 mpv `v0.41.0` 和 .NET SDK `8.0.427`；真实 Bilibili/OpenList 样本和发布许可仍未解决。
 - S2 的真实 E-AC3 样本未解决，不能用其他编码替代。
 - Windows 11、Intel GPU、真实双屏/DPI、睡眠恢复和 Wi-Fi/热点矩阵未覆盖。
 - mpv/FFmpeg 与 LibVLC/VLC 的准确发行物、构建参数、解码器和分发模型未冻结。
 - 最终选择、许可证结论和可分发性均待真机测试、依赖审计及法务/发布前复核。
+- Tauri 的完整 DACL/SID/session 对端信任、Job Object/崩溃清理、sidecar 身份校验和重定向策略仍未完成；WinUI 的真实来源、跨源重定向、音画同步和长时行为仍未完成。两者均不能据此进入正式产品集成。

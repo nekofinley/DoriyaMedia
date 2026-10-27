@@ -2,11 +2,13 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -402,5 +404,152 @@ func TestPlaybackClientCapabilitiesRejectMalformedPayload(t *testing.T) {
 	client.Containers = append(client.Containers, "mp4")
 	if _, err := normalizeV1PlaybackClient(client); err == nil {
 		t.Fatal("duplicate container was accepted")
+	}
+}
+
+func TestPlaybackCapabilitiesPreserveDASHMergeAndFourPreferences(t *testing.T) {
+	normalized, err := normalizeV1PlaybackClient(v1PlaybackClientCapabilities{
+		Platform:          "windows",
+		Version:           "0.1.0",
+		Engine:            "mpv",
+		Containers:        []string{"mp4"},
+		VideoCodecs:       []string{"h264"},
+		AudioCodecs:       []string{"aac"},
+		SubtitleCodecs:    []string{"text"},
+		SupportsHeaders:   true,
+		SupportsDASHMerge: true,
+	})
+	if err != nil {
+		t.Fatalf("normalize client: %v", err)
+	}
+	if !normalized.SupportsDASHMerge {
+		t.Fatal("supports_dash_merge was not preserved")
+	}
+	preferred, err := normalizeV1PreferredTransports([]string{
+		"direct-http", "direct-dash", "server-proxy", "server-hls",
+	})
+	if err != nil {
+		t.Fatalf("normalize four preferred transports: %v", err)
+	}
+	if len(preferred) != 4 || preferred[1] != media.NativeTransportDirectDASH {
+		t.Fatalf("preferred transports = %v", preferred)
+	}
+	if _, err := normalizeV1PreferredTransports([]string{
+		"direct-http", "direct-dash", "server-proxy", "server-hls", "direct-http",
+	}); err == nil {
+		t.Fatal("more than four transports were accepted")
+	}
+	if _, err := normalizeV1PreferredTransports([]string{
+		"direct-http", "direct-dash", "server-proxy", "local-relay",
+	}); err == nil {
+		t.Fatal("local-relay was accepted")
+	}
+}
+
+func TestSelectV1PlaybackTransportsUsesDASHPartsNotDirectURL(t *testing.T) {
+	f := newPlaybackAPIFixture(t)
+	fileID := seedPlaybackAPIFile(
+		t,
+		f.server.Store,
+		"https://cdn.example.test/library/video.mp4",
+		playbackAPITestProbe,
+	)
+	file, err := f.server.Store.FileByID(fileID)
+	if err != nil {
+		t.Fatalf("load playback file: %v", err)
+	}
+	probe := &media.Probe{
+		Format: media.ProbeFormat{
+			FormatName: "mov,mp4,m4a,3gp,3g2,mj2",
+			Duration:   json.Number("120"),
+		},
+		Streams: []media.ProbeStream{
+			{Index: 0, CodecType: "video", CodecName: "h264", Width: 1920, Height: 1080},
+			{Index: 1, CodecType: "audio", CodecName: "aac", Channels: 2},
+		},
+	}
+	driver := &playbackLifecycleDASHDriver{parts: playbackLifecycleDASHParts()}
+	client := media.NativeClientCapabilities{
+		Platform:          "windows",
+		Version:           "0.1.0",
+		Engine:            "mpv",
+		Containers:        []string{"mp4"},
+		VideoCodecs:       []string{"h264"},
+		AudioCodecs:       []string{"aac"},
+		SupportsHeaders:   true,
+		SupportsDASHMerge: true,
+	}
+	selection, err := f.server.selectV1PlaybackTransports(
+		context.Background(),
+		file,
+		driver,
+		probe,
+		client,
+		config.ClientFeatures{
+			DirectDASHEnabled:  true,
+			ServerHLSV1Enabled: true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("select transports: %v", err)
+	}
+	want := []media.NativeTransportKind{
+		media.NativeTransportDirectDASH,
+		media.NativeTransportServerHLS,
+	}
+	if got := selection.Kinds(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("kinds = %v, want %v (%s)",
+			got, want, selection.UnsupportedReason)
+	}
+	if driver.calls.Load() == 0 {
+		t.Fatal("DASH eligibility did not resolve parts")
+	}
+}
+
+func TestPlaybackTicketSelectionDropsDirectDASHWhenRuntimeFlagOff(t *testing.T) {
+	ticket := &models.PlaybackTicket{
+		State: models.PlaybackTicketReady,
+		CandidateTransports: []string{
+			models.PlaybackTransportDirectDASH,
+			models.PlaybackTransportServerHLS,
+		},
+		MediaSummary: json.RawMessage(
+			`{"container":"mp4","duration":120,"video":{"codec":"h264"},"audio":[]}`,
+		),
+	}
+	selection, err := (&Server{}).playbackTicketTransportSelection(
+		ticket,
+		media.NativeClientCapabilities{
+			SupportsRange: true, SupportsDASHMerge: true,
+		},
+		config.ClientFeatures{
+			DirectDASHEnabled:  false,
+			ServerHLSV1Enabled: true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("build frozen transport selection: %v", err)
+	}
+	if got := selection.Kinds(); !reflect.DeepEqual(
+		got, []media.NativeTransportKind{media.NativeTransportServerHLS},
+	) {
+		t.Fatalf("kinds = %v, want server-hls only", got)
+	}
+}
+
+func TestPlaybackSubtitleTransportAllowsDirectDASH(t *testing.T) {
+	server := &Server{Cfg: &config.Config{Client: config.ClientFeatures{
+		DirectDASHEnabled: true,
+	}}}
+	if !server.v1PlaybackSubtitleTransportEnabled(
+		models.PlaybackTransportDirectDASH,
+	) {
+		t.Fatal("direct-dash subtitle transport was not enabled")
+	}
+	server.Cfg.Client.DirectDASHEnabled = false
+	if server.v1PlaybackSubtitleTransportEnabled(
+		models.PlaybackTransportDirectDASH,
+	) {
+		t.Fatal("disabled direct-dash subtitle transport was accepted")
 	}
 }

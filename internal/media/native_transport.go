@@ -1,6 +1,7 @@
 package media
 
 import (
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -8,13 +9,13 @@ import (
 	"doriyamedia/internal/source"
 )
 
-// NativeTransportKind is the transport vocabulary shared by S3 tickets and
-// native clients. Direct DASH and the local relay are deliberately absent: S3
-// must never offer a transport that it cannot authorize end to end.
+// NativeTransportKind is the transport vocabulary shared by playback tickets
+// and native clients. The local relay remains deliberately absent.
 type NativeTransportKind string
 
 const (
 	NativeTransportDirectHTTP  NativeTransportKind = "direct-http"
+	NativeTransportDirectDASH  NativeTransportKind = "direct-dash"
 	NativeTransportServerProxy NativeTransportKind = "server-proxy"
 	NativeTransportServerHLS   NativeTransportKind = "server-hls"
 	NativeTransportUnsupported NativeTransportKind = "unsupported"
@@ -36,22 +37,24 @@ type NativeClientCapabilities struct {
 	PreferredTransports []NativeTransportKind `json:"preferred_transports"`
 }
 
-// NativeTransportFeatureFlags contains only the S3 transport switches. Direct
-// DASH and local relay are intentionally not representable here.
+// NativeTransportFeatureFlags contains independently switchable transport
+// gates. Direct DASH defaults off and the local relay is not representable.
 type NativeTransportFeatureFlags struct {
 	DirectHTTPEnabled    bool `json:"direct_http_enabled"`
+	DirectDASHEnabled    bool `json:"direct_dash_enabled"`
 	ServerProxyV1Enabled bool `json:"server_proxy_v1_enabled"`
 	ServerHLSV1Enabled   bool `json:"server_hls_v1_enabled"`
 }
 
 // NativeTransportInput contains already-resolved source facts. SourceHeaders is
-// used only to decide whether direct-http may emit the fixed safe DTO; it is
-// never copied into server-proxy or server-hls candidates.
+// used only for direct-http eligibility; Parts is used only for direct-dash.
+// Neither is copied into server-proxy or server-hls candidates.
 type NativeTransportInput struct {
 	Probe         *Probe
 	SourceURL     string
 	SourceHeaders map[string]string
 	MultiPart     bool
+	Parts         []source.Part
 	Client        NativeClientCapabilities
 	Features      NativeTransportFeatureFlags
 }
@@ -62,6 +65,16 @@ type NativeTransportCandidate struct {
 	Kind    NativeTransportKind   `json:"kind"`
 	Headers *source.StreamHeaders `json:"headers,omitempty"`
 	Range   bool                  `json:"range"`
+}
+
+// NativeDirectDASHStream is an internally validated pair member. It contains
+// source URLs and headers, so callers must never include it in ticket status or
+// candidate-plan JSON.
+type NativeDirectDASHStream struct {
+	Role    string
+	URL     string
+	MIME    string
+	Headers source.StreamHeaders
 }
 
 // NativeTransportSelection is ordered from the preferred candidate to the last
@@ -75,9 +88,11 @@ type NativeTransportSelection struct {
 
 // NativeVideoSummary is the video part of a ticket's media summary.
 type NativeVideoSummary struct {
-	Codec  string `json:"codec"`
-	Width  int    `json:"width,omitempty"`
-	Height int    `json:"height,omitempty"`
+	Codec    string `json:"codec"`
+	BitDepth int    `json:"bit_depth,omitempty"`
+	HDR      bool   `json:"hdr,omitempty"`
+	Width    int    `json:"width,omitempty"`
+	Height   int    `json:"height,omitempty"`
 }
 
 // NativeAudioSummary is one audio track. Audio is allowed to be an empty list.
@@ -98,6 +113,7 @@ type NativeMediaSummary struct {
 
 var defaultNativeTransportOrder = [...]NativeTransportKind{
 	NativeTransportDirectHTTP,
+	NativeTransportDirectDASH,
 	NativeTransportServerProxy,
 	NativeTransportServerHLS,
 }
@@ -112,8 +128,15 @@ func SummarizeNativeMedia(probe *Probe) NativeMediaSummary {
 	summary.Container = nativeContainerSummary(probe.Format.FormatName)
 	summary.Duration = probe.Duration()
 	if video := probe.Video(); video != nil {
+		bitDepth := video.BitDepth
+		if bitDepth == 0 {
+			bitDepth = nativeProfileBitDepth(video.Profile)
+		}
 		summary.Video = &NativeVideoSummary{
-			Codec:  video.CodecName,
+			Codec:    video.CodecName,
+			BitDepth: bitDepth,
+			HDR: video.HDR || video.DVProfile() > 0 ||
+				nativeProfileHDR(video.Profile, video.CodecTagString),
 			Width:  video.Width,
 			Height: video.Height,
 		}
@@ -156,9 +179,9 @@ func nativeContainerSummary(formatName string) string {
 	return normalizeNativeContainer(tokens[0])
 }
 
-// SelectNativeTransports evaluates the S3 transport set as a pure function.
+// SelectNativeTransports evaluates the ticket transport set as a pure function.
 // Client preferences only reorder already-eligible transports; they cannot add
-// direct-dash, local-relay, or a transport disabled by feature flags.
+// local-relay or a transport disabled by feature flags.
 func SelectNativeTransports(input NativeTransportInput) NativeTransportSelection {
 	selection := NativeTransportSelection{
 		Media:      SummarizeNativeMedia(input.Probe),
@@ -198,6 +221,17 @@ func SelectNativeTransports(input NativeTransportInput) NativeTransportSelection
 		}
 	}
 
+	if input.MultiPart && input.Features.DirectDASHEnabled && nativePlaybackOK {
+		if _, ok := ResolveNativeDirectDASHStreams(input.Parts, input.Client); ok {
+			eligible[NativeTransportDirectDASH] = NativeTransportCandidate{
+				Kind: NativeTransportDirectDASH,
+				// Source byte-range support is not probed for either part. Never
+				// promise seeking until the two upstream links have been tested.
+				Range: false,
+			}
+		}
+	}
+
 	// HLS can repair an incompatible source container or audio track, but it
 	// copies video. A source-only audio set or unsafe Header is therefore not a
 	// reason to hide HLS, while an undecodable video still is.
@@ -213,11 +247,12 @@ func SelectNativeTransports(input NativeTransportInput) NativeTransportSelection
 		reason := "no eligible native transport is enabled"
 		switch {
 		case !input.Features.DirectHTTPEnabled &&
+			!input.Features.DirectDASHEnabled &&
 			!input.Features.ServerProxyV1Enabled &&
 			!input.Features.ServerHLSV1Enabled:
-			reason = "all S3 native transports are disabled"
+			reason = "all native transports are disabled"
 		case input.MultiPart && !input.Features.ServerHLSV1Enabled:
-			reason = "multi-part media requires server-hls, which is disabled"
+			reason = "multi-part media has no eligible direct-dash or server-hls transport"
 		case !nativePlaybackOK && !input.Features.ServerHLSV1Enabled:
 			reason = "client cannot play the source container or audio set, and server-hls is disabled"
 		}
@@ -226,6 +261,142 @@ func SelectNativeTransports(input NativeTransportInput) NativeTransportSelection
 
 	selection.Candidates = candidates
 	return selection
+}
+
+// ResolveNativeDirectDASHStreams validates and returns exactly one video and
+// one audio stream. Any unsafe URL or header, unsupported codec, malformed
+// role, unknown MIME, or timeline mismatch rejects the entire candidate.
+func ResolveNativeDirectDASHStreams(
+	parts []source.Part,
+	caps NativeClientCapabilities,
+) ([]NativeDirectDASHStream, bool) {
+	if !caps.SupportsDASHMerge || len(parts) != 2 {
+		return nil, false
+	}
+	var video, audio *source.Part
+	for i := range parts {
+		switch role := strings.ToLower(strings.TrimSpace(parts[i].Kind)); role {
+		case "video":
+			if video != nil {
+				return nil, false
+			}
+			video = &parts[i]
+		case "audio":
+			if audio != nil {
+				return nil, false
+			}
+			audio = &parts[i]
+		default:
+			return nil, false
+		}
+	}
+	if video == nil || audio == nil || video.URL == audio.URL ||
+		!validNativeDASHDuration(video.Duration) ||
+		!validNativeDASHDuration(audio.Duration) ||
+		math.Abs(video.Duration-audio.Duration) > 0.25 {
+		return nil, false
+	}
+	clientVideo := nativeCodecSet(caps.VideoCodecs)
+	clientAudio := nativeCodecSet(caps.AudioCodecs)
+	if !clientVideo[normalizeNativeCodec(video.Codec)] ||
+		!clientAudio[normalizeNativeCodec(audio.Codec)] {
+		return nil, false
+	}
+	if !nativeDASHVideoProfileSupported(*video, caps) {
+		return nil, false
+	}
+
+	streams := make([]NativeDirectDASHStream, 0, 2)
+	for _, part := range []*source.Part{video, audio} {
+		role := strings.ToLower(strings.TrimSpace(part.Kind))
+		if !ValidNativeDirectURL(part.URL) ||
+			!validNativeDASHPartMIME(role, part.MIME) {
+			return nil, false
+		}
+		headers, err := source.NewStreamHeadersForURL(part.URL, part.Headers)
+		if err != nil || (!headers.Empty() && !caps.SupportsHeaders) {
+			return nil, false
+		}
+		streams = append(streams, NativeDirectDASHStream{
+			Role: role, URL: part.URL,
+			MIME:    strings.ToLower(strings.TrimSpace(part.MIME)),
+			Headers: headers,
+		})
+	}
+	return streams, true
+}
+
+func validNativeDASHDuration(value float64) bool {
+	return value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+// nativeProfileBitDepth recognizes the profile labels ffprobe and the
+// Bilibili codec mapper use. An unknown profile stays at zero rather than
+// pretending an unverified stream is 8-bit.
+func nativeProfileBitDepth(profile string) int {
+	p := strings.ToLower(strings.TrimSpace(profile))
+	switch {
+	case strings.Contains(p, "12"):
+		return 12
+	case strings.Contains(p, "10"):
+		return 10
+	case p == "baseline", p == "main", p == "high",
+		p == "extended", p == "main still picture":
+		return 8
+	default:
+		return 0
+	}
+}
+
+func nativeProfileHDR(profile, tag string) bool {
+	p := strings.ToLower(strings.TrimSpace(profile))
+	t := strings.ToLower(strings.TrimSpace(tag))
+	return strings.Contains(p, "hdr") ||
+		strings.Contains(p, "dolby") ||
+		p == "dv" || p == "dovi" ||
+		strings.HasPrefix(t, "dv")
+}
+
+func nativeDASHVideoProfileSupported(part source.Part, caps NativeClientCapabilities) bool {
+	bitDepth := part.BitDepth
+	if bitDepth == 0 {
+		bitDepth = nativeProfileBitDepth(part.Profile)
+	}
+	hdr := part.HDR || nativeProfileHDR(part.Profile, part.Tag)
+	if bitDepth <= 8 && !hdr {
+		return true
+	}
+	// The first direct-dash contract has no separate bit-depth/HDR capability.
+	// Only a client that explicitly advertises the profile may receive it;
+	// generic h264/hevc is not enough for High 10, Main 10, HDR, or Dolby.
+	family := normalizeNativeCodec(part.Codec)
+	for _, raw := range caps.VideoCodecs {
+		capability := strings.ToLower(strings.TrimSpace(raw))
+		if hdr {
+			if nativeProfileHDR(capability, "") {
+				return true
+			}
+			continue
+		}
+		capFamily := normalizeNativeCodec(capability)
+		if bitDepth > 8 &&
+			(capFamily == family || strings.HasPrefix(capFamily, family)) &&
+			nativeProfileBitDepth(capability) == bitDepth {
+			return true
+		}
+	}
+	return false
+}
+
+func validNativeDASHPartMIME(role, value string) bool {
+	switch role {
+	case "video":
+		return strings.EqualFold(strings.TrimSpace(value), "video/mp4")
+	case "audio":
+		return strings.EqualFold(strings.TrimSpace(value), "audio/mp4")
+	default:
+		return false
+	}
 }
 
 // Kinds returns the candidate kinds in selection order.

@@ -370,6 +370,13 @@ func TestLegacyProxyRejectsInconsistentPartialResponses(t *testing.T) {
 		{name: "end past total", contentRange: "bytes 100-199/199", length: "100"},
 		{name: "wrong content length", contentRange: "bytes 100-199/1000", length: "99"},
 		{name: "unknown total", contentRange: "bytes 100-199/*", length: "100"},
+		{name: "signed start", contentRange: "bytes +100-199/1000", length: "100"},
+		{name: "signed end", contentRange: "bytes 100-+199/1000", length: "100"},
+		{name: "space before dash", contentRange: "bytes 100 -199/1000", length: "100"},
+		{name: "space after dash", contentRange: "bytes 100- 199/1000", length: "100"},
+		{name: "space before slash", contentRange: "bytes 100-199 /1000", length: "100"},
+		{name: "space after slash", contentRange: "bytes 100-199/ 1000", length: "100"},
+		{name: "extra space after unit", contentRange: "bytes  100-199/1000", length: "100"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -397,6 +404,123 @@ func TestLegacyProxyRejectsInconsistentPartialResponses(t *testing.T) {
 			}
 			if got := rec.Header().Get("Content-Range"); got != "" {
 				t.Errorf("invalid upstream Content-Range leaked as %q", got)
+			}
+		})
+	}
+}
+
+func TestLegacyProxyRejectsInvalidContentLength(t *testing.T) {
+	for _, value := range []string{
+		"+4",
+		"-0",
+		"four",
+		"",
+		"9223372036854775808",
+	} {
+		t.Run(value, func(t *testing.T) {
+			client := &http.Client{Transport: legacyProxyRoundTripFunc(
+				func(req *http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Status:     "200 OK",
+						Header: http.Header{
+							"Content-Type":   {"video/mp4"},
+							"Content-Length": {value},
+						},
+						Body:          io.NopCloser(strings.NewReader("media")),
+						ContentLength: -1,
+						Request:       req,
+					}, nil
+				})}
+			req := httptest.NewRequest(http.MethodGet, "/api/stream/1?proxy=1", nil)
+			rec := httptest.NewRecorder()
+
+			proxyRemoteVia(rec, req, "https://media.example.test/video.mp4", nil, client)
+
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Content-Length"); got != "" {
+				t.Errorf("invalid upstream Content-Length leaked as %q", got)
+			}
+		})
+	}
+}
+
+func TestLegacyProxyRejectsInvalidRangeSyntax(t *testing.T) {
+	for _, value := range []string{
+		"bytes=+100-199",
+		"bytes=100-+199",
+		"bytes= 100-199",
+		"bytes=100 -199",
+		"bytes=100- 199",
+		"bytes=\t100-199",
+	} {
+		t.Run(value, func(t *testing.T) {
+			called := false
+			client := &http.Client{Transport: legacyProxyRoundTripFunc(
+				func(*http.Request) (*http.Response, error) {
+					called = true
+					return nil, fmt.Errorf("must not be called")
+				})}
+			req := httptest.NewRequest(http.MethodGet, "/api/stream/1?proxy=1", nil)
+			req.Header.Set("Range", value)
+			rec := httptest.NewRecorder()
+
+			proxyRemoteVia(rec, req, "https://media.example.test/video.mp4", nil, client)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%q", rec.Code, rec.Body.String())
+			}
+			if called {
+				t.Error("invalid Range reached the upstream")
+			}
+		})
+	}
+}
+
+func TestLegacyProxyRejectsMalformedUnsatisfiableContentRange(t *testing.T) {
+	for _, value := range []string{
+		"bytes */+1000",
+		"bytes */ 1000",
+		"bytes  */1000",
+		"bytes\t*/1000",
+		"bytes */1000x",
+		"bytes 0-0/1000",
+	} {
+		t.Run(value, func(t *testing.T) {
+			requests := 0
+			client := &http.Client{Transport: legacyProxyRoundTripFunc(
+				func(req *http.Request) (*http.Response, error) {
+					requests++
+					return &http.Response{
+						StatusCode: http.StatusRequestedRangeNotSatisfiable,
+						Status:     "416 Range Not Satisfiable",
+						Header: http.Header{
+							"Content-Type":  {"text/plain"},
+							"Content-Range": {value},
+						},
+						Body:    io.NopCloser(strings.NewReader("private upstream body")),
+						Request: req,
+					}, nil
+				})}
+			req := httptest.NewRequest(http.MethodGet, "/api/stream/1?proxy=1", nil)
+			req.Header.Set("Range", "bytes=1000-")
+			rec := httptest.NewRecorder()
+
+			proxyRemoteVia(rec, req, "https://media.example.test/video.mp4", nil, client)
+
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+			}
+			if requests != 1 {
+				t.Errorf("upstream requests = %d, want no fallback probe", requests)
+			}
+			if got := rec.Header().Get("Content-Range"); got != "" {
+				t.Errorf("malformed upstream Content-Range leaked as %q", got)
+			}
+			if strings.Contains(rec.Body.String(), "private upstream body") {
+				t.Errorf("upstream body leaked: %q", rec.Body.String())
 			}
 		})
 	}

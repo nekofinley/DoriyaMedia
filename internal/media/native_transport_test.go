@@ -2,9 +2,12 @@ package media
 
 import (
 	"encoding/json"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
+
+	"doriyamedia/internal/source"
 )
 
 func nativeTestProbe(format, videoCodec string, audio ...ProbeStream) *Probe {
@@ -113,6 +116,67 @@ func TestSummarizeNativeMediaAllowsNoAudio(t *testing.T) {
 	zero := SummarizeNativeMedia(nil)
 	if zero.Audio == nil || zero.Video != nil {
 		t.Fatalf("nil probe summary = %#v, want nil video and non-nil empty audio", zero)
+	}
+}
+
+func TestSummarizeNativeMediaReportsBitDepthAndHDR(t *testing.T) {
+	tests := []struct {
+		name     string
+		mutate   func(*ProbeStream)
+		wantBits int
+		wantHDR  bool
+	}{
+		{
+			name: "explicit fields",
+			mutate: func(video *ProbeStream) {
+				video.BitDepth = 10
+				video.HDR = true
+			},
+			wantBits: 10,
+			wantHDR:  true,
+		},
+		{
+			name: "profile fallback",
+			mutate: func(video *ProbeStream) {
+				video.Profile = "Main 10"
+				video.CodecName = "hevc"
+			},
+			wantBits: 10,
+		},
+		{
+			name: "dolby vision side data",
+			mutate: func(video *ProbeStream) {
+				video.BitDepth = 10
+				video.SideDataList = []SideData{{
+					SideDataType: "DOVI configuration record",
+					DVProfile:    8,
+				}}
+			},
+			wantBits: 10,
+			wantHDR:  true,
+		},
+		{
+			name: "unknown profile",
+			mutate: func(video *ProbeStream) {
+				video.Profile = ""
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := nativeTestProbe(
+				"mov,mp4,m4a,3gp,3g2,mj2", "h264",
+				ProbeStream{CodecName: "aac", Channels: 2})
+			tc.mutate(probe.Video())
+			got := SummarizeNativeMedia(probe).Video
+			if got == nil {
+				t.Fatal("video summary is nil")
+			}
+			if got.BitDepth != tc.wantBits || got.HDR != tc.wantHDR {
+				t.Fatalf("video summary = %+v, want bit_depth=%d hdr=%v",
+					got, tc.wantBits, tc.wantHDR)
+			}
+		})
 	}
 }
 
@@ -403,24 +467,290 @@ func TestSelectNativeTransportsCapabilityMatrix(t *testing.T) {
 	})
 }
 
-func TestSelectNativeTransportsMultipartIsHLSOnly(t *testing.T) {
+func multipartDASHInput() NativeTransportInput {
 	input := nativeTestInput()
 	input.MultiPart = true
+	input.Features.DirectDASHEnabled = true
 	input.Client.SupportsDASHMerge = true
+	input.Parts = []source.Part{
+		{
+			URL: "https://video.example.test/video.m4s?token=video-secret",
+			Headers: map[string]string{
+				"Referer": "https://www.bilibili.com/",
+			},
+			MIME: "video/mp4", Kind: "video", Codec: "h264",
+			Tag: "avc1", Profile: "High", Width: 1920, Height: 1080,
+			Duration: 123.5,
+		},
+		{
+			URL: "https://audio.example.test/audio.m4s?token=audio-secret",
+			Headers: map[string]string{
+				"Referer": "https://www.bilibili.com/",
+			},
+			MIME: "audio/mp4", Kind: "audio", Codec: "aac",
+			Tag: "mp4a", Channels: 2, Duration: 123.5,
+		},
+	}
+	return input
+}
+
+func TestSelectNativeTransportsDirectDASH(t *testing.T) {
+	input := multipartDASHInput()
 	input.Client.PreferredTransports = []NativeTransportKind{
 		NativeTransportDirectHTTP,
 		NativeTransportServerProxy,
-		"direct-dash",
+		NativeTransportDirectDASH,
 		"local-relay",
 		NativeTransportServerHLS,
 	}
 	selection := SelectNativeTransports(input)
-	want := []NativeTransportKind{NativeTransportServerHLS}
-	if got := selection.Kinds(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("kinds = %v, want %v", got, want)
+	want := []NativeTransportKind{
+		NativeTransportDirectDASH,
+		NativeTransportServerHLS,
 	}
-	if selection.Candidates[0].Headers != nil {
-		t.Fatal("server-hls multipart candidate exposed source headers")
+	if got := selection.Kinds(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("kinds = %v, want %v (%s)", got, want, selection.UnsupportedReason)
+	}
+	for _, candidate := range selection.Candidates {
+		if candidate.Headers != nil {
+			t.Errorf("%s exposed source headers in the candidate plan", candidate.Kind)
+		}
+		if candidate.Kind == NativeTransportDirectDASH && candidate.Range {
+			t.Fatal("direct-dash promised unverified source range support")
+		}
+	}
+	encoded, err := json.Marshal(selection)
+	if err != nil {
+		t.Fatalf("marshal direct-dash selection: %v", err)
+	}
+	if strings.Contains(string(encoded), "video-secret") ||
+		strings.Contains(string(encoded), "audio-secret") ||
+		strings.Contains(string(encoded), "bilibili.com") {
+		t.Fatalf("direct-dash candidate plan leaked source data: %s", encoded)
+	}
+}
+
+func TestSelectNativeTransportsDirectDASHFailsClosed(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*NativeTransportInput)
+	}{
+		{
+			name: "feature off",
+			mutate: func(input *NativeTransportInput) {
+				input.Features.DirectDASHEnabled = false
+			},
+		},
+		{
+			name: "client merge capability off",
+			mutate: func(input *NativeTransportInput) {
+				input.Client.SupportsDASHMerge = false
+			},
+		},
+		{
+			name: "missing audio",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts = input.Parts[:1]
+			},
+		},
+		{
+			name: "duplicate video",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[1] = input.Parts[0]
+			},
+		},
+		{
+			name: "same URL for video and audio",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[1].URL = input.Parts[0].URL
+			},
+		},
+		{
+			name: "unknown role",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[0].Kind = "muxed"
+			},
+		},
+		{
+			name: "wrong video MIME",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[0].MIME = "audio/mp4"
+			},
+		},
+		{
+			name: "HTTP URL",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[0].URL = "http://video.example.test/video.m4s"
+			},
+		},
+		{
+			name: "unsafe headers",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[1].Headers = map[string]string{
+					"Authorization": "Bearer source-secret",
+				}
+			},
+		},
+		{
+			name: "headers capability off",
+			mutate: func(input *NativeTransportInput) {
+				input.Client.SupportsHeaders = false
+			},
+		},
+		{
+			name: "duration skew",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[1].Duration = 123.1
+			},
+		},
+		{
+			name: "missing duration",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[0].Duration = 0
+			},
+		},
+		{
+			name: "NaN duration",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[0].Duration = math.NaN()
+			},
+		},
+		{
+			name: "positive infinity duration",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[0].Duration = math.Inf(1)
+			},
+		},
+		{
+			name: "negative infinity duration",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[0].Duration = math.Inf(-1)
+			},
+		},
+		{
+			name: "generic h264 capability for high 10",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[0].Profile = "High 10"
+				input.Parts[0].BitDepth = 10
+			},
+		},
+		{
+			name: "generic hevc capability for main 10",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[0].Codec = "hevc"
+				input.Parts[0].Profile = "Main 10"
+				input.Parts[0].BitDepth = 10
+			},
+		},
+		{
+			name: "generic hevc capability for HDR",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[0].Codec = "hevc"
+				input.Parts[0].Profile = "Main 10"
+				input.Parts[0].BitDepth = 10
+				input.Parts[0].HDR = true
+			},
+		},
+		{
+			name: "bit depth capability is not an HDR capability",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[0].Codec = "hevc"
+				input.Parts[0].Profile = "Main 10"
+				input.Parts[0].BitDepth = 10
+				input.Parts[0].HDR = true
+				input.Client.VideoCodecs = append(input.Client.VideoCodecs, "hevc10")
+			},
+		},
+		{
+			name: "unsupported audio codec",
+			mutate: func(input *NativeTransportInput) {
+				input.Parts[1].Codec = "dts"
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := multipartDASHInput()
+			tc.mutate(&input)
+			selection := SelectNativeTransports(input)
+			if got := selection.Kinds(); !reflect.DeepEqual(
+				got, []NativeTransportKind{NativeTransportServerHLS},
+			) {
+				t.Fatalf("kinds = %v, want server-hls fallback (%s)",
+					got, selection.UnsupportedReason)
+			}
+		})
+	}
+}
+
+func TestSelectNativeTransportsDirectDASHDurationBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		skew float64
+		want []NativeTransportKind
+	}{
+		{
+			name: "exact boundary",
+			skew: 0.25,
+			want: []NativeTransportKind{
+				NativeTransportDirectDASH,
+				NativeTransportServerHLS,
+			},
+		},
+		{
+			name: "just over boundary",
+			skew: 0.250001,
+			want: []NativeTransportKind{NativeTransportServerHLS},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := multipartDASHInput()
+			input.Client.PreferredTransports = []NativeTransportKind{
+				NativeTransportDirectDASH,
+				NativeTransportServerHLS,
+			}
+			input.Parts[1].Duration = input.Parts[0].Duration + tc.skew
+			if got := SelectNativeTransports(input).Kinds(); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("kinds = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSelectNativeTransportsDirectDASHExplicitProfileCapabilities(t *testing.T) {
+	tests := []struct {
+		name       string
+		codec      string
+		profile    string
+		hdr        bool
+		capability string
+	}{
+		{"h264 10-bit", "h264", "High 10", false, "h26410"},
+		{"hevc 10-bit", "hevc", "Main 10", false, "hevc10"},
+		{"hevc HDR", "hevc", "Main 10", true, "hdr10"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := multipartDASHInput()
+			input.Client.PreferredTransports = []NativeTransportKind{
+				NativeTransportDirectDASH,
+				NativeTransportServerHLS,
+			}
+			input.Parts[0].Codec = tc.codec
+			input.Parts[0].Profile = tc.profile
+			input.Parts[0].BitDepth = 10
+			input.Parts[0].HDR = tc.hdr
+			input.Client.VideoCodecs = append(
+				input.Client.VideoCodecs, tc.capability)
+			want := []NativeTransportKind{
+				NativeTransportDirectDASH,
+				NativeTransportServerHLS,
+			}
+			if got := SelectNativeTransports(input).Kinds(); !reflect.DeepEqual(got, want) {
+				t.Fatalf("kinds with capability %q = %v, want %v",
+					tc.capability, got, want)
+			}
+		})
 	}
 }
 

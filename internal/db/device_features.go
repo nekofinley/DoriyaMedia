@@ -234,7 +234,17 @@ func requirePlaybackTicketsAllowedTxContext(
 }
 
 func requirePlaybackTransportAllowedTx(tx *sql.Tx, deviceID int64, transport string) error {
-	overrides, err := loadDeviceFeatureOverrides(tx, deviceID)
+	return requirePlaybackTransportAllowedTxContext(
+		context.Background(), tx, deviceID, transport)
+}
+
+func requirePlaybackTransportAllowedTxContext(
+	ctx context.Context,
+	tx *sql.Tx,
+	deviceID int64,
+	transport string,
+) error {
+	overrides, err := loadDeviceFeatureOverridesContext(ctx, tx, deviceID)
 	if err != nil {
 		return err
 	}
