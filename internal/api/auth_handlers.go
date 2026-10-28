@@ -11,6 +11,7 @@ import (
 	"doriyamedia/internal/auth"
 	"doriyamedia/internal/config"
 	"doriyamedia/internal/models"
+	"doriyamedia/internal/scan"
 )
 
 func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
@@ -237,6 +238,18 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 	if err := readBody(r, &req); err != nil {
 		fail(w, 400, err.Error())
 		return
+	}
+	// Both lists accept /…/ regular expressions, and a pattern that does not
+	// compile is refused before anything is written: a saved-but-broken keyword
+	// would silently exclude nothing, which is worse than a rejected save.
+	for _, list := range []*[]string{req.ExcludeKeywords, req.ExcludeFolders} {
+		if list == nil {
+			continue
+		}
+		if err := scan.ValidateExcludes(cleanKeywords(*list)); err != nil {
+			fail(w, 400, err.Error())
+			return
+		}
 	}
 	if req.Port != nil && *req.Port > 0 {
 		s.Cfg.Port = *req.Port

@@ -116,3 +116,87 @@ func TestEffectiveExcludeFolders(t *testing.T) {
 		t.Fatalf("opt-out got %v", got)
 	}
 }
+
+// A /…/ entry is a regular expression, used as written — including its case
+// sensitivity, which the plain keywords do not have.
+func TestRegexKeyword(t *testing.T) {
+	re := excludeMatcher([]string{`/^\[PV\d+\]$/`})
+	if re == nil {
+		t.Fatal("matcher is nil")
+	}
+	if !re.MatchString("[PV12]") || !re.MatchString("[PV1]") {
+		t.Error("regex should match [PV12] and [PV1]")
+	}
+	if re.MatchString("[PV]") {
+		t.Error("\\d+ requires a digit")
+	}
+
+	// Case-sensitive unless the pattern says otherwise.
+	lower := excludeMatcher([]string{`/^pv\d*$/`})
+	if lower.MatchString("PV01") {
+		t.Error("/^pv\\d*$/ must not match PV01")
+	}
+	insensitive := excludeMatcher([]string{`/(?i)^pv\d*$/`})
+	if !insensitive.MatchString("PV01") {
+		t.Error("/(?i)^pv\\d*$/ should match PV01")
+	}
+}
+
+// A plain keyword keeps its old meaning next to a regex: latin words on word
+// boundaries, everything else as a substring.
+func TestRegexAndPlainKeywordsTogether(t *testing.T) {
+	re := excludeMatcher([]string{`/^\d+\./`, "sample"})
+	if !re.MatchString("01. 开场.mkv") {
+		t.Error("leading number should match")
+	}
+	if !re.MatchString("Show - Sample.mkv") {
+		t.Error("plain keyword should still work")
+	}
+	if re.MatchString("Spy x Family.mkv") {
+		t.Error("plain keyword must not match inside a word")
+	}
+}
+
+// A regex in the folder list matches a folder name at any depth.
+func TestRegexFolderKeyword(t *testing.T) {
+	files := []fileRec{
+		{Path: "/lib/Show/CD1/E01.mkv", Dir: "/lib/Show/CD1", Root: "/lib"},
+		{Path: "/lib/Show/E01.mkv", Dir: "/lib/Show", Root: "/lib"},
+	}
+	got := dropExcluded(files, nil, excludeMatcher([]string{`/^(CD|DVD)\d+$/`}))
+	if len(got) != 1 || got[0].Path != "/lib/Show/E01.mkv" {
+		t.Fatalf("got %v", paths(got))
+	}
+}
+
+// A stored pattern that no longer compiles is skipped, so the rest of the list
+// keeps working instead of the whole matcher collapsing to nil.
+func TestBrokenRegexIsSkipped(t *testing.T) {
+	re := excludeMatcher([]string{`/(unclosed/`, "sample"})
+	if re == nil {
+		t.Fatal("a broken entry must not disable the other keywords")
+	}
+	if !re.MatchString("Show - Sample.mkv") {
+		t.Error("the good keyword should still match")
+	}
+}
+
+// // is not an empty pattern (that would match everything): it stays a word.
+func TestEmptyRegexIsLiteral(t *testing.T) {
+	if _, ok := regexBody("//"); ok {
+		t.Fatal("// must not be treated as a regex")
+	}
+	if re := excludeMatcher([]string{"//"}); re == nil || re.MatchString("anything") {
+		t.Fatal("// must only match the literal text")
+	}
+}
+
+func TestValidateExcludes(t *testing.T) {
+	ok := []string{"sample", `/(?i)^pv\d+$/`, "特典", "//"}
+	if err := ValidateExcludes(ok); err != nil {
+		t.Fatalf("valid list rejected: %v", err)
+	}
+	if err := ValidateExcludes([]string{"sample", `/(unclosed/`}); err == nil {
+		t.Fatal("broken regex must be reported")
+	}
+}

@@ -2,6 +2,8 @@ package scan
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
 	"regexp"
 	"strings"
 
@@ -24,6 +26,9 @@ import (
 // name, folder names against any folder between the library root and the file.
 // Excluding a folder skips everything inside it, which is how an Extras or
 // Sample directory is kept out without naming every file in it.
+//
+// An entry wrapped in slashes — /^\[PV\d+\]$/ — is a regular expression and is
+// used as written; every other entry is matched the plain way described below.
 
 // EffectiveExcludes returns the keywords in force for one library: its own list
 // when it keeps one, the global list otherwise.
@@ -69,6 +74,42 @@ func parseKeywords(raw string) []string {
 	return out
 }
 
+// regexBody reports whether a keyword is written as a regular expression
+// (/pattern/) and returns its body. An empty body ("//") is not a pattern: it
+// would match everything, which nobody means by accident, so it stays an
+// ordinary word.
+func regexBody(keyword string) (string, bool) {
+	if len(keyword) < 3 || keyword[0] != '/' || keyword[len(keyword)-1] != '/' {
+		return "", false
+	}
+	body := keyword[1 : len(keyword)-1]
+	if strings.TrimSpace(body) == "" {
+		return "", false
+	}
+	return body, true
+}
+
+// ValidateExcludes checks every entry written as a regular expression and reports
+// the first one that does not compile, so a save can be refused with a message
+// naming the culprit instead of storing a keyword that silently never matches.
+// Plain keywords are always fine.
+func ValidateExcludes(keywords []string) error {
+	for _, k := range keywords {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		body, ok := regexBody(k)
+		if !ok {
+			continue
+		}
+		if _, err := regexp.Compile(body); err != nil {
+			return fmt.Errorf("正则写错了:%s(%v)", k, err)
+		}
+	}
+	return nil
+}
+
 // excludeMatcher compiles the keywords into one pattern.
 //
 // A keyword written in latin letters matches a whole word, allowing a trailing
@@ -76,24 +117,38 @@ func parseKeywords(raw string) []string {
 // not eat a show whose name happens to contain those letters. Anything else —
 // Chinese, or a keyword with punctuation — matches as a plain substring, because
 // those have no word boundaries to speak of.
+//
+// A keyword wrapped in slashes is a regular expression and is used as written,
+// case sensitivity included: /^pv/ is case-sensitive, /(?i)^pv/ is not. Plain
+// keywords stay case-insensitive. A stored pattern that no longer compiles (a
+// hand-edited row) is skipped instead of taking every other keyword down with it;
+// ValidateExcludes is what keeps such rows from being saved in the first place.
 func excludeMatcher(keywords []string) *regexp.Regexp {
-	var parts []string
+	parts := make([]string, 0, len(keywords))
 	for _, k := range keywords {
 		k = strings.TrimSpace(k)
 		if k == "" {
 			continue
 		}
+		if body, ok := regexBody(k); ok {
+			if _, err := regexp.Compile(body); err != nil {
+				log.Printf("exclude: skipping keyword %q: %v", k, err)
+				continue
+			}
+			parts = append(parts, "(?:"+body+")")
+			continue
+		}
 		q := regexp.QuoteMeta(k)
 		if isLatinWord(k) {
-			parts = append(parts, `(?:^|[^a-z0-9])`+q+`s?\d*(?:$|[^a-z0-9])`)
+			parts = append(parts, `(?i:(?:^|[^a-z0-9])`+q+`s?\d*(?:$|[^a-z0-9]))`)
 		} else {
-			parts = append(parts, q)
+			parts = append(parts, `(?i:`+q+`)`)
 		}
 	}
 	if len(parts) == 0 {
 		return nil
 	}
-	re, err := regexp.Compile(`(?i)` + strings.Join(parts, "|"))
+	re, err := regexp.Compile(strings.Join(parts, "|"))
 	if err != nil {
 		return nil
 	}

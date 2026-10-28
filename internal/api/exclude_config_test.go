@@ -127,3 +127,60 @@ func idString(t *testing.T, v any) string {
 	}
 	return strconv.FormatInt(int64(f), 10)
 }
+
+// A /…/ entry that does not compile is refused with a message naming it, for the
+// global lists and for a library's own lists alike.
+func TestBrokenRegexIsRefused(t *testing.T) {
+	_, ts := newTestServer(t)
+	base := ts.URL
+	admin := setupAdmin(t, base)
+
+	code, body := call(t, admin, "PUT", base+"/api/config", map[string]any{
+		"exclude_folders": []string{`/(unclosed/`},
+	})
+	if code != 400 {
+		t.Fatalf("broken regex accepted: code %d body %v", code, body)
+	}
+	if msg, _ := body["error"].(string); msg == "" {
+		t.Errorf("error message should name the entry, got %v", body)
+	}
+	// Nothing was written.
+	_, cfg := call(t, admin, "GET", base+"/api/config", nil)
+	if got := stringsOf(cfg["exclude_folders"]); len(got) != 0 {
+		t.Errorf("exclude_folders should still be empty, got %v", got)
+	}
+
+	code, src := call(t, admin, "POST", base+"/api/sources", map[string]any{
+		"name": "本地", "type": "local", "config": map[string]any{"root": "/media"},
+	})
+	if code != 200 {
+		t.Fatalf("create source: code %d body %v", code, src)
+	}
+	code, body = call(t, admin, "POST", base+"/api/libraries", map[string]any{
+		"name": "剧集", "type": "series", "source_id": src["id"], "path": "/tv",
+		"exclude_mode": "custom", "excludes": []string{"*bad"},
+	})
+	if code != 200 {
+		t.Fatalf("a plain keyword must never be rejected, code %d body %v", code, body)
+	}
+
+	code, body = call(t, admin, "POST", base+"/api/libraries", map[string]any{
+		"name": "剧集", "type": "series", "source_id": src["id"], "path": "/tv",
+		"exclude_folder_mode": "custom", "exclude_folders": []string{`/(unclosed/`},
+	})
+	if code != 400 {
+		t.Fatalf("broken folder regex accepted: code %d body %v", code, body)
+	}
+
+	// A good one goes through.
+	code, lib := call(t, admin, "POST", base+"/api/libraries", map[string]any{
+		"name": "剧集", "type": "series", "source_id": src["id"], "path": "/tv",
+		"exclude_mode": "custom", "excludes": []string{`/^\[PV\d+\]$/`},
+	})
+	if code != 200 {
+		t.Fatalf("valid regex rejected: code %d body %v", code, lib)
+	}
+	if got := lib["excludes"]; got != `["/^\\[PV\\d+\\]$/"]` {
+		t.Errorf("excludes = %v", got)
+	}
+}
