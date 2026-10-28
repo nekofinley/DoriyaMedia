@@ -129,6 +129,8 @@ func (s *Store) migrate() error {
 			providers TEXT NOT NULL DEFAULT '["nfo","tmdb"]',
 			exclude_mode TEXT NOT NULL DEFAULT 'inherit',
 			excludes TEXT NOT NULL DEFAULT '[]',
+			exclude_folder_mode TEXT NOT NULL DEFAULT 'inherit',
+			exclude_folders TEXT NOT NULL DEFAULT '[]',
 			created_at TIMESTAMP NOT NULL
 		)`,
 		// The places one library scans. A library used to be bound to a single
@@ -592,13 +594,18 @@ func (s *Store) migrateItemSourceTypes() error {
 	return nil
 }
 
-// migrateLibraryExcludes adds the per-library exclusion list. Libraries created
-// before it inherit the global list, which is what the empty mode means — no
+// migrateLibraryExcludes adds the per-library exclusion lists. Libraries created
+// before them inherit the global lists, which is what the empty mode means — no
 // backfill needed, and a library the user already tuned keeps its behaviour.
+//
+// There are two lists: keywords matched against file names, and keywords matched
+// against folder names (an Extras or Sample directory, skipped whole).
 func (s *Store) migrateLibraryExcludes() error {
 	columns := []struct{ name, ddl string }{
 		{"exclude_mode", `ALTER TABLE libraries ADD COLUMN exclude_mode TEXT NOT NULL DEFAULT 'inherit'`},
 		{"excludes", `ALTER TABLE libraries ADD COLUMN excludes TEXT NOT NULL DEFAULT '[]'`},
+		{"exclude_folder_mode", `ALTER TABLE libraries ADD COLUMN exclude_folder_mode TEXT NOT NULL DEFAULT 'inherit'`},
+		{"exclude_folders", `ALTER TABLE libraries ADD COLUMN exclude_folders TEXT NOT NULL DEFAULT '[]'`},
 	}
 	for _, c := range columns {
 		if err := s.addColumn("libraries", c.name, c.ddl); err != nil {
@@ -1075,8 +1082,10 @@ func (s *Store) CreateLibrary(lib *models.Library) error {
 	// request from it, and a library handed out saying mode "" would behave as
 	// "inherit" while claiming to have no opinion.
 	lib.ExcludeMode, lib.Excludes = orExcludeMode(lib.ExcludeMode), orExcludes(lib.Excludes)
-	res, err := s.DB.Exec(`INSERT INTO libraries (name, type, source_id, path, providers, exclude_mode, excludes, created_at) VALUES (?,?,?,?,?,?,?,?)`,
-		lib.Name, lib.Type, lib.SourceID, lib.Path, lib.Providers, lib.ExcludeMode, lib.Excludes, time.Now())
+	lib.ExcludeFolderMode, lib.ExcludeFolders = orExcludeMode(lib.ExcludeFolderMode), orExcludes(lib.ExcludeFolders)
+	res, err := s.DB.Exec(`INSERT INTO libraries (name, type, source_id, path, providers, exclude_mode, excludes, exclude_folder_mode, exclude_folders, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		lib.Name, lib.Type, lib.SourceID, lib.Path, lib.Providers, lib.ExcludeMode, lib.Excludes,
+		lib.ExcludeFolderMode, lib.ExcludeFolders, time.Now())
 	if err != nil {
 		return err
 	}
@@ -1090,8 +1099,10 @@ func (s *Store) CreateLibrary(lib *models.Library) error {
 
 func (s *Store) UpdateLibrary(lib *models.Library) error {
 	lib.ExcludeMode, lib.Excludes = orExcludeMode(lib.ExcludeMode), orExcludes(lib.Excludes)
-	_, err := s.DB.Exec(`UPDATE libraries SET name=?, type=?, source_id=?, path=?, providers=?, exclude_mode=?, excludes=? WHERE id=?`,
-		lib.Name, lib.Type, lib.SourceID, lib.Path, lib.Providers, lib.ExcludeMode, lib.Excludes, lib.ID)
+	lib.ExcludeFolderMode, lib.ExcludeFolders = orExcludeMode(lib.ExcludeFolderMode), orExcludes(lib.ExcludeFolders)
+	_, err := s.DB.Exec(`UPDATE libraries SET name=?, type=?, source_id=?, path=?, providers=?, exclude_mode=?, excludes=?, exclude_folder_mode=?, exclude_folders=? WHERE id=?`,
+		lib.Name, lib.Type, lib.SourceID, lib.Path, lib.Providers, lib.ExcludeMode, lib.Excludes,
+		lib.ExcludeFolderMode, lib.ExcludeFolders, lib.ID)
 	return err
 }
 
@@ -1190,8 +1201,9 @@ func (s *Store) DeleteLibrary(id int64) error {
 
 func (s *Store) LibraryByID(id int64) (*models.Library, error) {
 	lib := &models.Library{}
-	err := s.DB.QueryRow(`SELECT id, name, type, source_id, path, providers, exclude_mode, excludes, created_at FROM libraries WHERE id=?`, id).
-		Scan(&lib.ID, &lib.Name, &lib.Type, &lib.SourceID, &lib.Path, &lib.Providers, &lib.ExcludeMode, &lib.Excludes, &lib.CreatedAt)
+	err := s.DB.QueryRow(`SELECT id, name, type, source_id, path, providers, exclude_mode, excludes, exclude_folder_mode, exclude_folders, created_at FROM libraries WHERE id=?`, id).
+		Scan(&lib.ID, &lib.Name, &lib.Type, &lib.SourceID, &lib.Path, &lib.Providers, &lib.ExcludeMode, &lib.Excludes,
+			&lib.ExcludeFolderMode, &lib.ExcludeFolders, &lib.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -1206,9 +1218,10 @@ func (s *Store) LibraryByID(id int64) (*models.Library, error) {
 func (s *Store) EnsureBrowseLibrary(sourceID int64) (*models.Library, error) {
 	name := fmt.Sprintf("__browse__-%d", sourceID)
 	lib := &models.Library{}
-	err := s.DB.QueryRow(`SELECT id, name, type, source_id, path, providers, exclude_mode, excludes, created_at
+	err := s.DB.QueryRow(`SELECT id, name, type, source_id, path, providers, exclude_mode, excludes, exclude_folder_mode, exclude_folders, created_at
 		FROM libraries WHERE name = ? AND source_id = ?`, name, sourceID).
-		Scan(&lib.ID, &lib.Name, &lib.Type, &lib.SourceID, &lib.Path, &lib.Providers, &lib.ExcludeMode, &lib.Excludes, &lib.CreatedAt)
+		Scan(&lib.ID, &lib.Name, &lib.Type, &lib.SourceID, &lib.Path, &lib.Providers, &lib.ExcludeMode, &lib.Excludes,
+			&lib.ExcludeFolderMode, &lib.ExcludeFolders, &lib.CreatedAt)
 	if err == nil {
 		return lib, nil
 	}
@@ -1223,7 +1236,7 @@ func (s *Store) EnsureBrowseLibrary(sourceID int64) (*models.Library, error) {
 }
 
 func (s *Store) Libraries() ([]models.Library, error) {
-	rows, err := s.DB.Query(`SELECT id, name, type, source_id, path, providers, exclude_mode, excludes, created_at FROM libraries ORDER BY id`)
+	rows, err := s.DB.Query(`SELECT id, name, type, source_id, path, providers, exclude_mode, excludes, exclude_folder_mode, exclude_folders, created_at FROM libraries ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -1231,7 +1244,8 @@ func (s *Store) Libraries() ([]models.Library, error) {
 	var out []models.Library
 	for rows.Next() {
 		var lib models.Library
-		if err := rows.Scan(&lib.ID, &lib.Name, &lib.Type, &lib.SourceID, &lib.Path, &lib.Providers, &lib.ExcludeMode, &lib.Excludes, &lib.CreatedAt); err != nil {
+		if err := rows.Scan(&lib.ID, &lib.Name, &lib.Type, &lib.SourceID, &lib.Path, &lib.Providers, &lib.ExcludeMode, &lib.Excludes,
+			&lib.ExcludeFolderMode, &lib.ExcludeFolders, &lib.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, lib)

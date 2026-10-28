@@ -15,9 +15,15 @@ import (
 // or a card — and a rescan removes the rows it used to have. It stays visible in
 // the file browser, so it can still be played directly.
 //
-// The list is a setting, not a constant: every install starts from
-// config.DefaultExcludeKeywords, and both the global setting and a single
-// library's own list are editable.
+// The list is a setting, not a constant: both the global setting and a single
+// library's own list are editable, and a fresh install starts with neither of
+// them filled in — the words that mean "not an episode" differ per collection,
+// and a wrong guess quietly drops whole shows.
+//
+// There are two lists, matched at different levels: keywords against the file's
+// name, folder names against any folder between the library root and the file.
+// Excluding a folder skips everything inside it, which is how an Extras or
+// Sample directory is kept out without naming every file in it.
 
 // EffectiveExcludes returns the keywords in force for one library: its own list
 // when it keeps one, the global list otherwise.
@@ -28,7 +34,19 @@ func EffectiveExcludes(lib *models.Library, cfg *config.Config) []string {
 	if cfg != nil {
 		return cfg.ExcludeKeywords
 	}
-	return config.DefaultExcludeKeywords()
+	return nil
+}
+
+// EffectiveExcludeFolders is the same question for the folder list: the library's
+// own list when it keeps one, the global list otherwise.
+func EffectiveExcludeFolders(lib *models.Library, cfg *config.Config) []string {
+	if lib != nil && lib.ExcludeFolderMode == "custom" {
+		return parseKeywords(lib.ExcludeFolders)
+	}
+	if cfg != nil {
+		return cfg.ExcludeFolders
+	}
+	return nil
 }
 
 // parseKeywords reads a json array, tolerating newline-separated text so a
@@ -97,19 +115,42 @@ func isLatinWord(s string) bool {
 	return s != ""
 }
 
-// dropExcluded removes the files this library does not accept. Cleanup then sees
-// them as gone, which is how a newly added keyword takes an already imported file
-// back out of the library.
-func dropExcluded(files []fileRec, re *regexp.Regexp) []fileRec {
-	if re == nil || len(files) == 0 {
+// dropExcluded removes the files this library does not accept: a file whose name
+// matches the keyword list, or whose folder matches the folder list. Cleanup then
+// sees them as gone, which is how a newly added keyword takes an already imported
+// file back out of the library.
+func dropExcluded(files []fileRec, re, dirRe *regexp.Regexp) []fileRec {
+	if (re == nil && dirRe == nil) || len(files) == 0 {
 		return files
 	}
 	out := make([]fileRec, 0, len(files))
 	for _, fr := range files {
-		if re.MatchString(baseName(fr.Path)) {
+		if re != nil && re.MatchString(baseName(fr.Path)) {
+			continue
+		}
+		if dirRe != nil && dirExcluded(fr, dirRe) {
 			continue
 		}
 		out = append(out, fr)
 	}
 	return out
+}
+
+// dirExcluded reports whether any folder between the library root and the file
+// matches the folder list.
+//
+// The walk starts below Root on purpose: Root is the folder the user pointed the
+// library at, and a keyword that happens to be its name ("Anime") must not empty
+// a library the user just created. Only what the scan descends into counts.
+func dirExcluded(fr fileRec, re *regexp.Regexp) bool {
+	rel := fr.Dir
+	if root := strings.TrimSuffix(fr.Root, "/"); root != "" && strings.HasPrefix(rel, root) {
+		rel = rel[len(root):]
+	}
+	for _, seg := range strings.Split(rel, "/") {
+		if seg != "" && re.MatchString(seg) {
+			return true
+		}
+	}
+	return false
 }

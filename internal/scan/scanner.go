@@ -497,10 +497,13 @@ func (sc *Scanner) organize(lib *models.Library, files []fileRec, prog *models.S
 	}
 
 	// What this library refuses to import: release furniture, and whatever the
-	// user added to the list. Dropping the files here — before anything is
-	// planned — is what keeps them out of the library *and* lets cleanup take
-	// back a file whose keyword was added after it was imported.
-	files = dropExcluded(files, excludeMatcher(EffectiveExcludes(lib, sc.Cfg)))
+	// user added to either list — file-name keywords, or folder names skipped
+	// whole. Dropping the files here — before anything is planned — is what keeps
+	// them out of the library *and* lets cleanup take back a file whose keyword
+	// was added after it was imported.
+	files = dropExcluded(files,
+		excludeMatcher(EffectiveExcludes(lib, sc.Cfg)),
+		excludeMatcher(EffectiveExcludeFolders(lib, sc.Cfg)))
 
 	switch lib.Type {
 	case "series":

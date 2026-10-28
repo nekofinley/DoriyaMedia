@@ -195,17 +195,42 @@ type Config struct {
 	Turnstile       Turnstile `json:"turnstile"`
 	ScanConcurrency int       `json:"scan_concurrency"`
 	DevWebDir       string    `json:"dev_web_dir"`
-	// ExcludeKeywords is what a scan refuses to import: release furniture
-	// (NCED, menus, previews…) and anything else the user wants kept out of the
-	// library. A library that keeps its own list replaces this one.
+	// ExcludeKeywords is what a scan refuses to import, matched against each
+	// file's name: release furniture (NCED, menus, previews…) and anything else
+	// the user wants kept out of the library. A library that keeps its own list
+	// replaces this one.
+	//
+	// It starts empty: which words mean "not an episode" depends on the
+	// collection, and a wrong guess silently drops whole shows. Both lists are
+	// the user's to fill.
 	ExcludeKeywords []string `json:"exclude_keywords"`
+	// ExcludeFolders is the same idea one level up: a folder whose own name
+	// matches one of these is skipped whole, at any depth below the library's
+	// root. Nothing inside it is listed, imported or probed.
+	ExcludeFolders []string `json:"exclude_folders"`
 }
 
-// DefaultExcludeKeywords is the list a fresh install starts with. It is written
-// into the config file rather than applied on load: a user who deletes an entry
-// has deleted it, and a user who wants NCED back must be able to remove it.
-func DefaultExcludeKeywords() []string {
-	return []string{"ncop", "nced", "nc-op", "nc-ed", "creditless", "menu", "preview", "trailer", "sample", "pv", "cm", "sp"}
+// legacyExcludeKeywords is the stock file-name list older builds wrote into every
+// config file. It is a constant of the past, not a default: a fresh install now
+// starts with both lists empty, because which words mean "not an episode" depends
+// on the collection and a wrong guess silently drops whole shows.
+var legacyExcludeKeywords = []string{
+	"ncop", "nced", "nc-op", "nc-ed", "creditless", "menu", "preview", "trailer", "sample", "pv", "cm", "sp",
+}
+
+// dropLegacyExcludeDefaults empties a keyword list that is still exactly the list
+// older builds shipped. A list with even one word changed is the user's, and is
+// kept as it is.
+func (c *Config) dropLegacyExcludeDefaults() {
+	if len(c.ExcludeKeywords) != len(legacyExcludeKeywords) {
+		return
+	}
+	for i, k := range legacyExcludeKeywords {
+		if !strings.EqualFold(strings.TrimSpace(c.ExcludeKeywords[i]), k) {
+			return
+		}
+	}
+	c.ExcludeKeywords = []string{}
 }
 
 // RegistrationAllowed reports whether visitors may create their own account,
@@ -257,7 +282,8 @@ func Defaults() *Config {
 			Proxy:    DefaultTMDBProxy,
 		},
 		ScanConcurrency: 4,
-		ExcludeKeywords: DefaultExcludeKeywords(),
+		ExcludeKeywords: []string{},
+		ExcludeFolders:  []string{},
 	}
 }
 
@@ -360,6 +386,11 @@ func (c *Config) normalize() {
 	if c.Users.MinPassword > 128 {
 		c.Users.MinPassword = 128
 	}
+	// Both exclusion lists are the user's, and they start empty. A config file
+	// written by an older build still carries the stock keyword list it used to
+	// ship with; clearing it is what "no defaults" means, but only when it is
+	// still exactly that list — anything the user touched is left alone.
+	c.dropLegacyExcludeDefaults()
 	// A link in an email has to be absolute, so a base URL that ends in a slash
 	// would produce "//verify-email" — harmless in a browser, ugly in a mail
 	// client, and easy to prevent here.

@@ -380,8 +380,9 @@ func cleanKeywords(list []string) []string {
 func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request, user *models.User) {
 	var req struct {
 		models.Library
-		Providers providersField `json:"providers"`
-		Excludes  excludesField  `json:"excludes"`
+		Providers      providersField `json:"providers"`
+		Excludes       excludesField  `json:"excludes"`
+		FolderExcludes excludesField  `json:"exclude_folders"`
 	}
 	if err := readBody(r, &req); err != nil || req.Name == "" {
 		fail(w, 400, "名称不能为空")
@@ -398,11 +399,16 @@ func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request, use
 	if lib.Providers == "" {
 		lib.Providers = `["nfo","bgm","tmdb"]`
 	}
-	// A new library follows the global exclusion list unless it was given one.
+	// A new library follows the global exclusion lists unless it was given one.
 	lib.Excludes = string(req.Excludes)
 	if lib.ExcludeMode != "custom" {
 		lib.ExcludeMode = "inherit"
 		lib.Excludes = ""
+	}
+	lib.ExcludeFolders = string(req.FolderExcludes)
+	if lib.ExcludeFolderMode != "custom" {
+		lib.ExcludeFolderMode = "inherit"
+		lib.ExcludeFolders = ""
 	}
 	// The library's own source_id/path name its first place: the column is NOT
 	// NULL with a foreign key, and everything that predates multi-source reads
@@ -440,8 +446,9 @@ func (s *Server) handleUpdateLibrary(w http.ResponseWriter, r *http.Request, use
 	}
 	var req struct {
 		models.Library
-		Providers providersField `json:"providers"`
-		Excludes  excludesField  `json:"excludes"`
+		Providers      providersField `json:"providers"`
+		Excludes       excludesField  `json:"excludes"`
+		FolderExcludes excludesField  `json:"exclude_folders"`
 	}
 	if err := readBody(r, &req); err != nil {
 		fail(w, 400, err.Error())
@@ -474,6 +481,20 @@ func (s *Server) handleUpdateLibrary(w http.ResponseWriter, r *http.Request, use
 	} else {
 		lib.ExcludeMode = "inherit"
 		lib.Excludes = "[]"
+	}
+	// The folder list follows the same rule, and its own mode: a client that does
+	// not send it cannot wipe a library's folder exclusions.
+	if req.ExcludeFolderMode != "" {
+		lib.ExcludeFolderMode = req.ExcludeFolderMode
+	}
+	if lib.ExcludeFolderMode == "custom" {
+		lib.ExcludeFolders = string(req.FolderExcludes)
+		if strings.TrimSpace(lib.ExcludeFolders) == "" {
+			lib.ExcludeFolders = "[]"
+		}
+	} else {
+		lib.ExcludeFolderMode = "inherit"
+		lib.ExcludeFolders = "[]"
 	}
 	if err := s.Store.UpdateLibrary(lib); err != nil {
 		fail(w, 500, err.Error())

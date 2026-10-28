@@ -206,6 +206,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request, user *m
 		"ffprobe":          s.Cfg.FFProbe,
 		"scan_concurrency": s.Cfg.ScanConcurrency,
 		"exclude_keywords": s.Cfg.ExcludeKeywords,
+		"exclude_folders":  s.Cfg.ExcludeFolders,
 		"dev_web_dir":      s.Cfg.DevWebDir,
 		"tmdb":             s.Cfg.TMDB,
 		"bgm":              s.Cfg.BGM,
@@ -224,6 +225,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 		FFProbe         *string          `json:"ffprobe"`
 		ScanConcurrency *int             `json:"scan_concurrency"`
 		ExcludeKeywords *[]string        `json:"exclude_keywords"`
+		ExcludeFolders  *[]string        `json:"exclude_folders"`
 		DevWebDir       *string          `json:"dev_web_dir"`
 		TMDB            *configTMDB      `json:"tmdb"`
 		BGM             *configBGM       `json:"bgm"`
@@ -248,10 +250,13 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 	if req.ScanConcurrency != nil && *req.ScanConcurrency > 0 {
 		s.Cfg.ScanConcurrency = *req.ScanConcurrency
 	}
-	// A list is saved as sent, including an empty one: the defaults are written into
-	// the config file so that deleting an entry is how a user turns it off.
+	// A list is saved as sent, including an empty one: deleting an entry is how a
+	// user turns it off, and there are no built-in defaults to restore.
 	if req.ExcludeKeywords != nil {
 		s.Cfg.ExcludeKeywords = cleanKeywords(*req.ExcludeKeywords)
+	}
+	if req.ExcludeFolders != nil {
+		s.Cfg.ExcludeFolders = cleanKeywords(*req.ExcludeFolders)
 	}
 	if req.DevWebDir != nil {
 		s.Cfg.DevWebDir = *req.DevWebDir
