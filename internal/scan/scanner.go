@@ -602,88 +602,6 @@ func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *mo
 	return sc.cleanup(lib, files, current, walked, partial, listings)
 }
 
-// filmPlan is a film a series library holds: a file with no episode number whose
-// own folder ("[show][S0]") or own name says what it is.
-type filmPlan struct {
-	fr    fileRec
-	title string
-	year  int
-}
-
-// planFilm names one film. The folder wins when it names something — a film kept
-// in "[show][S0]" belongs to that show, so the show is a better search key than
-// the release's own file name — and the file name is the fallback for a movie
-// sitting loose at the root, the way organizeMovies reads a movie library.
-func planFilm(fr fileRec, p Parsed) (filmPlan, bool) {
-	title := ""
-	year := 0
-	if fr.Dir != "" && fr.Dir != fr.Root {
-		// A folder in the "[show][S0]" convention names the show in its first
-		// bracket; the later brackets are the season, never the film's name.
-		if t, _, _, _ := ParseShowDirName(baseName(fr.Dir)); t != "" {
-			title = t
-		} else if dp := ParseName(baseName(fr.Dir)); dp.Title != "" {
-			title, year = dp.Title, dp.Year
-		}
-	}
-	if title == "" {
-		title = orDefault(stripTitleYear(p.Title), displayBaseName(fr.Path))
-		year = p.Year
-	}
-	title = strings.TrimSpace(title)
-	if title == "" || SkipEntry(title) {
-		return filmPlan{}, false
-	}
-	return filmPlan{fr: fr, title: title, year: year}, true
-}
-
-// storeFilms writes the films a series library holds as movie items of that
-// library. A film is keyed by name and year, so a rescan lands on the same row
-// and two cuts of one film are two files on one card.
-func (sc *Scanner) storeFilms(lib *models.Library, films []filmPlan, prog *models.ScanProgress) error {
-	if len(films) == 0 {
-		return nil
-	}
-	existing, _, err := sc.Store.ItemsByLibrary(lib.ID, "movie", "", "", false, 0, 1000000)
-	if err != nil {
-		log.Printf("organize: load films of library %d failed: %v", lib.ID, err)
-		return err
-	}
-	byKey := map[string]int64{}
-	for _, it := range existing {
-		byKey[NormalizeKey(fmt.Sprintf("%s|%d", it.Name, it.Year))] = it.ID
-	}
-	for _, f := range films {
-		key := NormalizeKey(fmt.Sprintf("%s|%d", f.title, f.year))
-		id, ok := byKey[key]
-		if !ok {
-			it := &models.Item{
-				LibraryID: lib.ID, Type: "movie", Name: f.title, Year: f.year, SourceType: f.fr.SrcType,
-			}
-			if err := sc.Store.InsertItem(it); err != nil {
-				log.Printf("organize: insert film %q failed: %v", f.title, err)
-				return err
-			}
-			id = it.ID
-			byKey[key] = id
-		}
-		if _, err := sc.Store.UpsertFile(&models.MediaFile{
-			ItemID: id, SourceID: f.fr.SourceID, Path: f.fr.Path, Size: f.fr.Size, MTime: f.fr.MTime,
-		}); err != nil {
-			log.Printf("organize: UpsertFile film %q failed: %v", f.title, err)
-			return err
-		}
-		if prog != nil {
-			prog.Update(func(st *models.ScanState) {
-				st.Done++
-				st.Current = f.title
-			})
-			prog.AddEvent("movie", f.title)
-		}
-	}
-	return nil
-}
-
 // yearSuffix renders " (2019)" for the feed, empty when the year is unknown.
 func yearSuffix(year int) string {
 	if year <= 0 {
@@ -958,22 +876,28 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 	}
 	numbered := make([]planned, 0, len(files))
 	named := make([]planned, 0, len(files))
-	films := make([]filmPlan, 0, 8)
+	// The files that actually become episodes, and so the only ones a series
+	// library imports. Everything the organizer skips below is left out, which is
+	// also what the final cleanup uses to purge a row a previous scan may have
+	// imported for a file that no longer belongs here.
+	imported := make([]fileRec, 0, len(files))
+	var skippedFiles []fileRec
 	for _, fr := range files {
 		p := ParseName(baseName(fr.Path))
-		// A file with no episode number is not an episode of this show: by the
-		// collection's own convention it is a film — the "[show][S0]" folder, or
-		// a standalone movie sitting beside the shows. It is filed as a movie
-		// item below. Dropping it (the old behaviour) lost every theatre film.
+		// A file with no episode number is not an episode of this show. The
+		// standard layout is "name(year)/Sxx/…" for a show and a separate
+		// "name (year)" folder for a theatre film (kept in a movie library, not
+		// this one). Such a file does not match a series library, so it is not
+		// imported at all: importing it as a movie card is what let a bare title
+		// like "Another" be scraped into the unrelated film "(an)other".
 		//
 		// Release furniture (NCOP/NCED, menus, previews) never reaches this loop:
 		// SkipEntry drops those files during the walk.
 		if p.Episode == 0 {
-			if f, ok := planFilm(fr, p); ok {
-				films = append(films, f)
-			}
+			skippedFiles = append(skippedFiles, fr)
 			continue
 		}
+		imported = append(imported, fr)
 		// Show title: prefer the show DIRECTORY (the season-dir's parent), so
 		// "风夏/Season 1/EP01.mkv" or "风夏/01.mkv" both resolve to show "风夏".
 		// Only fall back to the filename when the file sits at the library root.
@@ -1183,14 +1107,20 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 
 	}
 
-	// The films this library holds beside its shows. They are ordinary movie
-	// items in the same library: the scraper treats them like any other film, and
-	// every page that lists a library's films picks them up by type.
-	if err := sc.storeFilms(lib, films, prog); err != nil {
-		return err
+	// Files that do not match a series library (no episode number) are not
+	// imported. Drop any row a previous scan wrote for them — the file may have
+	// been imported before this rule existed, or under a different naming — so
+	// cleanup can then take away the item it left behind.
+	for _, fr := range skippedFiles {
+		if _, err := sc.Store.DB.Exec(`DELETE FROM files WHERE source_id=? AND path=?`, fr.SourceID, fr.Path); err != nil {
+			log.Printf("organize: drop non-episode file path=%q failed: %v", fr.Path, err)
+		}
+	}
+	if len(skippedFiles) > 0 && prog != nil {
+		prog.AddEvent("warn", fmt.Sprintf("跳过 %d 个无集号文件(剧集库只收剧集)", len(skippedFiles)))
 	}
 
-	if err := sc.cleanup(lib, files, current, walked, partial, listings); err != nil {
+	if err := sc.cleanup(lib, imported, current, walked, partial, listings); err != nil {
 		log.Printf("organize: cleanup failed (done=%d): %v", progDone(prog), err)
 		return err
 	}
