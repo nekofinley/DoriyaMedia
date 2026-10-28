@@ -44,10 +44,14 @@ type Scanner struct {
 	// OnScanned fires after a library scan finishes, so the caller can warm
 	// caches (e.g. pre-probe new files) without blocking the scan itself.
 	OnScanned func(lib *models.Library)
-	states    sync.Map // libraryID -> *models.ScanProgress
-	cancels   sync.Map // libraryID -> context.CancelFunc
+	// Path scans use scoped hooks so enrichment and pre-probing do not expand
+	// back into a full-library operation.
+	OnIdentifyFiles func(lib *models.Library, files []models.MediaFile, listings map[string][]source.Entry, report func(done, total int, msg string))
+	OnScannedFiles  func(lib *models.Library, files []models.MediaFile)
+	states          sync.Map // libraryID -> *models.ScanProgress
+	cancels         sync.Map // libraryID -> context.CancelFunc
 
-	queue chan *models.Library
+	queue chan scanJob
 	once  sync.Once
 }
 
@@ -87,25 +91,33 @@ func (sc *Scanner) setState(libID int64, p *models.ScanProgress) {
 
 // ScanLibrary enqueues a library scan (processed sequentially by one worker).
 func (sc *Scanner) ScanLibrary(lib *models.Library) error {
+	return sc.enqueue(scanJob{lib: lib})
+}
+
+func (sc *Scanner) enqueue(job scanJob) error {
 	sc.once.Do(func() {
-		sc.queue = make(chan *models.Library, 64)
+		sc.queue = make(chan scanJob, 64)
 		go sc.worker()
 	})
 	select {
-	case sc.queue <- lib:
+	case sc.queue <- job:
 		return nil
 	default:
-		return fmt.Errorf("扫描队列已满,请稍后再试")
+		return ErrScanQueueFull
 	}
 }
 
 func (sc *Scanner) worker() {
-	for lib := range sc.queue {
-		sc.runScan(lib)
+	for job := range sc.queue {
+		_ = sc.runScanScoped(job.lib, job.scope)
 	}
 }
 
 func (sc *Scanner) runScan(lib *models.Library) error {
+	return sc.runScanScoped(lib, nil)
+}
+
+func (sc *Scanner) runScanScoped(lib *models.Library, scope *scanScope) error {
 	prog := models.NewScanProgress(lib.ID)
 	prog.Set(models.ScanState{
 		LibraryID: lib.ID, Running: true, Phase: "walk",
@@ -122,11 +134,30 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 		prog.AddEvent("warn", msg)
 	}
 
+	if scope != nil {
+		// A queued scan must honor configuration changes made while it waited.
+		fresh, err := sc.Store.LibraryByID(lib.ID)
+		if err != nil {
+			fail("媒体库已不存在: " + err.Error())
+			return err
+		}
+		resolved, err := sc.resolveScanScope(fresh, scope.SourceID, scope.Path)
+		if err != nil {
+			fail(err.Error())
+			return err
+		}
+		lib, scope = fresh, resolved
+	}
+
 	// Where this library scans. A library may hold several places; each is walked
 	// with its own driver, and every file found keeps the source it came from.
 	places, err := sc.Store.LibrarySources(lib.ID)
 	if err != nil || len(places) == 0 {
 		places = []models.LibrarySource{{LibraryID: lib.ID, SourceID: lib.SourceID, Path: lib.Path}}
+	}
+	if scope != nil {
+		places = []models.LibrarySource{{LibraryID: lib.ID, SourceID: scope.SourceID, Path: scope.Root}}
+		prog.AddEvent("info", "仅扫描路径 "+scope.Path)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -143,9 +174,9 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 	// The walk reports every directory. Emitting one line per directory would
 	// bury everything else on a large library, so the feed takes every eighth
 	// plus whatever is current — enough to see it moving.
-	var walkSeen int
+	var walkSeen atomic.Int64
 	onDir := func(dir string, dirs, found, errs int64, firstErr string) {
-		walkSeen++
+		n := walkSeen.Add(1)
 		prog.Update(func(st *models.ScanState) {
 			st.Current = dir
 			st.DirsDone, st.FilesFound, st.WalkErrs = int(dirs), int(found), int(errs)
@@ -153,7 +184,7 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 				st.FirstErr = firstErr
 			}
 		})
-		if walkSeen%8 == 0 {
+		if n%8 == 0 {
 			prog.AddEvent("dir", dir)
 		}
 	}
@@ -186,11 +217,22 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 			srcErrs = append(srcErrs, fmt.Sprintf("%s: %v", src.Name, derr))
 			continue
 		}
+		if scope != nil {
+			if err := scope.validateDriver(drv); err != nil {
+				srcErrs = append(srcErrs, fmt.Sprintf("%s: %v", src.Name, err))
+				continue
+			}
+		}
 		if pl, ok := drv.(source.PartialLister); ok && pl.PartialListing() {
 			partial[place.SourceID] = true
 		}
-		prog.AddEvent("info", fmt.Sprintf("扫描 %s %s", src.Name, place.Path))
-		f, l, werr := walkTree(ctx, drv, place.Path, place.Path, sc.Cfg.ScanConcurrency, place.SourceID, src.Type, onDir)
+		start := place.Path
+		if scope != nil {
+			start = scope.Path
+		}
+		prog.AddEvent("info", fmt.Sprintf("扫描 %s %s", src.Name, start))
+		// Keep the configured root for naming, even when walking a deep subtree.
+		f, l, werr := walkTree(ctx, drv, place.Path, start, sc.Cfg.ScanConcurrency, place.SourceID, src.Type, onDir, scope)
 		for k, v := range l {
 			listings[k] = v
 		}
@@ -216,6 +258,13 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 		prog.AddEvent("warn", "部分源读取失败(不清理这些源): "+strings.Join(srcErrs, "; "))
 	}
 
+	if scope != nil {
+		files, err = sc.keepScopedFiles(lib, files, prog)
+		if err != nil {
+			fail("检查文件归属失败: " + err.Error())
+			return err
+		}
+	}
 	prog.Update(func(st *models.ScanState) {
 		st.Phase = "organize"
 		st.Total = len(files)
@@ -223,7 +272,7 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 		st.Current = fmt.Sprintf("发现 %d 个视频文件,正在整理…", len(files))
 	})
 	prog.AddEvent("file", fmt.Sprintf("发现 %d 个视频文件", len(files)))
-	if err := sc.organize(lib, files, prog, current, walked, partial, listings); err != nil {
+	if err := sc.organize(lib, files, prog, current, walked, partial, listings, scope); err != nil {
 		fail("整理失败: " + err.Error())
 		finish()
 		return err
@@ -235,15 +284,22 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 		st.Current = "刮削与识别…"
 	})
 	prog.AddEvent("meta", "开始刮削与识别")
-	if sc.OnIdentify != nil {
-		sc.OnIdentify(lib, listings, func(done, total int, msg string) {
-			prog.Update(func(st *models.ScanState) {
-				st.Done, st.Total, st.Current = done, total, msg
-			})
-			if msg != "" {
-				prog.AddEvent("meta", msg)
-			}
+	report := func(done, total int, msg string) {
+		prog.Update(func(st *models.ScanState) {
+			st.Done, st.Total, st.Current = done, total, msg
 		})
+		if msg != "" {
+			prog.AddEvent("meta", msg)
+		}
+	}
+	var scannedFiles []models.MediaFile
+	if scope != nil {
+		scannedFiles = sc.scannedFiles(lib, files)
+		if sc.OnIdentifyFiles != nil {
+			sc.OnIdentifyFiles(lib, scannedFiles, listings, report)
+		}
+	} else if sc.OnIdentify != nil {
+		sc.OnIdentify(lib, listings, report)
 	}
 	// Settle the summary from the finished counters, then report it.
 	final, _ := prog.Snapshot(0)
@@ -257,7 +313,11 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 	})
 	prog.AddEvent("meta", fmt.Sprintf("扫描完成:%d 个视频文件", final.Total))
 	finish()
-	if sc.OnScanned != nil {
+	if scope != nil {
+		if sc.OnScannedFiles != nil {
+			sc.OnScannedFiles(lib, scannedFiles)
+		}
+	} else if sc.OnScanned != nil {
 		sc.OnScanned(lib)
 	}
 	return nil
@@ -349,7 +409,7 @@ func (sc *Scanner) showOfFile(sourceID int64, path string) int64 {
 
 const maxDepth = 8
 
-func walkTree(ctx context.Context, drv source.Driver, root, start string, concurrency int, srcID int64, srcType string, onDir func(dir string, dirs, files, errs int64, firstErr string)) ([]fileRec, map[string][]source.Entry, error) {
+func walkTree(ctx context.Context, drv source.Driver, root, start string, concurrency int, srcID int64, srcType string, onDir func(dir string, dirs, files, errs int64, firstErr string), scopes ...*scanScope) ([]fileRec, map[string][]source.Entry, error) {
 	if concurrency <= 0 {
 		concurrency = 4
 	}
@@ -407,6 +467,19 @@ func walkTree(ctx context.Context, drv source.Driver, root, start string, concur
 		listings[dirKey(dir)] = entries
 		mu.Unlock()
 		for _, e := range entries {
+			if len(scopes) > 0 && scopes[0] != nil {
+				p, err := cleanScanPath(e.Path)
+				if err != nil || e.Name == "" || e.Name == "." || e.Name == ".." || strings.ContainsAny(e.Name, "/\\") || !pathWithin(p, scopes[0].Path) || source.VirtualJoin(dir, e.Name) != p {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("存储源返回了扫描目录外或非直接子项的路径: %s", e.Path)
+					}
+					mu.Unlock()
+					errCount.Add(1)
+					continue
+				}
+				e.Path = p
+			}
 			if SkipEntry(e.Name) {
 				continue
 			}
@@ -487,7 +560,7 @@ type movieGroup struct {
 	Files []fileRec
 }
 
-func (sc *Scanner) organize(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked, partial map[int64]bool, listings map[string][]source.Entry) error {
+func (sc *Scanner) organize(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked, partial map[int64]bool, listings map[string][]source.Entry, scopes ...*scanScope) error {
 	// The walk runs for minutes without touching the database, and the first
 	// statement after it is the one that fails. Ping before any real work, so a
 	// connection whose handle went stale during that idle stretch is replaced on
@@ -507,10 +580,10 @@ func (sc *Scanner) organize(lib *models.Library, files []fileRec, prog *models.S
 
 	switch lib.Type {
 	case "series":
-		err := sc.organizeSeries(lib, files, prog, current, walked, partial, listings)
+		err := sc.organizeSeries(lib, files, prog, current, walked, partial, listings, scopes...)
 		return sc.finishOrganize(lib, err)
 	default:
-		err := sc.organizeMovies(lib, files, prog, current, walked, partial, listings)
+		err := sc.organizeMovies(lib, files, prog, current, walked, partial, listings, scopes...)
 		return sc.finishOrganize(lib, err)
 	}
 }
@@ -528,7 +601,7 @@ func (sc *Scanner) finishOrganize(lib *models.Library, err error) error {
 	return err
 }
 
-func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked, partial map[int64]bool, listings map[string][]source.Entry) error {
+func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked, partial map[int64]bool, listings map[string][]source.Entry, scopes ...*scanScope) error {
 	existing, _, err := sc.Store.ItemsByLibrary(lib.ID, "movie", "", "", false, 0, 1000000)
 	if err != nil {
 		log.Printf("organize: load movies failed: %v", err)
@@ -602,7 +675,7 @@ func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *mo
 		})
 		prog.AddEvent("show", fmt.Sprintf("%s%s", g.Title, yearSuffix(g.Year)))
 	}
-	return sc.cleanup(lib, files, current, walked, partial, listings)
+	return sc.cleanup(lib, files, current, walked, partial, listings, scopes...)
 }
 
 // yearSuffix renders " (2019)" for the feed, empty when the year is unknown.
@@ -774,7 +847,7 @@ func planShow(childCount map[string]int, libPath, dir, filePath string, parsedSe
 	}
 }
 
-func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked, partial map[int64]bool, listings map[string][]source.Entry) error {
+func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *models.ScanProgress, current, walked, partial map[int64]bool, listings map[string][]source.Entry, scopes ...*scanScope) error {
 	idx := &seriesIndex{
 		shows:       map[string]int64{},
 		seasons:     map[string]int64{},
@@ -1115,6 +1188,11 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 	// been imported before this rule existed, or under a different naming — so
 	// cleanup can then take away the item it left behind.
 	for _, fr := range skippedFiles {
+		if len(scopes) > 0 && scopes[0] != nil {
+			// Scoped cleanup removes this row using the directory listing and
+			// can then prune just its ancestors, without a global orphan sweep.
+			continue
+		}
 		if _, err := sc.Store.DB.Exec(`DELETE FROM files WHERE source_id=? AND path=?`, fr.SourceID, fr.Path); err != nil {
 			log.Printf("organize: drop non-episode file path=%q failed: %v", fr.Path, err)
 		}
@@ -1123,7 +1201,7 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *mo
 		prog.AddEvent("warn", fmt.Sprintf("跳过 %d 个无集号文件(剧集库只收剧集)", len(skippedFiles)))
 	}
 
-	if err := sc.cleanup(lib, imported, current, walked, partial, listings); err != nil {
+	if err := sc.cleanup(lib, imported, current, walked, partial, listings, scopes...); err != nil {
 		log.Printf("organize: cleanup failed (done=%d): %v", progDone(prog), err)
 		return err
 	}
@@ -1168,7 +1246,7 @@ func progDone(prog *models.ScanProgress) int {
 // almost never: every path the tree had before a restructure stayed in the
 // database, and the same series appeared as both the old flat entries and the
 // new series/season tree.
-func (sc *Scanner) cleanup(lib *models.Library, files []fileRec, current, walked, partial map[int64]bool, listings map[string][]source.Entry) error {
+func (sc *Scanner) cleanup(lib *models.Library, files []fileRec, current, walked, partial map[int64]bool, listings map[string][]source.Entry, scopes ...*scanScope) error {
 	seen := map[string]bool{}
 	// Episode ids the walk found, for a partial source: a stale path that names
 	// the same [epN] is the old location of a file that now lives elsewhere.
@@ -1184,12 +1262,22 @@ func (sc *Scanner) cleanup(lib *models.Library, files []fileRec, current, walked
 		return err
 	}
 	var gone []int64
+	var scope *scanScope
+	if len(scopes) > 0 {
+		scope = scopes[0]
+	}
 	for rows.Next() {
 		var id, srcID int64
 		var p string
 		if err := rows.Scan(&id, &srcID, &p); err != nil {
 			rows.Close()
 			return err
+		}
+		// Unseen paths outside this subtree say nothing about deletion. STRM
+		// rows store only their URL, so their original directory is unknown and
+		// unseen stream URLs must also be retained by a path scan.
+		if scope != nil && (srcID != scope.SourceID || !pathWithin(p, scope.Path)) {
+			continue
 		}
 		if !current[srcID] {
 			gone = append(gone, id)
@@ -1224,10 +1312,21 @@ func (sc *Scanner) cleanup(lib *models.Library, files []fileRec, current, walked
 		}
 	}
 	rows.Close()
+	var removedItems []int64
 	for _, id := range gone {
+		if scope != nil {
+			f, err := sc.Store.FileByID(id)
+			if err != nil {
+				return err
+			}
+			removedItems = append(removedItems, f.ItemID)
+		}
 		if _, err := sc.Store.DB.Exec(`DELETE FROM files WHERE id=?`, id); err != nil {
 			return err
 		}
+	}
+	if scope != nil {
+		return sc.pruneScanItems(lib.ID, removedItems)
 	}
 	stmts := []string{
 		`DELETE FROM items WHERE library_id=? AND type IN ('movie','episode') AND id NOT IN (SELECT DISTINCT item_id FROM files)`,

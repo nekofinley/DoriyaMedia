@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -565,9 +566,45 @@ func (s *Server) handleScanLibrary(w http.ResponseWriter, r *http.Request, user 
 		fail(w, 404, "媒体库不存在")
 		return
 	}
-	go func() {
-		_ = s.Scanner.ScanLibrary(lib)
-	}()
+	// An omitted body (or {}) retains the existing full scan API. A supplied
+	// path must be non-empty; malformed input must never fall back to full scan.
+	req := &struct {
+		Path     json.RawMessage `json:"path"`
+		SourceID int64           `json:"source_id"`
+	}{}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); (err != nil && !errors.Is(err, io.EOF)) || req == nil {
+		fail(w, 400, "扫描参数无效")
+		return
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		fail(w, 400, "扫描参数无效")
+		return
+	}
+	if req.Path != nil {
+		var dir string
+		if err := json.Unmarshal(req.Path, &dir); err != nil {
+			fail(w, 400, "扫描路径必须是字符串")
+			return
+		}
+		err = s.Scanner.ScanLibraryPath(lib, req.SourceID, dir)
+	} else {
+		if req.SourceID != 0 {
+			fail(w, 400, "指定存储源时必须同时提供扫描路径")
+			return
+		}
+		err = s.Scanner.ScanLibrary(lib)
+	}
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, scan.ErrScanQueueFull) {
+			status = http.StatusServiceUnavailable
+		}
+		fail(w, status, err.Error())
+		return
+	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 

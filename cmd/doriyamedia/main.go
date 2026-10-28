@@ -63,6 +63,10 @@ func main() {
 			manager.SeedListings(listings)
 			manager.EnrichLibrary(lib, report)
 		},
+		OnIdentifyFiles: func(lib *models.Library, files []models.MediaFile, listings map[string][]source.Entry, report func(done, total int, msg string)) {
+			manager.SeedListings(listings)
+			manager.EnrichFiles(lib, files, report)
+		},
 	}
 	// Probe is the slowest step of starting playback on a cloud drive. Warm the
 	// cache in the background after each scan so opening a file is already
@@ -77,6 +81,21 @@ func main() {
 			return
 		}
 		engine.PreProbeFiles(files)
+	}
+	scanner.OnScannedFiles = func(lib *models.Library, files []models.MediaFile) {
+		if !cfg.Playback.PreProbeAfterScan {
+			return
+		}
+		var pending []*models.MediaFile
+		for i := range files {
+			if files[i].Probe == "" {
+				pending = append(pending, &files[i])
+				if cfg.Playback.PreProbeMaxFiles > 0 && len(pending) >= cfg.Playback.PreProbeMaxFiles {
+					break
+				}
+			}
+		}
+		engine.PreProbeFiles(pending)
 	}
 
 	srv := api.New(store, cfg, scanner, manager, engine, web.Dist(), version)

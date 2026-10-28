@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -39,10 +40,59 @@ func NewManager(store *db.Store, cfg *config.Config) *Manager {
 	return &Manager{Store: store, Cfg: cfg}
 }
 
+// A scoped pass may inspect sidecars only inside the closest configured root.
+// Keep the restriction in the context so full-library enrichment is unchanged.
+type metadataScopeKey struct{}
+type metadataScope struct {
+	sourceID int64
+	root     string
+}
+
+func metadataPath(p string) string {
+	return path.Clean("/" + strings.TrimPrefix(filepath.ToSlash(p), "/"))
+}
+
+func (s metadataScope) contains(p string) bool {
+	if s.root == "" || isHTTP(p) {
+		return false
+	}
+	p = metadataPath(p)
+	return s.root == "/" || p == s.root || strings.HasPrefix(p, s.root+"/")
+}
+
+type scopedMetadataDriver struct {
+	source.Driver
+	scope metadataScope
+}
+
+func (d scopedMetadataDriver) Open(ctx context.Context, p string) (io.ReadCloser, error) {
+	if !d.scope.contains(p) {
+		return nil, fmt.Errorf("元数据路径超出媒体库根目录: %s", p)
+	}
+	return d.Driver.Open(ctx, p)
+}
+
+func (m *Manager) metadataDriver(ctx context.Context, fallback source.Driver, sourceID int64) source.Driver {
+	if _, scoped := ctx.Value(metadataScopeKey{}).(metadataScope); scoped {
+		// EnrichFiles already resolved this exact file's driver; in particular a
+		// missing nonzero source must never fall back to another source.
+		return fallback
+	}
+	if d := m.driverFor(sourceID); d != nil {
+		return d
+	}
+	return fallback
+}
+
 // cachedList returns the directory listing, deduplicating repeated lookups
 // within one enrichment run (hundreds of episodes often share a few dirs —
 // each remote List costs a public round-trip).
 func (m *Manager) cachedList(ctx context.Context, drv source.Driver, sourceID int64, dir string) ([]source.Entry, error) {
+	if scope, scoped := ctx.Value(metadataScopeKey{}).(metadataScope); scoped {
+		if drv == nil || sourceID != scope.sourceID || !scope.contains(dir) {
+			return nil, fmt.Errorf("元数据目录超出媒体库根目录或存储源不可用: %s", dir)
+		}
+	}
 	// Keyed by source as well as directory: two sources in one library can hold
 	// the same directory path, and a listing from the wrong one would have nfo
 	// and artwork looked for in a place the file is not.
@@ -256,6 +306,144 @@ func (m *Manager) EnrichLibrary(lib *models.Library, report func(done, total int
 	}
 }
 
+// EnrichFiles identifies only the movies/episodes represented by files and the
+// shows needed by those episodes. Parent items are resolved by ID, never by a
+// library-wide listing, and sidecars are read beside the supplied files only.
+func (m *Manager) EnrichFiles(lib *models.Library, files []models.MediaFile, report func(done, total int, msg string)) {
+	m.drvMu.Lock()
+	m.drivers = nil
+	m.drvMu.Unlock()
+	defer func() { m.listMu.Lock(); m.listCache = nil; m.listMu.Unlock() }()
+	if lib == nil || len(files) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+
+	type target struct {
+		item   *models.Item
+		file   models.MediaFile
+		show   *models.Item
+		season *models.Item
+	}
+	var targets []target
+	var shows []target
+	seen := map[int64]bool{}
+	showByID := map[int64]*models.Item{}
+	seasonByID := map[int64]*models.Item{}
+	for _, file := range files {
+		if ctx.Err() != nil {
+			return
+		}
+		if file.ItemID == 0 || seen[file.ItemID] {
+			continue
+		}
+		item, err := m.Store.ItemByID(file.ItemID)
+		if err != nil || item.LibraryID != lib.ID {
+			continue
+		}
+		t := target{item: item, file: file}
+		switch item.Type {
+		case "movie":
+			// Keep the full-library rule: unnumbered files in a series library
+			// are playable, but are not scraped as unrelated movies.
+			if lib.Type == "series" {
+				continue
+			}
+		case "episode":
+			if item.ParentID == nil {
+				continue
+			}
+			season := seasonByID[*item.ParentID]
+			if season == nil {
+				season, err = m.Store.ItemByID(*item.ParentID)
+				if err != nil || season.LibraryID != lib.ID || season.Type != "season" || season.ParentID == nil {
+					continue
+				}
+				seasonByID[season.ID] = season
+			}
+			show := showByID[*season.ParentID]
+			if show == nil {
+				show, err = m.Store.ItemByID(*season.ParentID)
+				if err != nil || show.LibraryID != lib.ID || show.Type != "show" {
+					continue
+				}
+				showByID[show.ID] = show
+				shows = append(shows, target{item: show, file: file})
+			}
+			t.show, t.season = show, season
+		default:
+			continue
+		}
+		seen[item.ID] = true
+		targets = append(targets, t)
+	}
+	if len(targets) == 0 {
+		return
+	}
+
+	roots, _ := m.Store.LibrarySources(lib.ID)
+	if len(roots) == 0 && lib.Path != "" {
+		roots = []models.LibrarySource{{SourceID: lib.SourceID, Path: lib.Path}}
+	}
+	scoped := func(file models.MediaFile) (context.Context, source.Driver) {
+		sourceID := file.SourceID
+		if sourceID == 0 {
+			sourceID = lib.SourceID
+		}
+		scope := metadataScope{sourceID: file.SourceID}
+		if !isHTTP(file.Path) {
+			for _, root := range roots {
+				if root.SourceID != sourceID || root.Path == "" || isHTTP(root.Path) {
+					continue
+				}
+				candidate := metadataScope{root: metadataPath(root.Path)}
+				if candidate.contains(file.Path) && len(candidate.root) > len(scope.root) {
+					scope.root = candidate.root
+				}
+			}
+		}
+		var drv source.Driver
+		if scope.root != "" {
+			if d := m.driverFor(sourceID); d != nil {
+				drv = scopedMetadataDriver{Driver: d, scope: scope}
+			}
+		}
+		return context.WithValue(ctx, metadataScopeKey{}, scope), drv
+	}
+	total, done := len(shows)+len(targets), 0
+	say := func(msg string) {
+		if report != nil {
+			report(done, total, msg)
+		}
+	}
+	for _, t := range shows {
+		if ctx.Err() != nil {
+			return
+		}
+		say("识别剧集 " + t.item.Name)
+		itemCtx, drv := scoped(t.file)
+		m.enrichShow(itemCtx, drv, lib, t.item, t.file)
+		done++
+		say("识别剧集 " + t.item.Name)
+	}
+	for _, t := range targets {
+		if ctx.Err() != nil {
+			return
+		}
+		say("识别 " + t.item.Name)
+		itemCtx, drv := scoped(t.file)
+		if t.item.Type == "movie" {
+			m.enrichMovie(itemCtx, drv, lib, t.item, t.file)
+		} else {
+			m.enrichEpisode(itemCtx, drv, lib, t.item, t.show, t.season, t.file)
+		}
+		done++
+		say("识别 " + t.item.Name)
+	}
+	say("识别完成")
+}
+
 func (m *Manager) enrichMovies(ctx context.Context, drv source.Driver, lib *models.Library, say func(done, total int, msg string)) {
 	items, _, err := m.Store.ItemsByLibrary(lib.ID, "movie", "", "", false, 0, 500000)
 	if err != nil {
@@ -322,13 +510,16 @@ func (m *Manager) enrichSeries(ctx context.Context, drv source.Driver, lib *mode
 	say(total, total, "识别完成")
 }
 
-func (m *Manager) enrichMovie(ctx context.Context, drv source.Driver, lib *models.Library, it *models.Item) {
+func (m *Manager) enrichMovie(ctx context.Context, drv source.Driver, lib *models.Library, it *models.Item, files ...models.MediaFile) {
 	if it.TMDBID != 0 && it.PosterPath != "" && it.Overview != "" {
 		return
 	}
-	files, err := m.Store.FilesByItem(it.ID)
-	if err != nil || len(files) == 0 {
-		return
+	if len(files) == 0 {
+		var err error
+		files, err = m.Store.FilesByItem(it.ID)
+		if err != nil || len(files) == 0 {
+			return
+		}
 	}
 	for _, p := range providers(lib) {
 		switch p {
@@ -348,18 +539,23 @@ func (m *Manager) enrichMovie(ctx context.Context, drv source.Driver, lib *model
 	}
 }
 
-func (m *Manager) enrichShow(ctx context.Context, drv source.Driver, lib *models.Library, show *models.Item) {
+func (m *Manager) enrichShow(ctx context.Context, drv source.Driver, lib *models.Library, show *models.Item, files ...models.MediaFile) {
 	if show.TMDBID != 0 && show.PosterPath != "" && show.Overview != "" {
 		return
 	}
-	filePath, epSource, ok := m.firstEpisodeFile(show.ID)
-	if !ok {
-		return
+	var filePath string
+	var epSource int64
+	if len(files) > 0 {
+		filePath, epSource = files[0].Path, files[0].SourceID
+	} else {
+		var ok bool
+		filePath, epSource, ok = m.firstEpisodeFile(show.ID)
+		if !ok {
+			return
+		}
 	}
 	// The show's own files name the source to read its nfo and artwork from.
-	if d := m.driverFor(epSource); d != nil {
-		drv = d
-	}
+	drv = m.metadataDriver(ctx, drv, epSource)
 	for _, p := range providers(lib) {
 		switch p {
 		case "nfo":
@@ -378,7 +574,7 @@ func (m *Manager) enrichShow(ctx context.Context, drv source.Driver, lib *models
 	}
 }
 
-func (m *Manager) enrichEpisode(ctx context.Context, drv source.Driver, lib *models.Library, ep *models.Item, show *models.Item, season *models.Item) {
+func (m *Manager) enrichEpisode(ctx context.Context, drv source.Driver, lib *models.Library, ep *models.Item, show *models.Item, season *models.Item, files ...models.MediaFile) {
 	// A name the scan took from the source itself is not a guess to be improved
 	// on: bilibili states every episode's title in its listing, and that title is
 	// right for *this* season. Asking a provider by episode number is what gave a
@@ -399,9 +595,12 @@ func (m *Manager) enrichEpisode(ctx context.Context, drv source.Driver, lib *mod
 		}
 	}()
 
-	files, err := m.Store.FilesByItem(ep.ID)
-	if err != nil || len(files) == 0 {
-		return
+	if len(files) == 0 {
+		var err error
+		files, err = m.Store.FilesByItem(ep.ID)
+		if err != nil || len(files) == 0 {
+			return
+		}
 	}
 	// provider order decides who wins: nfo (precise, local) → Bangumi (Chinese
 	// titles for anime) → TMDB season data.
@@ -580,9 +779,7 @@ func (m *Manager) tryMovieNFO(ctx context.Context, drv source.Driver, it *models
 		return false
 	}
 	// The file's own source decides where to look: a library may scan several.
-	if d := m.driverFor(f.SourceID); d != nil {
-		drv = d
-	}
+	drv = m.metadataDriver(ctx, drv, f.SourceID)
 	dir, base := dirBase(f.Path)
 	stem := fileStem(base)
 	list, err := m.cachedList(ctx, drv, f.SourceID, dir)
@@ -659,9 +856,7 @@ func (m *Manager) tryEpisodeNFO(ctx context.Context, drv source.Driver, ep *mode
 	if f == nil || isHTTP(f.Path) {
 		return false
 	}
-	if d := m.driverFor(f.SourceID); d != nil {
-		drv = d
-	}
+	drv = m.metadataDriver(ctx, drv, f.SourceID)
 	dir, file := dirBase(f.Path)
 	stem := fileStem(file)
 	list, err := m.cachedList(ctx, drv, f.SourceID, dir)
