@@ -263,8 +263,8 @@ object PlaybackInputValidator {
     if (value.length > rule.maxValueLength) {
       fail("Header ${rule.canonicalName} is too long.")
     }
-    if (value.any { it.isISOControl() }) {
-      fail("Header ${rule.canonicalName} contains control characters.")
+    if (value.any { it.isISOControl() || it.code > 0x7E }) {
+      fail("Header ${rule.canonicalName} contains control or non-ASCII characters.")
     }
 
     when (rule.canonicalName) {

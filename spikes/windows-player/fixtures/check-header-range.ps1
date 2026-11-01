@@ -96,18 +96,24 @@ try {
     throw "Expected unsatisfied Range status 416, got $unsatisfiedStatus."
   }
 
-  & $MpvPath `
-    --no-config `
-    --vo=null `
-    --ao=null `
-    --really-quiet `
-    --frames=1 `
-    --force-window=no `
-    "--referrer=$($fixture.referer)" `
-    "--user-agent=$($fixture.user_agent)" `
-    $fixture.url
-  if ($LASTEXITCODE -ne 0) {
-    throw "mpv failed to decode the Header-protected loopback fixture."
+  $mpvProcess = Start-Process `
+    -FilePath $MpvPath `
+    -ArgumentList @(
+      "--no-config",
+      "--vo=null",
+      "--ao=null",
+      "--really-quiet",
+      "--frames=1",
+      "--force-window=no",
+      "--referrer=$($fixture.referer)",
+      "--user-agent=$($fixture.user_agent)",
+      [string]$fixture.url
+    ) `
+    -WindowStyle Hidden `
+    -Wait `
+    -PassThru
+  if ($mpvProcess.ExitCode -ne 0) {
+    throw "mpv failed to decode the Header-protected loopback fixture. Exit=$($mpvProcess.ExitCode)"
   }
 
   Write-Output "HEADER_RANGE_FIXTURE|PASS|size=$($fixture.size)|head=200|range=206|unsatisfied=416|mpv=PASS"

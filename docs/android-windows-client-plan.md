@@ -1,13 +1,13 @@
 # Android / Windows 客户端开发规划
 
-> 状态：S0 工具/脚本已完成但真实矩阵待执行；S1-S3 已完成；S4 服务端加固主体、专项自动测试、协议契约和 race 门禁已落地，但真实矩阵尚未全部关闭；S5 direct-dash 服务端契约、默认关闭实现及进程级 HTTP E2E 已落地，但真实 Bilibili 双流、客户端本地合流、Windows/Android 真机与网络矩阵尚未验收，因此 S5 未关闭；W0 两个候选和 A0 Media3 机制原型已落地并通过本机构建、启动/探针冒烟，但真实媒体与真机矩阵未验收，因此 W0/A0 未关闭；local-relay 尚未实现
+> 状态：S0 工具/脚本已完成但真实矩阵待执行；S1-S3 已完成；S4 服务端加固主体、专项自动测试、协议契约和 race 门禁已落地，但真实矩阵尚未全部关闭；S5 direct-dash 服务端契约、默认关闭实现及进程级 HTTP E2E 已落地，但真实 Bilibili 双流、客户端本地合流、Windows/Android 真机与网络矩阵尚未验收，因此 S5 未关闭；W0 两个候选和 A0 Media3 机制原型已落地并通过本机构建、启动/探针冒烟，但真实媒体与真机矩阵未验收，因此 W0/A0 未关闭；产品 local-relay 尚未实现，仅有隔离的 WinUI loopback relay 机制探针和 Tauri W0 单-origin CONNECT egress guard
 > 基线日期：2026-10-27
-> 最近更新：2026-10-28
+> 最近更新：2026-11-01
 > 目标：把后续工作拆成可由不同 Agent 独立领取、验证和回滚的任务
 
 ## 0. 当前实施进度
 
-截至 2026-10-28，当前分支已落地以下服务端基础和客户端机制原型：
+截至 2026-11-01，当前分支已落地以下服务端基础和客户端机制原型：
 
 - S0：样本矩阵脚本、dry-run 与报告目录已建立；真机和真实来源矩阵仍需现场执行。
 - S1：`/api/v1/meta`、稳定错误模型、OpenAPI/JSON Schema/golden fixtures 与校验脚本已完成。
@@ -15,9 +15,9 @@
 - S3：播放票据、`direct-http`、`server-proxy`、`server-hls`、TTL、refresh、字幕 capability 和私网 SSRF 边界已实现。
 - S4：Range/HEAD/`bytes=0-0`/416/If-Range、严格 206 校验、跨源 Header 剥除、源站错误脱敏、阶段超时和固定字段播放遥测已实现并通过本机自动测试；本地强 validator 改为文件系统版本。播放票 TTL、文件代际 CAS、字幕 discovery watchdog、metadata/embedded subtitle 原子提交、audio-only 识别、探测工具快照、source cache invalidation，以及 ticket probe registry/执行并发上限均已接入。probe 失败按真实父 context 区分，单流与 MultiPart 解析锁等待可取消，非协作 MultiPart driver 不再阻塞 ticket probe slot；播放/字幕 cleanup 使用有界 Context。OpenAPI/Schema 已同步 media/HLS 响应矩阵、Range/OWS、206、ETag/If-Range 和公开 failure code，protocolcheck 自测包含 mutation 覆盖。FFmpeg 出站代理已覆盖 DNS/IP 固定、重定向/嵌套资源、CONNECT 凭据隔离和本地 HLS/DASH fail-closed。`LocalDriver` 的 `Open/List/Serve` 已改为句柄操作，v1 本地流也复用安全打开的句柄。
 - S4 尚未关闭：仍须用真实 OpenList/Bilibili 来源验证 30 分钟 direct、真实 HLS 解码、20 次随机 seek、网络切换和 Windows/Android 真机矩阵。`go test -race ./...` 已于 2026-10-28 在本机通过。FFmpeg/FFprobe 的普通路径重开、hardlink、根目录父级 ACL 和文件原地改写，以及 `size + mtime` 代际碰撞、subtitle row ID 快照和协作式 driver 取消仍有残余风险，不能宣称 S4 全量验收通过。
-- S5：`direct-dash` 服务端契约、默认关闭实现和进程级 HTTP E2E 已落地；只有服务端 flag、设备策略、多流来源资格和客户端 `supports_dash_merge=true` 同时满足时才会签发。E2E 已通过真实 admin API 建源/扫描、能力省略/false/true、全局 flag、设备级禁用与恢复、跨设备隔离、双流签发、签发阶段非法 Header 原子回退和 HLS 关闭 fail-closed 的确定性 fixture 验证。真实 Bilibili 双流、客户端本地合流、Windows/Android 真机与网络矩阵尚未验收，因此 S5 未关闭。`local-relay` 尚未实现，仅保留发现 flag。
-- W0：`spikes/windows-player/` 已形成 Tauri 2 + mpv 与 WinUI 3 + LibVLCSharp 两个隔离原型。Tauri 通过 pnpm/Rust 检查、32 个 Rust tests（另 1 个真实 mpv 测试需显式启用）、真实 mpv 空载 JSON IPC 1/1、debug exe 构建和交互会话 GUI 启动/退出 smoke；已实现 mpv 最小环境隔离、128 位随机命名管道、管道服务端 PID 校验、空 Tauri capability、固定 5 秒 IPC 响应期限、`start-file`/`file-loaded`/`end-file` 代次状态机，以及子进程退出、控制超时和失败后的有界清理。完整 DACL/SID/session 对端信任和 Job Object 崩溃联动清理仍未完成。WinUI 通过 0 warning/error 构建、91 个 xUnit tests、LibVLC `3.0.19` probe、Windows App SDK self-contained app smoke，以及带独立 `Referer`/`User-Agent` 校验的合成 loopback 双源 smoke；已支持 `Media.AddSlave` 和 LibVLC 可安全表达的双流共享 Header。两候选都未加载真实媒体，WinUI 尚不支持逐流 Header，因此 W0 未关闭。
-- A0：`spikes/android-player/` 已形成 Kotlin + Compose + Media3 机制原型，支持单 URL、白名单 Header、逐流 Header/容器 MIME、双 URL `MergingMediaSource`、同源重定向 Header 保留与跨源 fail-closed、播放意图、控制/seek、lifecycle 暂停与 PlayerView 解绑、脱敏日志。Lint 0 error、10 warnings；24 个 JVM tests 通过；debug 与 test APK 构建通过；API 37 x86_64 ATD 上 `connectedDebugAndroidTest` 4/4 通过，覆盖 Ready、双轨、seek discontinuity、seek 后位置推进、播放/暂停、video surface、逐流输入和生产 MediaSource factory 独立 DataSource，APK 冷启动成功。该 ATD 的 goldfish H.264 解码器存在 Codec2 缺陷，合成 merge 测试使用 `PREFER_SOFTWARE` 仅用于隔离机制；真实 CDN 重定向链、逐流 Range、真实 API 28/31/34 真机、默认硬件解码、真实 Bilibili 双流和长时矩阵仍未执行，因此 A0 未关闭。
+- S5：`direct-dash` 服务端契约、默认关闭实现和进程级 HTTP E2E 已落地；只有服务端 flag、设备策略、多流来源资格和客户端 `supports_dash_merge=true` 同时满足时才会签发。E2E 已通过真实 admin API 建源/扫描、能力省略/false/true、全局 flag、设备级禁用与恢复、跨设备隔离、双流签发、签发阶段非法 Header 原子回退和 HLS 关闭 fail-closed 的确定性 fixture 验证。真实 Bilibili 双流、客户端本地合流、Windows/Android 真机与网络矩阵尚未验收，因此 S5 未关闭。产品 `local-relay` 尚未实现，仅保留发现 flag；另有隔离的 WinUI loopback relay 机制探针（Release build 0 warning/0 error、94/94 tests）和 Tauri W0 CONNECT/PID egress guard，二者都不是产品 transport，也未接入 S3 票据链。
+- W0：`spikes/windows-player/` 已形成 Tauri 2 + mpv 与 WinUI 3 + LibVLCSharp 两个隔离原型。Tauri 通过 pnpm/Rust 检查、75 个 Rust tests 通过（另 3 个真实 mpv/Python/公网 opt-in 测试需显式启用）、真实 mpv 空载 JSON IPC 连续 3/3、Header 保护 loopback 合成 MP4 + 20 次 seek 连续 3/3、公网 HTTPS CONNECT 的 mpv owner-PID + 创建时间探针连续 3/3、debug exe 构建和此前交互会话 GUI 启动/退出 smoke；已实现 mpv 最小环境隔离、绝对路径与必填 SHA-256 内容钉扎、可选同一句柄 Authenticode leaf signer SHA-256 pin、`--tls-verify=yes`、`--ytdl=no`、`--network-timeout=15`、禁用脚本/本地自动加载、stream/demuxer Lavf 协议白名单与 `max_redirects=3`、私网/本机 HTTPS IP literal 拒绝、128 位随机命名管道、仅当前用户单一 ACE DACL、拒绝远程客户端、单实例预连接、`STARTUPINFOEX` 限制继承句柄为 client stdin/NUL 并以 `fd://0` 建 IPC、原始进程句柄 SID/session 校验、overlapped I/O 取消回收、统一 15 秒启动期限（覆盖首连/进程创建/首次 IPC acknowledgement）、自动启动 `open`/`control` 的 15+5 秒绝对期限、创建时经 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 加入 `KILL_ON_JOB_CLOSE` Job Object、空 Tauri capability、运行期单请求与多请求高层操作共享 5 秒期限、`start-file`/`file-loaded`/`end-file` 代次状态机、30 秒 `file-loaded` watchdog，以及子进程退出、控制超时和失败后的有界清理。严格模式另用无凭据 `127.0.0.1` CONNECT egress guard，只允许当前播放的精确 HTTPS CONNECT authority，在宿主内以 single-flight 方式按播放会话解析 DNS（CONNECT handler 最多等待 5 秒且不持有 relay 全局状态锁；底层 resolver worker 不可取消）/过滤公网地址/pin，只连接固定数字地址；监听器使用 `SO_EXCLUSIVEADDRUSE`，并用 `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` 要求客户端侧 ESTABLISHED 行的 owner PID 和进程创建时间均等于已校验 mpv sidecar。新播放和 disarm 会主动关闭旧隧道；真实 mpv 公网 HTTPS 探针已连续 3/3 通过。隧道建立后不检查 TLS SNI、HTTP Host、path/query、method、Header 或响应内容；DNS 不在会话内重解析，严格 DNS/PID/relay 失败也不直连回退。PID + 创建时间匹配是所有权关联而非密码学认证；普通 PID 复用已被缩小，handle 复制、内核失陷和同用户调试/注入在 W0 威胁模型之外。重要残留风险：真实 HTTPS 要求 Lavf 白名单保留 `tcp`，而 `tcp://` 不经过 HTTP proxy，恶意嵌套 playlist 仍可能绕过 CONNECT guard 直接建连，因此 W0 不是进程级 egress fail-closed；正式安全门禁前需要 WFP、AppContainer、进程级防火墙或等价网络层。debug-only 的 loopback HTTP fixture 开关在 release 构建中被忽略。WinUI 通过 0 warning/error 构建、91 个 xUnit tests、LibVLC `3.0.19` probe、Windows App SDK self-contained app smoke，以及带独立 `Referer`/`User-Agent` 校验的合成 loopback 双源 smoke；已支持 `Media.AddSlave` 和 LibVLC 可安全表达的双流共享 Header。另有隔离的 loopback relay 机制探针（94/94 tests），但尚未接入 WinUI/LibVLC，也不代表产品 local-relay。两候选都未加载真实媒体，WinUI 尚不支持逐流 Header，因此 W0 未关闭。
+- A0：`spikes/android-player/` 已形成 Kotlin + Compose + Media3 机制原型，支持单 URL、白名单 Header、逐流 Header/MediaItem 容器 MIME 提示、双 URL `MergingMediaSource`、应用层同源重定向 Header 保留与跨源 socket 前 fail-closed、Cookie/系统代理隔离、HTTPS-only 嵌套 DataSource、公网 DNS/IP connect-time 过滤、播放意图、控制/seek、lifecycle 暂停与 PlayerView 解绑、脱敏日志。Header 值在输入层和 HTTP 工厂层均只允许 ASCII 可打印字符。Lint 0 error、11 warnings；33 个 JVM tests 通过；debug 与 test APK 构建通过；API 37 x86_64 ATD 上最终 `connectedDebugAndroidTest` 15/15 通过，覆盖真实 TLS GET/HEAD/206/416、`Content-Range`、逐流 Header、同源/跨源重定向、Cookie 不回放、非 HTTPS/userinfo 嵌套 URI 拒绝、Single/Merge MediaItem MIME 映射和双路 HTTPS 合成 MP4 Media3 merge。该 ATD 的 goldfish H.264 解码器存在 Codec2 缺陷，合成 merge 测试使用 `PREFER_SOFTWARE` 仅用于隔离机制；标准 NAT64 前缀 fail-closed，但运营商自定义 RFC 6052 前缀的内嵌私网风险仍依赖网关。真实 CDN/Range/URL 过期、真实 API 28/31/34 真机、默认硬件解码、真实 Bilibili 双流和长时矩阵仍未执行，因此 A0 未关闭。
 
 当前验证基线：
 
@@ -171,19 +171,19 @@ DoriyaMedia/
 
 ### 4.1 四种 v1 传输与未来 local-relay
 
-概念上有五种策略，但当前 contract version 1 只定义四种传输；`local-relay` 尚未实现，也不是当前可签发的 transport。
+概念上有五种策略，但当前 contract version 1 只定义四种传输；产品 `local-relay` 尚未实现，也不是当前可签发的 transport。隔离的 WinUI relay 探针仅验证 loopback HTTP 机制，Tauri W0 egress guard 仅验证单-origin CONNECT 出站隔离；两者都不计入 contract 或产品能力。
 
 | `transport` | 当前状态 | 字节路径 | 使用场景 | 是否允许 Header | 必须保留的兜底 |
 | --- | --- | --- | --- | --- | --- |
 | `direct-http` | v1 已实现 | 客户端 → 源站 | 单 URL、客户端可解码、Header 可安全下发 | 仅白名单 Header | `server-proxy`、启用的 `server-hls` |
 | `direct-dash` | v1 additive 已实现，默认关闭 | 客户端分别 → 视频/音频源站，本地合流 | Bilibili 等双流源 | 仅白名单 Header | 启用的 `server-hls` |
-| `local-relay` | 未实现，仅保留发现 flag | 客户端播放器 → `127.0.0.1` 中继 → 源站 | 播放内核无法注入 Header，或需要自动刷新 URL | 中继内部注入 | `server-proxy`、启用的 `server-hls` |
+| `local-relay` | 产品路径未实现，仅保留发现 flag；另有 WinUI token relay 和 Tauri W0 CONNECT/PID egress guard 两个隔离探针 | 客户端播放器 → `127.0.0.1` 中继 → 源站 | 播放内核无法注入 Header，或需要自动刷新 URL | 中继内部注入 | `server-proxy`、启用的 `server-hls` |
 | `server-proxy` | v1 已实现 | 客户端 → 服务器 → 源站 | 客户端可解码但源站不允许安全直连 | 不向客户端下发源凭据 | 启用的 `server-hls` |
 | `server-hls` | v1 已实现 | 客户端 → 服务器 HLS → ffmpeg 拉源 | 容器/音频/双流/图形字幕不兼容 | 不向客户端下发源凭据 | `unsupported` |
 
 `direct-dash` 只有在 `direct_dash_enabled=true`、设备级策略允许、来源是多流且客户端显式声明 `supports_dash_merge=true` 时才可能签发；省略该能力等价于 false。真实 Bilibili 双流与客户端本地合流尚未验收，不能把该实现状态写成 S5 已关闭。
 
-`local-relay` 尚未开始实现。未来落地时，它不是服务器中转，只监听 loopback，使用随机端口和一次性票据，绝不能绑定 `0.0.0.0`，也不能成为开放代理或 SSRF 跳板。
+产品 `local-relay` 尚未开始实现；当前 WinUI 探针只覆盖 `127.0.0.1` 随机端口、一次性 token、精确 origin allowlist、Header/Range/超时和私网/转换 IPv6 拒绝，尚未接入 WinUI/LibVLC。Tauri W0 egress guard 使用 PID 绑定而不是 token，只支持当前单播放会话的精确 HTTPS CONNECT authority/DNS pin，relay 自身不注入 Header，也不支持 URL 刷新或跨 origin 子资源；隧道后不检查 TLS SNI、HTTP Host、path/query、method、Header 或响应内容。它同样不代表产品 local-relay。未来落地时，它不是服务器中转，绝不能绑定 `0.0.0.0`，也不能成为开放代理或 SSRF 跳板。
 
 ### 4.2 “像 302”不是继续返回 HTTP 302
 
@@ -213,7 +213,7 @@ direct-dash
   -> unsupported（显示可操作原因）
 ```
 
-`direct-dash` 不创建 media session，当前不能回退到 `server-proxy`。`local-relay` 是尚未实现的引擎适配层，不是额外内容来源；未来落地后其失败路径才进入 `server-proxy`。
+`direct-dash` 不创建 media session，当前不能回退到 `server-proxy`。产品 `local-relay` 是尚未实现的引擎适配层，不是额外内容来源；未来落地后其失败路径才进入 `server-proxy`。
 
 客户端必须避免回退循环：
 
@@ -789,7 +789,7 @@ git diff --check
 - `direct-dash` 服务端契约、默认关闭实现、协议样例、自动测试和进程级 HTTP E2E 已落地。
 - E2E 使用确定性多流 fixture 验证签发、能力/flag/设备策略矩阵、跨设备隔离与恢复、Header 白名单、签发阶段原子回退与 HLS 关闭 fail-closed；它不代表真实 Bilibili 双流或客户端合流通过。
 - 真实 Bilibili 双流、客户端本地合流、Windows/Android 真机与网络矩阵均未执行，S5 未关闭。
-- `local-relay` 尚未开始实现，仅保留 `local_relay_enabled` 发现 flag。
+- 产品 `local-relay` 尚未开始实现，仅保留 `local_relay_enabled` 发现 flag；WinUI 目录中的隔离机制探针未接入播放器，Tauri W0 egress guard 也不是产品 transport。
 
 **目标**
 
@@ -803,7 +803,7 @@ git diff --check
 - 不在服务器端做客户端本地合流。
 - 不承诺 Bilibili 在所有网络和地区都能直连。
 - 不允许中继接受任意目标 URL 或绑定公网地址。
-- 不在当前收尾中实现 `local-relay`；它未开始且不属于当前可签发 transport。
+- 不在当前收尾中实现产品 `local-relay`；WinUI token relay 和 Tauri W0 CONNECT/PID egress guard 都不改变它尚未接入、未验收且不属于当前可签发 transport 的状态。
 
 **依赖**
 
@@ -842,11 +842,11 @@ git diff --check
 **回滚**
 
 - 默认关闭 `direct_dash_enabled`；客户端只能使用其他已启用候选。只有 `server_hls_v1_enabled=true` 时才可使用 server-HLS，否则显示明确的 `unsupported`/重试原因。
-- `local_relay_enabled` 继续保持 false；因为 local-relay 尚未实现，关闭它不会改变当前播放路径。
+- `local_relay_enabled` 继续保持 false；因为产品 local-relay 尚未实现，关闭它不会改变当前播放路径。
 
 **日志禁区**
 
-- 禁止 Bilibili Cookie、账号信息、完整 CDN URL、签名参数、Referer/UA 以外的 Header、ticket secret 和中继 token。
+- 禁止 Bilibili Cookie、账号信息、完整 CDN URL、签名参数、Referer/UA 以外的 Header、ticket secret，以及 WinUI/未来产品 relay 的 capability/token；Tauri W0 egress guard 本身无 token，其 `127.0.0.1` proxy URL 也仍不得写入日志。
 
 ### W0：Windows 播放内核 Spike
 
@@ -864,7 +864,7 @@ git diff --check
 
 **依赖**
 
-- S0；`ticket-direct-dash.json` 双流协议样本已存在。W0 的 Tauri 与 WinUI 机制原型已创建并通过本机构建/冒烟，但真实媒体、逐流 Header、双流同步和稳定性验证尚未开始。
+- S0；`ticket-direct-dash.json` 双流协议样本已存在。W0 的 Tauri 与 WinUI 机制原型已创建并通过本机构建/冒烟；真实媒体、WinUI 逐流 Header、双流同步和稳定性验证尚未完成。
 
 **目标目录**
 
@@ -873,7 +873,7 @@ git diff --check
 
 **完成与验证**
 
-- 当前状态：Tauri 已通过构建、32 个 Rust tests（另 1 个真实 mpv 测试需显式启用）、真实 mpv 空载 IPC、debug exe 构建和交互会话 GUI 启动/退出 smoke，并已实现最小环境继承、128 位随机管道名、服务端 PID 校验、空 capability、固定 5 秒 IPC 响应期限、`start-file`/`file-loaded`/`end-file` 代次状态机，以及子进程退出、控制超时和失败后的有界清理；完整 DACL/SID/session 对端信任和 Job Object 崩溃联动清理仍未完成。WinUI 已通过 0 warning/error 构建、91 个 xUnit tests、LibVLC `3.0.19` probe、app smoke 和合成 loopback 双源 smoke，支持 `Media.AddSlave` 与 LibVLC 可安全表达的双流共享 Header。两者均未加载真实媒体，WinUI 尚不支持逐流 Header，因此 W0 未关闭。
+- 当前状态：Tauri 已通过构建、75 个 Rust tests 通过（另 3 个真实 mpv/Python/公网 opt-in 测试需显式启用）、真实 mpv 空载 IPC 连续 3/3、Header 保护 loopback 合成 MP4 + 20 次 seek 连续 3/3、公网 HTTPS CONNECT 的 mpv owner-PID + 创建时间探针连续 3/3、debug exe 构建和此前交互会话 GUI 启动/退出 smoke，并已实现最小环境继承、绝对路径与必填 SHA-256 内容钉扎、可选同一句柄 Authenticode leaf signer SHA-256 pin、`--tls-verify=yes`、`--ytdl=no`、`--network-timeout=15`、禁用脚本/本地自动加载、stream/demuxer Lavf 协议白名单与 `max_redirects=3`、私网/本机 HTTPS IP literal 拒绝、128 位随机管道名、仅当前用户单一 ACE DACL、拒绝远程客户端、单实例预连接、`STARTUPINFOEX` 仅继承 client stdin/NUL 并以 `fd://0` 建 IPC、原始进程句柄 SID/session 校验、overlapped I/O 取消回收、统一 15 秒启动期限、自动启动 `open`/`control` 的 15+5 秒绝对期限、创建时 Job Object `KILL_ON_JOB_CLOSE`、空 capability、运行期单请求与多请求高层操作共享 5 秒期限、`start-file`/`file-loaded`/`end-file` 代次状态机、30 秒 `file-loaded` watchdog，以及子进程退出、控制超时和失败后的有界清理。严格模式通过无凭据 loopback CONNECT egress guard 完成 single-flight DNS 解析（CONNECT handler 最多等待 5 秒、锁外；底层 resolver worker 不可取消）/公网地址过滤/pin 和精确 origin 校验，用 `SO_EXCLUSIVEADDRUSE` 防端口抢占，并以 Windows TCP owner PID + 进程创建时间绑定已校验 mpv；真实公网 HTTPS 探针连续 3/3。由于 Lavf 白名单必须保留 `tcp`，嵌套 `tcp://` 仍可绕过 proxy/CONNECT guard，当前不是进程级 egress fail-closed。Lavf append 白名单已与真实 mpv `fd://0` IPC 联合冒烟，Header 保护合成媒体的完整控制器加载和 20 次 seek 已通过；但仍需实际跨 origin HLS/DASH 重定向/嵌套资源矩阵和真实 S1-S5 样本。真实签名 mpv 发行物、生产强制发布者门禁、签名版本清单和真实媒体的 Host 崩溃联动验证仍未完成。WinUI 已通过 0 warning/error 构建、91 个 xUnit tests、LibVLC `3.0.19` probe、app smoke 和合成 loopback 双源 smoke，支持 `Media.AddSlave` 与 LibVLC 可安全表达的双流共享 Header；隔离 loopback relay 探针尚未接入 Windows 播放路径。两者均未加载真实媒体，WinUI 尚不支持逐流 Header，因此 W0 未关闭。
 - 两个候选方案至少各完成 S1、S2、S3、S4、S5 的可行性测试。
 - 通过标准：30 分钟无花屏；20 次 seek 正常；音画差不超过 100 ms；全屏和多显示器正常。
 - 许可证结论明确到 mpv、FFmpeg、使用的解码器和 HEVC/AAC 分发义务。
@@ -1055,7 +1055,7 @@ pnpm tauri build --debug
 
 **完成与验证**
 
-- 中继只监听 `127.0.0.1`，随机端口，一次性 token；不转发到任意目标。
+- 中继只监听 `127.0.0.1`，随机端口，一次性 token；不转发到任意目标。W0 的 PID 绑定 CONNECT egress guard 不能直接复用为产品 local-relay，正式采用必须另立 ADR/安全评审。
 - Header 注入不把账号 Cookie 写入 mpv 参数或日志。
 - 双流 30 分钟、20 次 seek，音画差不超过 100 ms。
 - 验证命令：
@@ -1077,7 +1077,7 @@ pnpm tauri build --debug
 
 **回滚**
 
-- 分别关闭 `local_relay_enabled` 和 `direct_dash_enabled`；恢复 mpv 直接 Header，或仅在 `server_hls_v1_enabled=true` 时使用 server-HLS。local-relay 尚未实现，关闭其 flag 不改变当前路径。
+- 分别关闭 `local_relay_enabled` 和 `direct_dash_enabled`；恢复 mpv 直接 Header，或仅在 `server_hls_v1_enabled=true` 时使用 server-HLS。产品 local-relay 尚未实现，关闭其 flag 不改变当前路径。
 - relay 监听异常时应用立即退出中继并回到服务端兜底。
 
 **日志禁区**
@@ -1166,7 +1166,7 @@ git diff --check
 
 **完成与验证**
 
-- 当前状态：单 URL、白名单 Header、逐流 Header/容器 MIME、双 URL `MergingMediaSource`、同源重定向 Header 保留与跨源 fail-closed、播放意图、控制/seek、lifecycle 暂停与 PlayerView 解绑、脱敏日志已实现；lint 0 error/10 warnings、24 个 JVM tests、debug/test APK 构建、API 37 ATD `connectedDebugAndroidTest` 4/4 和冷启动冒烟通过。connected 测试覆盖 Ready、双轨、seek discontinuity、seek 后位置推进、播放/暂停、video surface、逐流输入和生产 MediaSource factory 独立 DataSource。ATD 的 goldfish H.264 解码缺陷使合成测试使用 `PREFER_SOFTWARE`，不能替代真机/默认硬件路径；真实 CDN 重定向链和逐流 Range 尚无端到端结果，真实 API 28/31/34 真机、默认硬件解码、真实 Bilibili 双流和长时矩阵仍未验收。
+- 当前状态：单 URL、白名单 Header、逐流 Header/MediaItem 容器 MIME 提示、双 URL `MergingMediaSource`、应用层同源重定向 Header 保留与跨源 socket 前 fail-closed、Cookie/系统代理隔离、HTTPS-only 嵌套 DataSource、公网 DNS/IP connect-time 过滤、播放意图、控制/seek、lifecycle 暂停与 PlayerView 解绑、脱敏日志已实现；lint 0 error/11 warnings、33 个 JVM tests、debug/test APK 构建、API 37 ATD `connectedDebugAndroidTest` 最终 15/15 和冷启动冒烟通过。Header 值和工厂层 Header 名称均为 fail-closed allowlist。connected 测试覆盖既有播放/UI 场景，以及真实 TLS GET/HEAD/206/416、逐流 Header、同源/跨源重定向、Cookie 不回放、非 HTTPS/userinfo 嵌套 URI 拒绝、Single/Merge MediaItem MIME 映射和双路 HTTPS 合成 MP4 Media3 merge。ATD 的 goldfish H.264 解码缺陷使合成测试使用 `PREFER_SOFTWARE`，不能替代真机/默认硬件路径；本地 HTTPS fixture 不证明真实 CDN/Range/URL 过期行为，标准 NAT64 前缀 fail-closed，运营商自定义 RFC 6052 前缀的内嵌私网风险仍依赖网关，真实 API 28/31/34 真机、默认硬件解码、真实 Bilibili 双流和长时矩阵仍未验收。
 - S1-S5 在 API 28/31/34 真机上的结果表；当前尚未执行。
 - 记录起播、seek、字幕、音画同步、CPU、电量和内存。
 - 验证命令：

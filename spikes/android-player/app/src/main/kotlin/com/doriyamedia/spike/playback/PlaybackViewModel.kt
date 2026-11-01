@@ -7,9 +7,6 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.DataSource
-import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -40,7 +37,8 @@ data class PlaybackUiState(
 class PlaybackViewModel(application: Application) : AndroidViewModel(application) {
   private val _uiState = MutableStateFlow(PlaybackUiState())
   val uiState: StateFlow<PlaybackUiState> = _uiState.asStateFlow()
-  private val mediaSourceFactory = PlaybackMediaSourceFactory(::dataSourceFactory)
+  private val dataSourceFactory = PlaybackDataSourceFactory(application)
+  private val mediaSourceFactory = PlaybackMediaSourceFactory(dataSourceFactory::create)
 
   private val playerListener =
     object : Player.Listener {
@@ -215,13 +213,6 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
   private fun safeDuration(): Long {
     val duration = player.duration
     return if (duration > 0 && duration != Long.MIN_VALUE) duration else 0
-  }
-
-  private fun dataSourceFactory(stream: StreamRequest): DataSource.Factory {
-    val httpFactory =
-      OkHttpDataSource.Factory(PlaybackHttpClientFactory.create(stream))
-        .setDefaultRequestProperties(stream.headers)
-    return DefaultDataSource.Factory(getApplication<Application>(), httpFactory)
   }
 
   override fun onCleared() {

@@ -82,22 +82,24 @@ WinUI 3 C# UI
 
 ### 4.1 当前机制证据
 
-截至 2026-10-28，两个隔离原型均已创建并通过以下本机验证：
+截至 2026-11-01，两个隔离原型均已创建并通过以下本机验证：
 
 | 候选 | 已通过 | 证据边界 |
 | --- | --- | --- |
-| Tauri 2 + mpv | pnpm frozen install/build；cargo fmt；clippy `-D warnings`；32 个 Rust tests 通过（另 1 个真实 mpv 测试需显式启用）；真实 mpv 空载 JSON IPC 1/1；Tauri debug exe 构建及交互会话 GUI 启动/退出 smoke | 只证明宿主、sidecar、IPC、输入边界、异步装载状态和退出清理可运行，未加载真实媒体 |
+| Tauri 2 + mpv | pnpm frozen install/build；cargo fmt；clippy `-D warnings`；75 个 Rust tests 通过（另 3 个真实 mpv/Python/公网 opt-in 测试需显式启用）；真实 mpv 空载 JSON IPC 连续 3/3；Header 保护 loopback 合成 MP4 + 20 次 seek 连续 3/3；公网 HTTPS CONNECT 的 mpv owner-PID + 创建时间探针连续 3/3；Tauri debug exe 构建及此前交互会话 GUI 启动/退出 smoke | 只证明宿主、受限制 pipe、sidecar、IPC、输入边界、异步装载状态、Header 注入、seek 和单-origin egress guard 机制可运行，未加载真实媒体 |
 | WinUI 3 + LibVLCSharp | .NET restore/build 0 warnings/0 errors；91 个 xUnit tests；LibVLC 3.0.19 probe（含 audio slave/Header 构造）；Windows App SDK self-contained app smoke；两个 loopback 合成源的 GUI `Opening -> Playing` smoke | 只证明窗口、LibVLC 初始化、白名单 Header 和本地双源机制可运行；不是真实 S1-S5、音画同步或长时结果 |
 
 当前实现边界：
 
-- Tauri 和 WinUI 都接受 HTTPS；plain HTTP 只允许显式启用的精确 loopback 测试模式。
-- Tauri 已实现 Header 白名单和双流的命令基础；mpv 子进程使用清空后的最小环境，命名管道由 128 位 CSPRNG 生成并校验服务端 PID，Tauri capability 权限为空。IPC 请求在 worker 中执行并受固定 5 秒期限约束，`start-file`/`file-loaded`/`end-file` 驱动状态，超时会强制清理 sidecar。真实媒体 Header/双流尚未验证。
+- Tauri 和 WinUI 都接受 HTTPS；plain HTTP 只允许显式启用的精确 loopback 测试模式。Tauri 的 HTTPS 预检拒绝 loopback/私网/链路本地/文档/CGNAT/组播/选定特殊用途 IP literal 和 `localhost` 主机名；严格模式下再由精确 CONNECT authority 的 W0 egress guard 处理域名解析、公网地址过滤和 DNS pin。
+- Tauri 已实现 Header 白名单和双流的命令基础；mpv 子进程使用清空后的最小环境，Tauri capability 权限为空。sidecar 必须通过绝对 `DORIYA_W0_MPV_PATH` 和必填 `DORIYA_W0_MPV_SHA256` 校验：宿主以禁止写/删除共享的方式打开文件，完成 SHA-256 比对并保持句柄锁定，直到 `CreateProcessW` 接受映像。可选 `DORIYA_W0_MPV_SIGNER_SHA256` 会在同一验证句柄上执行离线 Authenticode 校验，并要求 leaf signer 的 SHA-256 thumbprint 精确匹配；未配置时仅适用于本机未签名开发 mpv，不等于生产发布者门禁或签名版本清单验证。宿主先创建 128 位 CSPRNG 命名、仅当前用户单一 ACE、拒绝远程客户端的单实例 pipe，并预连接 client 端；`STARTUPINFOEX` 只允许 client stdin 与 NUL 输出句柄继承，参数使用 `fd://0`。connect、进程创建和首次 IPC acknowledgement 共享一个有界的 15 秒启动期限；自动启动 sidecar 的 `open`/`control` 使用 15 秒启动加 5 秒操作的单一绝对期限，已有 runtime 的请求仍共享 5 秒运行期限；connect 进入 pending 后的失败、超时和 read/write 等待失败都会先 `CancelIoEx` 并阻塞 `GetOverlappedResult` 回收，再释放 `OVERLAPPED`。子进程通过 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 在创建时原子加入 `KILL_ON_JOB_CLOSE` Job Object，并用原始进程句柄校验 user SID/session，避免 PID 复用竞态；任意校验失败均终止 sidecar。mpv 固定使用 `--tls-verify=yes`、`--ytdl=no`、`--network-timeout=15`，关闭脚本/本地自动加载，并通过 `--stream-lavf-o-append`、`--demuxer-lavf-o-append` 设置 Lavf 协议白名单和 `max_redirects=3`；该 append 形式已与真实 mpv `fd://0` IPC 联合冒烟。IPC 在 worker 中执行，`start-file`/`file-loaded`/`end-file` 驱动状态；`status` 轮询对未进入 `file-loaded` 的打开操作实施 30 秒期限，超时会强制清理 sidecar。opt-in 集成测试已通过完整控制器加载 Header 保护的 loopback 合成 MP4，并完成暂停、20 次相对 seek 和恢复播放 3/3；真实媒体 Header/双流、长时和跨 origin HLS/DASH 嵌套资源矩阵尚未验证。
+- Tauri 严格模式另有一个仅用于 W0 的 egress guard，不是产品 `local-relay`：只绑定 `127.0.0.1:0` 并使用 `SO_EXCLUSIVEADDRUSE`，通过无凭据代理 URL 和受保护 JSON IPC 的 `http-proxy` 属性交给 mpv；只接受 HTTP/1.1 `CONNECT` 和当前播放的精确 HTTPS CONNECT authority（host + port）。每个播放会话在宿主内以 single-flight 方式解析 DNS（不持有 relay 全局状态锁，CONNECT handler 最多等待 5 秒；底层不可取消的 resolver worker 可能更晚退出）、拒绝公私混合答案、缓存 pin，只连接 pin 的数字 `SocketAddr`，并验证 `peer_addr()`；连接、握手和写操作有界，会话 CONNECT 数量和并发受限。`GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` 用于匹配客户端侧 ESTABLISHED loopback 行，owner PID 和进程创建时间必须等于已校验 mpv sidecar；查询失败、PID/创建时间不同或竞态均 fail-closed。新播放和 disarm 会轮换 generation 并主动关闭旧隧道；`stop()` 的 2 秒等待不能取消已开始的不可取消 DNS/connect，相关 handler 可能短暂存活，但后续 generation/shutdown 检查会阻止持续隧道。FFmpeg 会把 `Host` 写成代理 loopback authority，解析器只接受该精确代理 authority 或精确 CONNECT target。真实 mpv 公网 HTTPS 探针连续 3/3 观察到成功 CONNECT 的 owner PID 与创建时间均匹配 sidecar。建立隧道后不检查 TLS SNI、HTTP Host、path/query、method、Header 或响应内容；DNS 在一个播放会话内不会重解析，CDN/DNS 轮换或 URL 刷新需要新播放；严格 DNS/PID/relay 失败不会回退直连；debug-only 的 loopback HTTP fixture 开关在 release 构建中被忽略。Open P1 residual risk：真实 HTTPS 要求 Lavf 白名单保留 `tcp`，而 `tcp://` 不经过 HTTP proxy，恶意嵌套 playlist 仍可能绕过 CONNECT guard 直接建连，因此该 guard 不是进程级 egress fail-closed，正式安全门禁前需要 WFP、AppContainer、进程级防火墙或等价网络层。PID + 创建时间匹配是所有权关联而非密码学认证；普通 PID 复用已被缩小，handle 复制、内核失陷与同用户调试/注入不在 W0 威胁模型内。该机制不支持跨 origin redirect、HLS/DASH 子 origin、逐流 origin 或自动 URL 刷新，不能作为产品 local-relay 或 S3 安全门禁证据。
 - WinUI 已通过 `Media.AddSlave` 实现音频 slave，并支持 `Referer`/`User-Agent` media option。VLC 3.0.19 没有安全的 `Origin`/`Accept`/`Accept-Language` 注入路径，media option 也不能表达两流不同 Header，因此这些场景 fail-closed；不能据此认为 S4/S5 已通过。
-- Tauri 仍需完成完整 DACL/SID/session 对端信任、Windows Job Object 崩溃清理、sidecar 可执行文件身份校验和重定向策略。WinUI 仍需验证真实来源、跨源重定向、音画同步和长时行为。
+- WinUI 目录另有独立的 loopback relay 机制探针：仅绑定 `127.0.0.1` 随机端口，使用 256-bit 一次性 token、逐流 Header、精确 origin allowlist、公网 HTTPS-only、GET/HEAD/Range/If-Range、响应头 allowlist、3xx fail-closed、精确 IANA RIR 全球单播 CIDR 前缀 allowlist、私网/转换 IPv6 connect-time 拒绝、响应头阶段超时与响应体空闲超时分离；响应已开始后发生超时或流错误会主动重置下游连接。Release build 0 warning/0 error，独立 xUnit 94/94。该探针尚未接入 WinUI/LibVLC，没有真实播放、刷新、产品票据或设备策略证据。
+- Tauri 的 DACL、受限继承 handle、SID/session、内容哈希钉扎、可选 Authenticode leaf signer pin、mpv 网络选项、30 秒 `file-loaded` watchdog、创建时 Job Object 和单-origin egress guard 机制已落地，但仍需真实签名发行物、生产强制发布者门禁、签名版本清单、轮换/吊销策略、真实媒体 Header/双流、Host 崩溃联动实机验证和完整跨 origin HLS/DASH 重定向/嵌套资源策略。pending overlapped 读的取消后回收仍会阻塞等待驱动完成；WinUI 仍需验证真实来源、跨源重定向、音画同步和长时行为。
 - API 37 Android ATD 的 Media3 机制结果与本文无关，不能替代任何 Windows 候选。
 
-这些结果只把 W0 从“未开始”推进到“机制原型可构建、可启动、可探针”；S1-S5、稳定性、音画差、DPI/多显示器、Windows 11、Intel GPU、网络和许可证门禁仍未执行。
+这些结果只把 W0 从“未开始”推进到“机制原型可构建、可启动、可探针”；S1-S5、稳定性、音画差、DPI/多显示器、Windows 11、Intel GPU、真实网络矩阵和许可证门禁仍未执行。
 
 ### 4.2 证据要求
 
@@ -189,6 +191,7 @@ G1-G5 的功能结论和 G6 的许可证结论必须分开记录。功能通过�
 - 只允许白名单 Header 名称和值进入播放器边界；完整记录仍须脱敏。
 - 播放器进程只能接收最小短期能力，不得获得长期账号凭据。
 - 所有诊断输出在写入磁盘前经过字段白名单和脱敏。
+- Tauri 的 mpv IPC 管道不得重新退化为把 pipe 路径交给 mpv、允许第二个 client 或使用默认宽松 DACL；`fd://0` 继承路径必须由真实 mpv smoke 持续覆盖。
 
 ### 6.2 W0 回滚
 
@@ -205,10 +208,10 @@ G1-G5 的功能结论和 G6 的许可证结论必须分开记录。功能通过�
 
 ## 7. 待决事项
 
-- 两个原型已创建并完成机制级构建/启动验证，但 S1-S5、30 分钟、seek、音画差和 DPI 矩阵均未执行。
+- 两个原型已创建并完成机制级构建/启动验证，但 S1-S5、30 分钟、真实样本上的 20 次随机 seek、音画差和 DPI 矩阵均未执行。
 - 本机已配置 mpv `v0.41.0` 和 .NET SDK `8.0.427`；真实 Bilibili/OpenList 样本和发布许可仍未解决。
 - S2 的真实 E-AC3 样本未解决，不能用其他编码替代。
 - Windows 11、Intel GPU、真实双屏/DPI、睡眠恢复和 Wi-Fi/热点矩阵未覆盖。
 - mpv/FFmpeg 与 LibVLC/VLC 的准确发行物、构建参数、解码器和分发模型未冻结。
 - 最终选择、许可证结论和可分发性均待真机测试、依赖审计及法务/发布前复核。
-- Tauri 的完整 DACL/SID/session 对端信任、Job Object/崩溃清理、sidecar 身份校验和重定向策略仍未完成；WinUI 的真实来源、跨源重定向、音画同步和长时行为仍未完成。两者均不能据此进入正式产品集成。
+- Tauri 的 sidecar 内容哈希钉扎、可选 Authenticode leaf signer pin、Lavf 协议白名单/redirect 上限、30 秒 `file-loaded` watchdog 和单-origin egress guard 已完成，但真实签名发行物、生产强制发布者门禁、签名版本清单、完整跨 origin HLS/DASH 重定向/嵌套资源策略、真实媒体和 Host 崩溃联动实机验证仍未完成；egress guard 不是产品 `local-relay`，也不防同用户调试/注入；由于 Lavf 白名单必须保留 `tcp`，嵌套 `tcp://` 仍可绕过 HTTP proxy/CONNECT guard，当前不是进程级 egress fail-closed，正式安全门禁前需要 WFP、AppContainer、进程级防火墙或等价网络层。WinUI 的真实来源、跨源重定向、音画同步和长时行为仍未完成。两者均不能据此进入正式产品集成。

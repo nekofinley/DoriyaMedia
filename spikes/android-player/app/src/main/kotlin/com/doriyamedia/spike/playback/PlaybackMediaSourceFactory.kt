@@ -12,30 +12,31 @@ import androidx.media3.exoplayer.source.ProgressiveMediaSource
 @OptIn(UnstableApi::class)
 internal class PlaybackMediaSourceFactory(
   private val dataSourceFactory: (StreamRequest) -> DataSource.Factory,
+  private val mediaItemFactory: (StreamRequest) -> MediaItem = StreamRequest::toMediaItem,
 ) {
   fun create(request: PlaybackRequest): MediaSource =
     when (request) {
       is PlaybackRequest.Single -> {
         DefaultMediaSourceFactory(dataSourceFactory(request.stream))
-          .createMediaSource(request.stream.toMediaItem())
+          .createMediaSource(mediaItemFactory(request.stream))
       }
 
       is PlaybackRequest.Merge -> {
         val videoSource =
           ProgressiveMediaSource.Factory(dataSourceFactory(request.video))
-            .createMediaSource(request.video.toMediaItem())
+            .createMediaSource(mediaItemFactory(request.video))
         val audioSource =
           ProgressiveMediaSource.Factory(dataSourceFactory(request.audio))
-            .createMediaSource(request.audio.toMediaItem())
+            .createMediaSource(mediaItemFactory(request.audio))
         MergingMediaSource(videoSource, audioSource)
       }
     }
-
-  private fun StreamRequest.toMediaItem(): MediaItem =
-    MediaItem.Builder()
-      .setUri(url)
-      .apply {
-        containerMimeType?.let { setMimeType(it) }
-      }
-      .build()
 }
+
+internal fun StreamRequest.toMediaItem(): MediaItem =
+  MediaItem.Builder()
+    .setUri(url)
+    .apply {
+      containerMimeType?.let { setMimeType(it) }
+    }
+    .build()

@@ -105,22 +105,26 @@ libmpv 是最后的兼容性方案，不是默认方案：
 - Kotlin + Jetpack Compose，`minSdk=28`，`targetSdk=37`，`compileSdk=37`。
 - 单 URL 播放，HTTPS-only；HTTP 仅保留给显式本机测试的协议边界讨论，当前 UI 不接受普通 HTTP 媒体 URL。
 - Header 白名单：`Referer`、`Origin`、`User-Agent`、`Accept`、`Accept-Language`。
+- Header 值在输入校验层和 HTTP 工厂层都只接受非空 ASCII 可打印字符；控制字符、DEL 和非 ASCII 均 fail-closed，错误信息不回显值。
 - 视频和音频分别保存 URL、Header 和容器 MIME，各自创建独立的 `OkHttpDataSource` 与 `ProgressiveMediaSource`，再由 `MergingMediaSource` 本地合流。
-- 每次播放请求按流建立 OkHttp client；同源重定向保留白名单 Header，scheme/host/port 任一变化的重定向在目标收到请求前 fail-closed，同时禁用 TLS 重定向、Cookie 和连接失败自动重试。
+- 每次播放请求按流建立 OkHttp client；自动重定向关闭，由应用层手动跟随同源重定向并保留白名单 Header，scheme/host/port 任一变化的重定向在目标 DNS/socket 前 fail-closed，同时禁用 TLS 重定向、Cookie、系统代理和连接失败自动重试。
+- URL 工厂对 IP literal 做公网分类，域名解析结果必须全部为公网地址；所有 Media3 嵌套 DataSource open 都要求无 userinfo 的 HTTPS URI，防止远程播放列表转到 `file/content/udp/data`。
 - 播放意图 `playWhenReady`、播放、暂停、seek、位置/时长和脱敏后的 Media3 错误码；准备失败会停止并清空旧 source。
 - 页面离开时暂停，`PlayerView` 释放时解绑播放器，进度轮询受 lifecycle 约束。
 - URL、Header 名称和错误码的脱敏日志测试。
 - JVM 输入/Header/日志/状态展示测试，以及带合成 H.264/AAC 素材的 instrumented merge、seek 后位置推进、video/audio 轨道和 surface 可见性测试。
+- instrumented 测试使用真实 TLS `MockWebServer` 和逐测试信任锚，覆盖逐流 Header、GET/HEAD、Range/206/416、`Content-Range`、同源重定向保留 Header、服务端 Cookie 不回放、生产工厂强制 `CookieJar.NO_COOKIES`，以及跨源重定向在目标收到请求前 fail-closed；另有非 HTTPS/userinfo 嵌套 URI 的 DataSource 拒绝测试。
+- 双路 HTTPS 合成 MP4 的端到端 Media3 merge 测试验证独立 URL/Header 和 video/audio 双轨 `STATE_READY`；另有 MediaItem 映射和工厂 wiring 测试锁定 Single 与 Merge 每路的 `localConfiguration.mimeType` 提示，HTTP 请求本身不发送容器 MIME。
 
-### 4.2 2026-10-28 本机验证
+### 4.2 2026-11-01 本机验证
 
 | 检查 | 结果 |
 | --- | --- |
-| `:app:lintDebug` | 通过，0 error，10 个依赖版本提示 |
-| `:app:testDebugUnitTest` | 通过，24 tests，0 failures |
+| `:app:lintDebug` | 通过，0 error，11 个依赖版本提示 |
+| `:app:testDebugUnitTest` | 通过，33 tests，0 failures |
 | `:app:assembleDebug` | 通过，生成 debug APK |
 | `:app:assembleDebugAndroidTest` | 通过，测试 APK 可编译 |
-| API 37 x86_64 ATD `connectedDebugAndroidTest` | 通过，4/4 tests；覆盖 Ready、双轨、seek discontinuity、seek 后位置推进、播放/暂停、video surface 可见性、逐流 Header/MIME 输入和生产 `PlaybackMediaSourceFactory` 独立创建两路 DataSource |
+| API 37 x86_64 ATD `connectedDebugAndroidTest` | 最终运行通过，15/15 tests；除既有播放/UI 覆盖外，包含真实 TLS GET/HEAD/206/416、逐流 Header、重定向/Cookie/代理隔离、HTTPS-only 嵌套 DataSource 拒绝、Single/Merge MediaItem MIME wiring 和 HTTPS 双源 Media3 merge |
 | APK 安装与 `MainActivity` 冷启动 | 通过，Activity 为 topResumed，UI 文本可见，未见应用级 Runtime error |
 
 API 37 ATD 的系统 `c2.goldfish.h264.decoder` 在当前主机上出现 Codec2 buffer/SELinux 错误，导致合成 H.264 素材无法按默认硬件解码路径播放。instrumented 合流测试显式使用 `MediaCodecSelector.PREFER_SOFTWARE`，目的是隔离并验证 `MergingMediaSource` 机制，不是产品默认路径，也不是真机解码结论。该 workaround 必须保留在测试说明中，不能写成“模拟器通过了目标 H.264 能力”。
@@ -129,8 +133,10 @@ API 37 ATD 的系统 `c2.goldfish.h264.decoder` 在当前主机上出现 Codec2 
 
 - Media3 双源合流 API、assets 读取、播放器状态、seek、seek 后位置推进、播放/暂停、video surface 和测试 APK 生命周期可工作。
 - Header 和 URL 校验/脱敏逻辑有 JVM 层证据。
-- 视频和音频的 Header、容器 MIME 与 DataSource client 已按流独立建模，生产 `PlaybackMediaSourceFactory` 的独立 DataSource 创建有 instrumented 证据。
-- 同源重定向保留白名单 Header、跨源重定向在目标收到请求前拒绝，已由 JVM loopback fixture 覆盖。
+- 视频和音频的 Header、MediaItem 容器 MIME 提示与 DataSource client 已按流独立建模，生产 `PlaybackMediaSourceFactory` 的独立 DataSource 和 MediaItem mapper 调用均有 instrumented 证据。
+- 同源重定向保留白名单 Header、跨源重定向在目标收到请求前拒绝、Cookie 不回放，以及 GET/HEAD/206/416 的响应元数据处理已由本地 HTTPS instrumented fixture 覆盖。
+- IP literal 和 DNS 结果公网过滤、系统代理禁用、嵌套 DataSource HTTPS-only 均有 JVM 或 instrumented 证据；标准 NAT64 前缀按 fail-closed 拒绝。运营商在宽泛 RIR 前缀内自定义的 RFC 6052 映射无法仅凭 IPv6 外层识别，仍需依赖本地 NAT64 网关拒绝私网内嵌 IPv4，这是未关闭的网络风险。
+- 独立 URL、Header 和 MediaItem MIME 提示的双路 HTTPS 合成 MP4 可进入 Media3 双轨 Ready。
 - Android 构建、lint、APK 安装和无窗口 ATD 启动链路可工作。
 
 这些结果不证明：
@@ -141,7 +147,7 @@ API 37 ATD 的系统 `c2.goldfish.h264.decoder` 在当前主机上出现 Codec2 
 - 默认硬件解码路径、功耗、电量、热行为或后台/PiP/MediaSession 已满足产品要求。
 - 真实 Bilibili/CDN 多跳重定向、DNS 变化和弱网重试可用；fixture 只证明当前拒绝策略。
 - 生产 `PlaybackViewModel` 的完整网络、错误和 lifecycle 合流路径已被端到端覆盖；当前合流播放测试独立构造了 Media3 source。
-- 合流路径的逐流 Range 可用；当前只接受 MP4/WebM progressive，Range 委托 Media3/OkHttp，尚无两路独立 Range 的端到端测试。
+- 真实 CDN、过期签名 URL 或网络切换下的逐流 Range 可用；本地 HTTPS fixture 只证明 GET/HEAD/206/416 和 `Content-Range` 管线，不证明真实来源行为。
 
 ## 5. A0 验收门禁
 

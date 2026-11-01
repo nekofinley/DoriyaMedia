@@ -229,13 +229,18 @@ class PlaybackInputValidatorTest {
 
   @Test
   fun forbiddenAndUnknownHeadersAreRejectedWithoutEchoingValues() {
-    listOf("Authorization: Bearer secret-value", "X-Source-Token: secret-value").forEach {
-      val result = validationWithHeaders(it)
-      assertTrue(result is ValidationResult.Failure)
-      val reason = (result as ValidationResult.Failure).reason
-      assertTrue(reason.contains("allowlist"))
-      assertFalse(reason.contains("secret-value"))
-    }
+    listOf(
+        "Authorization: Bearer secret-value",
+        "Cookie: session=secret-value",
+        "X-Source-Token: secret-value",
+      )
+      .forEach {
+        val result = validationWithHeaders(it)
+        assertTrue(result is ValidationResult.Failure)
+        val reason = (result as ValidationResult.Failure).reason
+        assertTrue(reason.contains("allowlist"))
+        assertFalse(reason.contains("secret-value"))
+      }
   }
 
   @Test
@@ -246,6 +251,8 @@ class PlaybackInputValidatorTest {
         "User-Agent: first\nUser-Agent: second",
         "User-Agent: first\r\nAuthorization: secret-value",
         "User-Agent: value\u0000secret-value",
+        "Referer: https://www.example.com/watch?token=secret-value-中文",
+        "Accept-Language: zh-CN, 日本語",
       )
 
     inputs.forEach { headers ->

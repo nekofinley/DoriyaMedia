@@ -1,8 +1,4 @@
-use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
-use std::thread;
-use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -44,38 +40,25 @@ pub trait IpcConnection: Send {
     fn request(&mut self, request_id: u64, command: &[Value]) -> Result<IpcReply, IpcError>;
 
     fn notify(&mut self, command: &[Value]) -> Result<(), IpcError>;
-
-    fn server_pid(&self) -> Result<u32, IpcError>;
 }
 
 pub struct JsonPipe {
-    reader: BufReader<File>,
-    writer: File,
+    reader: BufReader<Box<dyn Read + Send>>,
+    writer: Box<dyn Write + Send>,
 }
 
 impl JsonPipe {
-    pub fn connect(path: &Path, timeout: Duration) -> Result<Self, IpcError> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match OpenOptions::new().read(true).write(true).open(path) {
-                Ok(file) => {
-                    let reader_file = file.try_clone().map_err(|_| IpcError::Io)?;
-                    return Ok(Self {
-                        reader: BufReader::new(reader_file),
-                        writer: file,
-                    });
-                }
-                Err(_) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(40));
-                }
-                Err(_) => return Err(IpcError::Io),
-            }
+    pub(super) fn from_parts(reader: Box<dyn Read + Send>, writer: Box<dyn Write + Send>) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            writer,
         }
     }
 
     fn write_message(&mut self, value: &Value) -> Result<(), IpcError> {
-        serde_json::to_writer(&mut self.writer, value).map_err(|_| IpcError::Protocol)?;
-        self.writer.write_all(b"\n").map_err(|_| IpcError::Io)?;
+        let mut encoded = serde_json::to_vec(value).map_err(|_| IpcError::Protocol)?;
+        encoded.push(b'\n');
+        self.writer.write_all(&encoded).map_err(|_| IpcError::Io)?;
         self.writer.flush().map_err(|_| IpcError::Io)
     }
 
@@ -124,31 +107,6 @@ impl IpcConnection for JsonPipe {
 
     fn notify(&mut self, command: &[Value]) -> Result<(), IpcError> {
         self.write_message(&json!({ "command": command }))
-    }
-
-    fn server_pid(&self) -> Result<u32, IpcError> {
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawHandle;
-
-            use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
-
-            let mut pid = 0u32;
-            // SAFETY: `writer` owns a live pipe handle for the duration of this call.
-            let succeeded = unsafe {
-                GetNamedPipeServerProcessId(self.writer.as_raw_handle().cast(), &mut pid)
-            };
-            if succeeded == 0 || pid == 0 {
-                Err(IpcError::Io)
-            } else {
-                Ok(pid)
-            }
-        }
-
-        #[cfg(not(windows))]
-        {
-            Err(IpcError::Io)
-        }
     }
 }
 
@@ -298,5 +256,26 @@ mod tests {
             Ok(ParsedIpcMessage::Ignored)
         ));
         assert_eq!(parse_mpv_message(invalid, 12), Err(IpcError::Protocol));
+    }
+
+    #[test]
+    fn writer_failures_are_classified_as_io_not_protocol_errors() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed test pipe",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut pipe = JsonPipe::from_parts(Box::new(std::io::empty()), Box::new(FailingWriter));
+        assert_eq!(pipe.notify(&[json!("quit")]), Err(IpcError::Io));
     }
 }

@@ -79,7 +79,7 @@ path, so use the executable path above.
 
 ## Actual verification results
 
-Recorded on 2026-10-28 on Windows 10 22H2 (`10.0.19045`, x64):
+Recorded on 2026-11-01 on Windows 10 22H2 (`10.0.19045`, x64):
 
 - `dotnet restore`: PASS, exit code 0.
 - `dotnet build -c Debug`: PASS, 0 warnings and 0 errors.
@@ -97,6 +97,44 @@ Recorded on 2026-10-28 on Windows 10 22H2 (`10.0.19045`, x64):
   wiring only, not real-source, synchronization, seek, or codec acceptance.
 - The framework-dependent diagnostic launch failed with `0x80070005` before
   window creation in the Codex host, as described above.
+
+### Isolated loopback relay probe
+
+`tools/DoriyaMedia.WinUISpike.LoopbackRelayProbe/` is a separate .NET console
+project. It is **not referenced by the WinUI app**, is not used by LibVLC, and
+does not implement a product `local-relay` transport. Its purpose is to test the
+HTTP mechanism that a future relay would need.
+
+The probe builds with 0 warnings / 0 errors and its separate xUnit project
+passes 94 tests. It currently covers:
+
+- `127.0.0.1`-only ephemeral binding, a 256-bit capability token, and fixed-time
+  token comparison.
+- Independent video/audio routes with exact-origin allowlists and per-route
+  `Origin`, `Referer`, and `User-Agent` injection.
+- GET/HEAD, Range/If-Range, 200/206/416 forwarding, response-header allowlisting,
+  redirect fail-closed behavior, and non-identity `Content-Encoding` rejection.
+- Header-phase timeout separate from response-body idle timeout, so a long
+  media transfer is not cut off by a fixed total response deadline. If a
+  started response times out or its body stream fails, the downstream
+  connection is reset instead of appearing as a clean EOF.
+- Public targets require HTTPS; only the exact `127.0.0.1` fixture permits
+  plain HTTP. Connect-time checks use exact IANA RIR global-unicast CIDR
+  prefixes and reject allocation gaps, private, loopback, documentation,
+  reserved, NAT64, 6to4, Teredo, IPv4-compatible and IPv4-mapped addresses,
+  plus query/Host/method/header rejection paths.
+- Redacted audit outcomes that do not contain URLs, query values, headers,
+  cookies, or capability tokens.
+
+```powershell
+Set-Location C:\Users\Administrator\DoriyaMedia\spikes\windows-player\winui-libvlcsharp\tools\DoriyaMedia.WinUISpike.LoopbackRelayProbe
+dotnet build .\DoriyaMedia.WinUISpike.LoopbackRelayProbe.csproj -c Release
+dotnet test ..\..\tests\DoriyaMedia.WinUISpike.LoopbackRelayProbe.Tests\DoriyaMedia.WinUISpike.LoopbackRelayProbe.Tests.csproj -c Release --no-restore
+```
+
+This is mechanism evidence only. No real LibVLC playback through the relay, URL
+refresh, product ticket integration, TLS/token rotation, rate limiting, or
+run/game/device policy has been verified. W0 and S5 remain open.
 
 ## Safety boundary
 

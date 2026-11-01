@@ -1,7 +1,11 @@
 package com.doriyamedia.spike.playback
 
 import java.io.IOException
+import java.net.InetAddress
+import java.net.ServerSocket
 import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
+import okhttp3.CookieJar
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -9,6 +13,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -96,6 +101,69 @@ class SameOriginRedirectPolicyTest {
   }
 
   @Test
+  fun hostChangeWithTheSameSchemeAndPortIsRejectedBeforeTheRedirectRequest() {
+    val initialUrl = server.url("/start")
+    val changedHostUrl = initialUrl.newBuilder().host("127.0.0.1").build()
+    server.enqueue(
+      MockResponse()
+        .setResponseCode(302)
+        .setHeader("Location", changedHostUrl),
+    )
+    server.enqueue(MockResponse().setResponseCode(200).setBody("must not be reached"))
+
+    val failure =
+      assertThrows(IOException::class.java) {
+        client(initialUrl.toString())
+          .newCall(Request.Builder().url(initialUrl).build())
+          .execute()
+          .close()
+      }
+
+    assertEquals(SameOriginRedirectPolicy.REDIRECT_REJECTED, failure.message)
+    assertEquals(1, server.requestCount)
+  }
+
+  @Test
+  fun crossOriginRedirectDoesNotOpenATargetSocket() {
+    ServerSocket(0, 1, InetAddress.getLoopbackAddress()).use { target ->
+      target.soTimeout = 750
+      val accepted = java.util.concurrent.CountDownLatch(1)
+      val listener =
+        thread(name = "redirect-target-accept") {
+          try {
+            target.accept().use {}
+            accepted.countDown()
+          } catch (_: IOException) {
+            // A timeout is the expected successful outcome for this test.
+          }
+        }
+
+      val initialUrl = server.url("/start")
+      server.enqueue(
+        MockResponse()
+          .setResponseCode(302)
+          .setHeader(
+            "Location",
+            "http://127.0.0.1:${target.localPort}/must-not-connect",
+          ),
+      )
+
+      val failure =
+        assertThrows(IOException::class.java) {
+          client(initialUrl.toString())
+            .newCall(Request.Builder().url(initialUrl).build())
+            .execute()
+            .close()
+        }
+
+      assertEquals(SameOriginRedirectPolicy.REDIRECT_REJECTED, failure.message)
+      assertFalse(accepted.await(300, TimeUnit.MILLISECONDS))
+      listener.join(1_000)
+      assertEquals(1, server.requestCount)
+    }
+  }
+
+  @Test
   fun httpAndCredentialBearingInitialUrlsAreRejected() {
     val http =
       assertThrows(IllegalArgumentException::class.java) {
@@ -122,12 +190,55 @@ class SameOriginRedirectPolicyTest {
     assertEquals("Playback URL must not contain user information", credentials.message)
   }
 
+  @Test
+  fun productionFactoryRegistersRedirectAndCookiePolicies() {
+    val client =
+      PlaybackHttpClientFactory.create(
+        StreamRequest(
+          url = "https://media.example/video.mp4",
+          headers = emptyMap(),
+          containerMimeType = null,
+        ),
+      )
+
+    assertTrue(client.interceptors.any { it is SameOriginRedirectPolicy })
+    assertEquals(CookieJar.NO_COOKIES, client.cookieJar)
+    assertEquals(false, client.followRedirects)
+    assertEquals(false, client.followSslRedirects)
+    assertEquals(false, client.retryOnConnectionFailure)
+  }
+
+  @Test
+  fun productionFactoryRejectsUnsafeHeadersWithoutEchoingTheirValues() {
+    val headers =
+      listOf(
+        mapOf("Referer" to "https://www.example.com/secret-value-中文"),
+        mapOf("Authorization" to "Bearer secret-value"),
+        mapOf("X-Source-Token" to "secret-value"),
+      )
+
+    headers.forEach { unsafeHeaders ->
+      val failure =
+        assertThrows(IllegalArgumentException::class.java) {
+          PlaybackHttpClientFactory.create(
+            StreamRequest(
+              url = "https://media.example/video.mp4",
+              headers = unsafeHeaders,
+              containerMimeType = null,
+            ),
+          )
+        }
+
+      assertFalse(failure.message.orEmpty().contains("secret-value"))
+    }
+  }
+
   private fun client(initialUrl: String): OkHttpClient =
     OkHttpClient.Builder()
-      .followRedirects(true)
+      .followRedirects(false)
       .followSslRedirects(false)
       .retryOnConnectionFailure(false)
-      .addNetworkInterceptor(
+      .addInterceptor(
         SameOriginRedirectPolicy(checkNotNull(initialUrl.toHttpUrl())),
       )
       .build()

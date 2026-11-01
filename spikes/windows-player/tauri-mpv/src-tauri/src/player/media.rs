@@ -4,6 +4,9 @@ use std::env;
 use serde::Deserialize;
 use url::{Host, Url};
 
+use super::network::{is_public_ip, normalize_public_dns_name};
+use super::relay::{origin_for_media, RelayOrigin};
+
 const MAX_URL_BYTES: usize = 8 * 1024;
 const MAX_HEADER_COUNT: usize = 8;
 const MAX_HEADER_VALUE_BYTES: usize = 2 * 1024;
@@ -45,6 +48,10 @@ impl ValidatedMedia {
             .map(|header| format!("{}: {}", header.name, header.value))
             .collect()
     }
+
+    pub(crate) fn relay_origin(&self) -> Option<RelayOrigin> {
+        origin_for_media(&self.url)
+    }
 }
 
 struct ValidatedHeader {
@@ -60,8 +67,8 @@ pub struct MediaPolicy {
 impl MediaPolicy {
     pub fn from_environment() -> Self {
         Self {
-            allow_loopback_http: env::var("DORIYA_W0_ALLOW_LOOPBACK_HTTP")
-                .is_ok_and(|value| value == "1"),
+            allow_loopback_http: cfg!(debug_assertions)
+                && env::var("DORIYA_W0_ALLOW_LOOPBACK_HTTP").is_ok_and(|value| value == "1"),
         }
     }
 
@@ -93,6 +100,7 @@ pub enum MediaError {
     UrlFragment,
     UrlScheme,
     UrlInsecure,
+    UrlHostNotPublic,
     HeaderNotAllowed,
     HeaderDuplicate,
     HeaderValueInvalid,
@@ -109,6 +117,7 @@ impl MediaError {
             Self::UrlFragment => "media_url_fragment",
             Self::UrlScheme => "media_url_scheme",
             Self::UrlInsecure => "media_url_insecure",
+            Self::UrlHostNotPublic => "media_url_host_not_public",
             Self::HeaderNotAllowed => "header_not_allowed",
             Self::HeaderDuplicate => "header_duplicate",
             Self::HeaderValueInvalid => "header_value_invalid",
@@ -125,6 +134,7 @@ impl MediaError {
             Self::UrlFragment => "Media URLs must not contain a fragment.",
             Self::UrlScheme => "Only HTTPS media URLs are allowed.",
             Self::UrlInsecure => "Plain HTTP is limited to loopback test mode.",
+            Self::UrlHostNotPublic => "Media URLs must not target a private or local host.",
             Self::HeaderNotAllowed => "A header is not on the playback allowlist.",
             Self::HeaderDuplicate => "A header was supplied more than once.",
             Self::HeaderValueInvalid => "A header value is malformed.",
@@ -196,8 +206,8 @@ fn validate_url(input: &str, policy: MediaPolicy) -> Result<(), MediaError> {
     }
 
     match url.scheme() {
-        "https" if url.host().is_some() => Ok(()),
-        "https" => Err(MediaError::UrlInvalid),
+        "https" if !is_public_https_host(&url) => Err(MediaError::UrlHostNotPublic),
+        "https" => Ok(()),
         "http" if url.host().is_some() && policy.allow_loopback_http && is_loopback_host(&url) => {
             Ok(())
         }
@@ -205,6 +215,23 @@ fn validate_url(input: &str, policy: MediaPolicy) -> Result<(), MediaError> {
         "http" => Err(MediaError::UrlInvalid),
         _ => Err(MediaError::UrlScheme),
     }
+}
+
+fn is_public_https_host(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(host)) => normalize_public_dns_name(host).is_some(),
+        Some(Host::Ipv4(address)) => is_public_ipv4(address),
+        Some(Host::Ipv6(address)) => is_public_ipv6(address),
+        None => false,
+    }
+}
+
+fn is_public_ipv4(address: std::net::Ipv4Addr) -> bool {
+    is_public_ip(std::net::IpAddr::V4(address))
+}
+
+fn is_public_ipv6(address: std::net::Ipv6Addr) -> bool {
+    is_public_ip(std::net::IpAddr::V6(address))
 }
 
 fn is_loopback_host(url: &Url) -> bool {
@@ -337,6 +364,40 @@ mod tests {
                 .err()
                 .expect("URL must be rejected");
             assert_eq!(error, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_private_and_local_https_hosts() {
+        for url in [
+            "https://127.0.0.1/media.mkv",
+            "https://10.0.0.8/media.mkv",
+            "https://169.254.1.1/media.mkv",
+            "https://[::1]/media.mkv",
+            "https://[fd00::1]/media.mkv",
+            "https://localhost/media.mkv",
+            "https://media.localhost/media.mkv",
+        ] {
+            assert_eq!(
+                validate_media(request(url, &[]), MediaPolicy::strict())
+                    .err()
+                    .expect("private HTTPS host must be rejected"),
+                MediaError::UrlHostNotPublic,
+                "unexpected result for {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_public_ip_literal_https_hosts() {
+        for url in [
+            "https://8.8.8.8/media.mkv",
+            "https://[2606:4700:4700::1111]/media.mkv",
+        ] {
+            assert!(
+                validate_media(request(url, &[]), MediaPolicy::strict()).is_ok(),
+                "public HTTPS host must be accepted: {url}"
+            );
         }
     }
 

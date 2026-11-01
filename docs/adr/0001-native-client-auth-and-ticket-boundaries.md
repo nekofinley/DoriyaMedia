@@ -577,6 +577,12 @@ local relay 解决的是本机播放器无法设置某些请求 header 或需要
 - 响应只回传媒体所需 header；不得把上游 Set-Cookie 或凭据类 header 反射给播放器。
 - 限制并发、请求体、响应大小和超时；记录 host/transport/字节统计，不记录完整 URL/query/header/token。
 
+### 6.4 与 Windows W0 egress guard 的边界
+
+`spikes/windows-player/tauri-mpv/` 中存在一个仅用于 W0 可行性验证的 egress guard。它只在严格模式下绑定 `127.0.0.1:0` 并使用 `SO_EXCLUSIVEADDRUSE`，通过无凭据 proxy URL 提供单播放会话的 HTTP/1.1 `CONNECT`，只允许当前播放的精确 HTTPS CONNECT authority（host + port），在宿主内完成每播放会话 single-flight DNS 解析（不持有 relay 全局状态锁，CONNECT handler 最多等待 5 秒；底层不可取消的 resolver worker 可能更晚退出）/公网地址过滤/pin，并用 Windows TCP owner PID + 进程创建时间绑定到已校验的 mpv 子进程；新播放和 disarm 会主动关闭已登记隧道；`stop()` 不能取消已开始的不可取消 DNS/connect，相关 handler 可能短暂存活，但不会再维持隧道。采用 PID 绑定而不是 bootstrap token，是因为当前真实 mpv/FFmpeg 路径不会发送 `Proxy-Authorization`，等待 407 后也不会带凭据重试。该匹配是进程所有权关联，不是密码学认证；创建时间绑定缩小了普通 PID 复用窗口，但 handle 复制、内核失陷和同用户调试/注入不在 W0 威胁模型内。
+
+debug-only 的 loopback HTTP fixture 开关在 release 构建中被忽略。该 guard 不是本文所称的产品 `local-relay`，不受 `local_relay_enabled` 控制，不能获得 ticket、由 relay 自身注入源站 Header、刷新 URL、处理跨 origin 子资源或接受任意目标；宿主仍可通过受保护 JSON IPC 向 mpv 设置白名单 `http-header-fields`。真实 HTTPS 要求 Lavf 白名单保留 `tcp`，而 `tcp://` 不经过 HTTP proxy，恶意嵌套 playlist 仍可能绕过 guard 直接建连；因此它是经代理 HTTP/HTTPS 的约束机制，不是进程级 egress fail-closed，正式安全门禁前需要 WFP、AppContainer、进程级防火墙或等价网络层。建立隧道后，guard 不检查 TLS SNI、HTTP Host、path/query、method、Header 或响应内容，因此只证明单-authority CONNECT egress 隔离机制可运行，不满足第 6 节的产品安全要求，也不能作为 S3 安全门禁证据。产品若考虑复用 CONNECT 语义，必须另立 ADR 和安全评审，并重新决定认证方式、token/PID 能力边界、可审计性和跨 origin 资源策略；不得以 W0 原型绕过“产品 local relay 不提供通用 CONNECT”的约束。
+
 ## 7. S1 / S2 / S3 拆分与依赖
 
 ### 7.1 S1 完成前的门禁
@@ -652,7 +658,7 @@ S3 不得先把旧 `/api` 的签名 URL 包一层新路径；必须从 ticket �
 11. Range/HEAD 与 HLS init/segment 不因媒体会话授权而被破坏；保留现有 `proxy_range_test.go` 的语义。
 12. 日志/响应 canary：测试生成的 URL query、header、token、Cookie、票据和标题哨兵不得出现在日志、指标 label 或错误 message 中。
 13. `go test -race ./internal/api ./internal/media`，覆盖 ticket claim、刷新并发、会话关闭和 fallback。
-14. local relay 若启用，额外测试 loopback/随机端口、Host、一次性 bootstrap、目标白名单、拒绝 CONNECT/任意 target、跨域重定向、Cookie/Authorization 剥离和日志脱敏。
+14. local relay 若启用，额外测试 loopback/随机端口、Host、一次性 bootstrap、目标白名单、拒绝 CONNECT/任意 target、跨域重定向、Cookie/Authorization 剥离和日志脱敏。Windows W0 egress guard 的 CONNECT/PID 探针不满足此产品测试，也不能改变产品 local relay 继续拒绝通用 CONNECT 的约束。
 
 #### 可复用并有参考价值的现有测试
 

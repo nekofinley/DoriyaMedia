@@ -9,24 +9,85 @@ This is an isolated feasibility prototype. It must not be copied into `clients/w
 The frontend is a control and status surface only. Rust owns:
 
 - mpv sidecar startup and bounded shutdown.
-- A unique Windows named pipe and newline-delimited mpv JSON IPC.
+- An absolute `DORIYA_W0_MPV_PATH` plus a required SHA-256 pin from
+  `DORIYA_W0_MPV_SHA256`. The file is opened without write/delete sharing,
+  hashed, and kept locked until `CreateProcessW` has accepted the image.
+- An optional `DORIYA_W0_MPV_SIGNER_SHA256` publisher pin. When configured,
+  the same locked file handle must also pass embedded Authenticode verification
+  and expose exactly that SHA-256 leaf-signer certificate thumbprint.
+- A host-created, single-instance Windows named pipe with an ACL that grants
+  only the current user, remote clients rejected, and a 128-bit CSPRNG name.
+  The pipe is preconnected before mpv starts. `STARTUPINFOEX` restricts the
+  child handle list to the client stdin and NUL output/error handles; mpv
+  receives `--input-ipc-client=fd://0`.
+- Newline-delimited mpv JSON IPC over a synchronous wrapper around the required
+  overlapped named-pipe I/O.
 - A fixed command allowlist and numeric bounds.
 - HTTPS-only media URL validation, with plain HTTP limited to explicitly enabled loopback test mode.
+  Public HTTPS IP literals are required to be globally routable; loopback,
+  private, link-local, documentation, CGNAT, multicast, selected special-use, and
+  `localhost` targets are rejected. In strict mode, mpv uses a loopback
+  `CONNECT` egress guard whose proxy URL contains no credentials. The guard
+  accepts only the exact HTTPS CONNECT authority selected for the current playback,
+  performs one single-flight DNS resolution outside the global relay lock with
+  a five-second deadline, rejects mixed public/non-public answers, connects
+  only to the pinned numeric addresses, and requires every accepted TCP
+  connection to be owned by the already verified mpv PID plus its original
+  process creation time. The listener uses `SO_EXCLUSIVEADDRUSE`; starting a
+  new playback or disarming the guard actively shuts down registered tunnels.
 - Header validation for only `Accept`, `Accept-Language`, `Origin`, `Referer`, and `User-Agent`.
 - Coded, non-sensitive errors and allowlisted diagnostic fields.
 
-Media URLs and Header values are never placed in mpv command-line arguments, Tauri capabilities, local storage, or application log messages. The media URL and Header values are sent to mpv through a randomly named local pipe after Rust validation. The pipe name uses a 128-bit CSPRNG suffix, and the host verifies that the pipe server PID matches the mpv process it just launched. This validation does not make the pipe a security boundary against a hostile process already running as the same Windows user.
+Media URLs and Header values are never placed in mpv command-line arguments,
+Tauri capabilities, local storage, or application log messages. The pipe name
+is not passed to mpv. The sole preconnected client endpoint is inherited as
+stdin after launch, while the host retains the server endpoint. The host also
+verifies the child's user SID and session and assigns it atomically to a
+`KILL_ON_JOB_CLOSE` Job Object through `PROC_THREAD_ATTRIBUTE_JOB_LIST`. This
+reduces cross-process pipe exposure, but it
+does not make the spike resistant to a hostile process with the same user's
+debug/injection rights.
 
 ## Run
 
-From this directory:
+Strict HTTPS mode (do not set the loopback fixture override):
 
 ```powershell
 pnpm install
 $env:DORIYA_W0_MPV_PATH = 'C:\Program Files\MPV Player\mpv.exe'
-$env:DORIYA_W0_ALLOW_LOOPBACK_HTTP = '1' # only for a local fixture
+$env:DORIYA_W0_MPV_SHA256 = (Get-FileHash -LiteralPath $env:DORIYA_W0_MPV_PATH -Algorithm SHA256).Hash.ToLowerInvariant()
+# $env:DORIYA_W0_MPV_SIGNER_SHA256 = '<64 hex characters from a trusted release>'
+Remove-Item Env:DORIYA_W0_ALLOW_LOOPBACK_HTTP -ErrorAction SilentlyContinue
 pnpm tauri dev
 ```
+
+`DORIYA_W0_MPV_PATH` must be absolute. Startup fails closed when the SHA-256
+value is missing, malformed, or does not match the file. The signer pin is
+optional for local development because the installed development mpv is
+unsigned; when it is set, a missing, invalid, untrusted, or mismatched
+Authenticode signer also fails startup closed.
+
+`DORIYA_W0_ALLOW_LOOPBACK_HTTP=1` is a separate isolated fixture mode honored
+only by debug builds. While enabled, the runtime does not create the strict
+HTTPS egress guard, adds `http` to the mpv process-wide Lavf protocol allowlist,
+and allows the initial URL to load directly from loopback. Nested redirects and
+playlist resources can therefore use HTTP for that process. Do not use this flag
+with production tickets, and do not count direct-fixture results as relay
+evidence.
+
+The sidecar uses `--tls-verify=yes`, `--ytdl=no`, and
+`--network-timeout=15`. It disables config scripts, automatic local file
+loading, external-subtitle autoload, audio-file autoload, and cover-art
+autoload. Candidate Lavf limits are applied with
+`--stream-lavf-o-append` and `--demuxer-lavf-o-append` for the protocol
+allowlist and `max_redirects=3`. These append forms were exercised with the real
+installed mpv and do not break `fd://0` JSON IPC, but a positive/negative
+HTTPS HLS/DASH subresource matrix is still required before treating redirect
+and nested-resource policy as complete.
+
+`status` polling enforces a 30-second `Opening` deadline. If no media reaches
+`file-loaded` within that period, the host stops the sidecar and transitions to
+a stable error instead of remaining in `Opening` indefinitely.
 
 The application does not auto-load media. Use the masked URL input, or provide an environment input before starting:
 
@@ -67,10 +128,47 @@ The Rust tests cover:
   thread, then forcing sidecar termination and state cleanup on timeout.
 - Proving sidecar arguments do not contain media URL, Header, or Cookie material.
 - Clearing the inherited environment and passing only an explicit allowlist to mpv.
-- Generating collision-resistant random pipe names and rejecting a pipe owned by another process.
+- Generating collision-resistant random pipe names, creating a one-ACE
+  current-user DACL, rejecting remote clients, and proving a second client
+  cannot attach to the preconnected single-instance pipe.
+- Proving an arbitrary inheritable parent file handle is absent from the
+  restricted child handle list.
+- Verifying the launched process user SID and session, and failing closed on a
+  mismatch using the original process handle rather than reopening a PID.
+- Asserting Job Object `KILL_ON_JOB_CLOSE`, job membership, and child termination
+  when the job handle closes.
+- Enforcing one shared five-second deadline across multi-request `open`,
+  `control`, and `status` operations.
+- Giving cold process launch and the first IPC acknowledgement one shared
+  fifteen-second startup deadline, and making an auto-starting `open`/`control`
+  use a single fifteen-second-plus-five-second absolute budget; warm runtime
+  operations remain limited to five seconds.
+- Requiring an absolute mpv path and matching SHA-256 pin before process
+  creation, then holding the verification handle without write/delete sharing
+  until the image has been passed to `CreateProcessW`.
+- Verifying an optional embedded Authenticode leaf-signer SHA-256 thumbprint
+  through the same locked handle before process creation.
+- Enforcing the sidecar script/autoload switches, Lavf protocol allowlist and
+  redirect limit in command-line tests, and exercising that argument set against
+  the real installed mpv over `fd://0` IPC.
+- Releasing the sidecar and reporting a stable error when `status` polling sees
+  the 30-second `file-loaded` deadline expire.
+- Loading a Header-protected loopback MP4 through the full Tauri controller,
+  pausing, issuing 20 relative seeks, resuming playback, and verifying no stale
+  player error or leftover sidecar state.
 - Keeping failed starts/open operations from publishing loaded or stale-session state.
 - Replacing a reaped runtime on a later start and clearing state after control transport failure.
 - Reading the current pause property before toggling instead of deriving it from stale UI metrics.
+- Strict HTTP/1.1 `CONNECT` parsing, exact origin matching, one-time DNS
+  resolution and pinning per playback, mixed private/public answer rejection,
+  absolute header deadlines, bounded read/write tunnel timeouts, and
+  generation-based tunnel shutdown.
+- Windows TCP-table ownership lookup for the client-side ESTABLISHED loopback
+  row, including byte-order decoding and rejection when the connection owner is
+  not the bound mpv PID or its verified creation time. The loopback listener
+  rejects same-port rebinding with `SO_EXCLUSIVEADDRUSE`.
+- A real installed-mpv HTTPS probe that requires the relay to complete an
+  owner-bound CONNECT response, not merely accept the client socket.
 
 The installed-mpv integration test is opt-in because it starts a real process:
 
@@ -78,7 +176,39 @@ The installed-mpv integration test is opt-in because it starts a real process:
 cargo test --locked installed_mpv_accepts_json_ipc_and_shuts_down -- --ignored --nocapture
 ```
 
-It opens an mpv sidecar with no media, verifies the `mpv-version` response through JSON IPC, and verifies process and pipe cleanup.
+It opens an mpv sidecar with no media, verifies the `mpv-version` response through
+JSON IPC, and verifies process and pipe cleanup. The installed mpv binary uses
+the `fd://0` IPC-client form; the client pipe is inherited as stdin.
+
+The header/seek fixture integration test is also opt-in and requires Python:
+
+```powershell
+cargo test --locked installed_mpv_loads_header_protected_loopback_fixture_and_seeks -- --ignored --nocapture
+```
+
+It starts `fixtures/header-range-server.py` on `127.0.0.1`, loads
+`fixtures/synthetic/s1-h264-aac.mp4` through the real Tauri player controller,
+requires matching `Referer` and `User-Agent`, performs 20 seeks while paused,
+and resumes playback. This is mechanism evidence only; it does not replace real
+S1-S5 media, network, timing, or device acceptance. The test enables the direct
+loopback HTTP fixture mode, so it does not exercise or validate the CONNECT
+egress guard.
+
+The public HTTPS relay probe is opt-in and requires network access:
+
+```powershell
+cargo test --locked installed_mpv_routes_public_https_through_connect_relay -- --ignored --nocapture
+```
+
+It starts the real mpv sidecar in strict mode, injects the credential-free
+loopback proxy URL through JSON IPC, loads `https://example.com/`, and requires
+the relay to write the successful CONNECT response for a tunnel whose Windows
+TCP-table owner PID and process creation time match the verified mpv sidecar.
+FFmpeg sends `Host` as the proxy loopback authority rather than the target
+authority; the parser accepts only that exact proxy authority or the exact
+CONNECT target. On 2026-11-01 this probe passed 3/3 after the hardening
+changes. It is egress guard mechanism evidence only and does not establish
+product `local-relay`.
 
 The full Tauri executable build requires an MSVC environment. From this directory:
 
@@ -88,7 +218,7 @@ cmd.exe /d /s /c '"C:\Program Files\Microsoft Visual Studio\2022\Community\Commo
 
 `--no-bundle` is intentional: this Spike does not create a distributable installer and does not copy or package mpv, FFmpeg, VLC, or their codecs.
 
-Local verification on 2026-10-28:
+Local verification on 2026-11-01:
 
 | Gate | Result |
 | --- | --- |
@@ -96,8 +226,10 @@ Local verification on 2026-10-28:
 | `pnpm build` | Pass |
 | `cargo fmt --all -- --check` | Pass |
 | `cargo clippy --all-targets --locked -- -D warnings` | Pass |
-| `cargo test --locked` | Pass: 32 passed, 1 opt-in test ignored |
-| Installed-mpv IPC smoke test | Pass: 1/1 |
+| `cargo test --locked` | Pass: 75 passed, 3 opt-in tests ignored |
+| Installed-mpv IPC smoke test | Pass: 3/3 consecutive runs |
+| Header-protected loopback MP4 + 20 seeks | Pass: 3/3 consecutive runs |
+| Public HTTPS CONNECT with mpv owner-PID binding | Pass: 3/3 consecutive runs |
 | `pnpm tauri build --debug --no-bundle` | Pass |
 | Explorer-launched GUI smoke | Pass: window created, process responsive, clean process exit |
 
@@ -111,12 +243,13 @@ The following remain **open W0 gates** and must not be inferred from passing uni
 
 - Real S1-S5 media playback, including MKV, HEVC 10-bit, FLAC, ASS/PGS, Range and Header behavior.
 - Any 30-minute continuous playback run.
-- 20 random seeks per sample, seek recovery, or audio/video offset measurement against the 100 ms gate.
+- 20 random seeks on each real S1-S5 sample, seek recovery, or audio/video offset measurement against the 100 ms gate. The synthetic loopback fixture covers controller/seek mechanics only.
 - Fullscreen, 100%/150%/200% DPI, single/dual display, display hot-plug, sleep/resume, or window crossing.
 - Windows 11, Intel/NVIDIA/AMD device matrix, Wi-Fi/hotspot/VPN/region changes.
 - Real Bilibili dual-stream `direct-dash`, audio/video merge, or expiry/fallback behavior.
 - License/distribution review for the installed mpv, FFmpeg and codec builds.
-- Production ticket storage, authentication, refresh, or relay.
+- Production ticket storage, authentication, refresh, or the product
+  `local-relay` transport. The W0 loopback egress guard is not that transport.
 
 ## Toolchain notes
 
@@ -128,15 +261,62 @@ The following remain **open W0 gates** and must not be inferred from passing uni
 ## Security limitations
 
 - The control UI is not authenticated. A production shell needs a device authorization design and a trusted ticket source.
-- The named pipe is randomly named, local-only, and PID-checked, but it does not yet have a complete DACL/SID/session peer-trust policy. Same-user malicious processes may still inspect or connect to it.
-- Blocking pipe I/O runs on a worker thread. Every request has a fixed five-second
-  deadline; a timeout is treated as fatal and triggers bounded forced termination
-  of the sidecar. The detached worker can only exit after the closed pipe unblocks.
+- The pipe's DACL, single-instance preconnection, inherited client handle,
+  process identity check, and Job Object replace the old PID-only path. This is
+  still not anti-tamper protection against a same-user process with debug or
+  injection rights.
+- Pending overlapped I/O is cancelled and synchronously reaped before its
+  `OVERLAPPED` storage is released; preconnection participates in the shared
+  fifteen-second startup deadline. Blocking pipe I/O still runs on a worker thread. Multi-request
+  operations share one five-second operation deadline, while a blocked worker
+  can remain detached until the pipe closes.
+- `PROC_THREAD_ATTRIBUTE_JOB_LIST` assigns the child to the Job Object during
+  process creation, and the child handle list contains only stdin and NUL.
+- An IPC timeout is treated as fatal and triggers bounded forced termination of
+  the sidecar. The detached worker can only exit after the closed pipe unblocks.
 - `loadfile` acceptance is not treated as proof that media loaded; `file-loaded`
   and `end-file` now drive the stable state. mpv events do not carry the
   application request ID, so old-generation isolation still depends on the
   `start-file` barrier and mpv event ordering.
-- Forced child wait after a kill attempt is bounded, but a Windows Job Object is not yet used to guarantee sidecar cleanup after a host crash.
-- The sidecar executable identity and redirect policy are not yet pinned or verified beyond the configured path/PATH lookup.
+- The sidecar supports an optional Authenticode leaf-signer thumbprint pin, but
+  no signed mpv distribution, signed version manifest, production-enforced
+  publisher gate, signer rotation/revocation policy, or update channel exists
+  yet.
+- Lavf stream/demuxer protocol allowlists and a redirect limit are configured,
+  and the strict W0 egress guard now resolves and pins one exact HTTPS CONNECT
+  authority per playback. It compares only host and port; after the tunnel is
+  established it does not inspect TLS SNI, HTTP Host, path, query, method,
+  Header or response content. It is deliberately not a general local relay:
+  cross-origin redirects, HLS/DASH child origins, per-stream origins and
+  automatic URL refresh currently fail closed. DNS is not re-resolved within a
+  playback; CDN/DNS rotation or URL refresh requires a new playback, and strict
+  DNS/PID/relay failures do not fall back to direct connections. HTTPS
+  HLS/DASH redirect, nested-resource, cross-origin Header propagation and
+  compatibility tests are not complete.
+- **Open P1 egress risk:** real HTTPS requires `tcp` in the Lavf protocol
+  whitelist. Lavf accepts `tcp://` without using the HTTP proxy, so a malicious
+  nested playlist may bypass the CONNECT guard and open a direct TCP connection.
+  The W0 guard therefore confines proxied HTTP/HTTPS traffic; it is **not** a
+  process-level egress fail-closed boundary. A production security gate needs
+  WFP, AppContainer, a process firewall, or an equivalent network layer.
+- PID plus process-creation-time matching is process-ownership association,
+  not cryptographic authentication. Creation-time binding closes ordinary PID
+  reuse, but handle duplication, kernel compromise, and a hostile same-user
+  process with debugging or injection rights remain outside this spike's
+  threat model. The guard remains a W0 mechanism, not the product
+  `local-relay` transport or a ticket/session implementation.
+- `DORIYA_W0_ALLOW_LOOPBACK_HTTP=1` is honored only by debug builds. Release
+  builds always stay on the strict HTTPS/relay path, but the W0 spike still has
+  no production configuration or trust boundary for this environment switch.
+- Disarming closes every registered tunnel, but shutdown is not a complete
+  cancellation barrier for work still inside a non-cancellable DNS lookup or
+  an already-started five-second upstream connect. That handler may remain
+  detached briefly after `stop()`'s two-second wait; its next generation and
+  shutdown checks prevent sustained tunneling or a later successful session.
+- The five-second DNS deadline bounds how long a CONNECT handler waits, not the
+  underlying `ToSocketAddrs` worker. Standard Windows resolution is not exposed
+  here as a cancellable operation, so a stuck resolver worker may remain
+  detached after the relay has disarmed.
 - URL and Header values necessarily exist in process memory when handed to mpv; this prototype minimizes persistence and logging, not memory exposure.
-- mpv is chosen from `DORIYA_W0_MPV_PATH`, otherwise `mpv` from `PATH`. Production needs a signed, versioned sidecar and explicit license review.
+- Production still needs a signed, versioned sidecar, a reproducible hash
+  manifest, and explicit license review.

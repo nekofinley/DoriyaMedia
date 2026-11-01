@@ -51,6 +51,21 @@ Instrumented tests include:
   system image's `c2.goldfish.h264.decoder` currently fails at the Codec2
   buffer layer on this host; this workaround isolates the merge mechanism and
   is not evidence for a product decode path.
+- A real TLS `MockWebServer` fixture with a per-test trust anchor. Request-level
+  tests verify independent per-stream allowlisted Headers, GET and HEAD,
+  Range/206/416 and `Content-Range`, same-origin redirect Header retention,
+  no server-cookie replay, a production `CookieJar.NO_COOKIES` override,
+  `Proxy.NO_PROXY`, and application-layer cross-origin redirect rejection
+  before the target opens a DNS lookup or socket.
+- DNS and direct-IP validation accept only public addresses. Every nested
+  Media3 DataSource open must use HTTPS without userinfo, so a remote playlist
+  cannot fall back to `file:`, `content:`, `udp:`, or `data:`.
+- An end-to-end Media3 merge test that reads two separate HTTPS MP4 resources,
+  verifies each request carries only its stream's Headers, and reaches
+  `STATE_READY` with both video and audio tracks. Separate tests verify that
+  each stream supplies its own `MediaItem.localConfiguration.mimeType` hint and
+  that the production factory invokes that mapper for Single and both Merge
+  streams; container MIME is not sent as an HTTP Header.
 
 ## Commands
 
@@ -71,21 +86,23 @@ The script creates its AVD under the ignored `artifacts/` directory, installs
 the app, launches `MainActivity`, captures the UI/screenshot, runs connected
 tests, and calls `adb emu kill` in `finally`.
 
-## Current results (2026-10-28)
+## Current results (2026-11-01)
 
 Mechanism validation only:
 
 | Check | Result |
 | --- | --- |
-| `:app:lintDebug` | Passed: 0 errors, 10 version warnings |
-| `:app:testDebugUnitTest` | Passed: 24 tests, 0 failures |
+| `:app:lintDebug` | Passed: 0 errors, 11 dependency-version warnings |
+| `:app:testDebugUnitTest` | Passed: 33 tests, 0 failures |
 | `:app:assembleDebug` | Passed; debug APK generated |
 | `:app:assembleDebugAndroidTest` | Passed; test APK compiled |
-| API 37 x86_64 ATD `connectedDebugAndroidTest` | Passed: 4 tests, 0 failures; Ready, dual tracks, seek discontinuity, position advancement, play/pause, separate per-stream factory wiring, merge UI, and video-surface assertions |
+| API 37 x86_64 ATD `connectedDebugAndroidTest` | Passed: 15 tests, 0 failures; existing playback/UI coverage plus real TLS GET/HEAD/206/416, per-stream Headers, redirect/cookie/proxy isolation, HTTPS-only nested DataSource rejection, Single/Merge MediaItem MIME wiring, and HTTPS dual-source Media3 merge |
 | APK install and cold `MainActivity` launch | Passed: `topResumedActivity` set, UI text found, no app-level runtime errors |
 | APK metadata | `minSdk=28`, `targetSdk=37`, package `com.doriyamedia.spike` |
 
-The connected run used the isolated `A0_API_37_ATD` AVD under `artifacts/`.
+The final API 37 x86_64 ATD connected run passed 15/15 tests after the last
+instrumented assertion was added. The connected run used the isolated
+`A0_API_37_ATD` AVD under `artifacts/`.
 It booted successfully with about 7.7 GB free on C:. The screenshot from the
 headless ATD was black, so UI presence is based on `uiautomator` output rather
 than screenshot inspection.
@@ -97,20 +114,27 @@ Not executed:
 - Wi-Fi, 5G, hotspot, VPN and different source egress matrix.
 - Real Bilibili `direct-dash` URLs/Headers and audio/video synchronization.
 - Real CDN redirect behavior. The current policy intentionally rejects every
-  cross-origin redirect; only a local MockWebServer mechanism test exists.
-- Per-stream Range behavior and real source response variants. Range is left to
-  Media3/OkHttp and is not directly asserted by this spike.
+  cross-origin redirect; the HTTPS MockWebServer fixture only validates the
+  local mechanism.
+- Standard NAT64 prefix (`64:ff9b::/96`) is deliberately rejected instead of
+  decoding embedded IPv4. An operator-defined RFC 6052 prefix inside a broad
+  RIR allocation cannot be identified from the IPv6 address alone; this
+  residual SSRF boundary depends on the local NAT64 gateway rejecting private
+  embedded IPv4 mappings.
+- Per-stream Range behavior against a real CDN or expiring signed URL. The local
+  fixture validates GET/HEAD/206/416 and `Content-Range` plumbing only.
 - Media3 + FFmpeg extension and libmpv comparison.
 - CPU, battery, memory, subtitle and long-duration measurements.
 
 ## Acceptance boundary
 
 This validates input handling, per-stream Header/MIME wiring, same-origin
-redirect enforcement, log redaction, Media3 merge API wiring, Android
-build/lint/unit tests, API 37 x86_64 ATD installation, and synthetic local
-merge tests. It does **not** close A0 or S5. Real-device capability, actual
-Bilibili DASH merge, audio/video sync, real codec behavior, Range behavior and
-the device/network matrix remain unverified. The ADR is
+redirect enforcement, cookie isolation, local HTTPS Range plumbing, log
+redaction, Media3 merge API wiring, Android build/lint/unit tests, API 37
+x86_64 ATD installation, and synthetic local merge tests. It does **not**
+close A0 or S5. Real-device capability, actual Bilibili DASH merge,
+audio/video sync, real codec behavior, real CDN Range/expiry behavior and the
+device/network matrix remain unverified. The ADR is
 `docs/adr/0003-android-player-engine.md` and intentionally remains
 `Proposed / 待真机验证`.
 

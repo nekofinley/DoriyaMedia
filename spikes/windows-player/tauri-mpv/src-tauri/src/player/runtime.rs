@@ -1,21 +1,47 @@
 use std::env;
 use std::ffi::OsString;
+#[cfg(windows)]
+use std::fs::{self, File, OpenOptions};
+#[cfg(windows)]
+use std::io::Read;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(not(windows))]
+use std::process::Child as PlatformChild;
+use std::process::ExitStatus;
+#[cfg(test)]
+use std::process::{Child, Command};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
+#[cfg(windows)]
+use super::authenticode::{verify_embedded_signature, SignatureError};
 use super::ipc::{EndFileReason, IpcConnection, IpcError, IpcReply, JsonPipe, MpvEvent};
 use super::media::ValidatedMedia;
+use super::relay::RelayProxy;
+#[cfg(windows)]
+use super::windows_security::{
+    current_user_session_id, current_user_sid, verify_process_identity, JobObject, NamedPipeServer,
+    PipeError, SidecarChild as PlatformChild,
+};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // Keep every request bounded without turning a transient scheduler stall into a
 // permanent player failure on a busy desktop.
 const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const IPC_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+// Process launch and the first IPC acknowledgement are slower than ordinary
+// control requests on cold disks. Keep them bounded but separate.
+const MPV_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const MEDIA_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_millis(1500);
 const FORCED_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const PIPE_NAME_PREFIX: &str = r"\\.\pipe\doriya-w0-";
@@ -51,15 +77,26 @@ const SIDECAR_ENV_ALLOWLIST: &[&str] = &[
     "WINDIR",
 ];
 
+fn capped_startup_deadline(request_deadline: Instant) -> Instant {
+    request_deadline.min(Instant::now() + MPV_STARTUP_TIMEOUT)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlayerError {
     MpvExecutableMissing,
+    MpvIdentityMissing,
+    MpvIdentityInvalid,
+    MpvIdentityMismatch,
+    MpvPublisherInvalid,
+    MpvSignatureMissing,
+    MpvSignatureInvalid,
+    MpvPublisherMismatch,
     MpvStartFailed,
+    MediaOpenTimeout,
     IpcTimeout,
     IpcIo,
     IpcProtocol,
     IpcRejected,
-    IpcPeerMismatch,
     MediaLoadFailed,
     Exited,
     InvalidCommand,
@@ -70,12 +107,19 @@ impl PlayerError {
     pub const fn code(self) -> &'static str {
         match self {
             Self::MpvExecutableMissing => "mpv_executable_missing",
+            Self::MpvIdentityMissing => "mpv_identity_missing",
+            Self::MpvIdentityInvalid => "mpv_identity_invalid",
+            Self::MpvIdentityMismatch => "mpv_identity_mismatch",
+            Self::MpvPublisherInvalid => "mpv_publisher_invalid",
+            Self::MpvSignatureMissing => "mpv_signature_missing",
+            Self::MpvSignatureInvalid => "mpv_signature_invalid",
+            Self::MpvPublisherMismatch => "mpv_publisher_mismatch",
             Self::MpvStartFailed => "mpv_start_failed",
+            Self::MediaOpenTimeout => "mpv_media_open_timeout",
             Self::IpcTimeout => "mpv_ipc_timeout",
             Self::IpcIo => "mpv_ipc_io",
             Self::IpcProtocol => "mpv_ipc_protocol",
             Self::IpcRejected => "mpv_ipc_rejected",
-            Self::IpcPeerMismatch => "mpv_ipc_peer_mismatch",
             Self::MediaLoadFailed => "mpv_media_load_failed",
             Self::Exited => "mpv_exited",
             Self::InvalidCommand => "invalid_command",
@@ -86,14 +130,29 @@ impl PlayerError {
     pub const fn message(self) -> &'static str {
         match self {
             Self::MpvExecutableMissing => "The mpv executable could not be found.",
+            Self::MpvIdentityMissing => "The mpv executable SHA-256 identity is not configured.",
+            Self::MpvIdentityInvalid => {
+                "The configured mpv executable SHA-256 identity is invalid."
+            }
+            Self::MpvIdentityMismatch => {
+                "The mpv executable does not match the configured SHA-256 identity."
+            }
+            Self::MpvPublisherInvalid => {
+                "The configured mpv publisher SHA-256 identity is invalid."
+            }
+            Self::MpvSignatureMissing => "The mpv executable is not Authenticode-signed.",
+            Self::MpvSignatureInvalid => {
+                "The mpv executable's Authenticode signature is invalid or untrusted."
+            }
+            Self::MpvPublisherMismatch => {
+                "The mpv executable signer does not match the configured publisher identity."
+            }
             Self::MpvStartFailed => "The mpv sidecar could not be started.",
+            Self::MediaOpenTimeout => "Timed out while waiting for media to load.",
             Self::IpcTimeout => "Timed out while communicating with the mpv IPC pipe.",
             Self::IpcIo => "The mpv IPC connection failed.",
             Self::IpcProtocol => "mpv returned an invalid IPC response.",
             Self::IpcRejected => "mpv rejected the command.",
-            Self::IpcPeerMismatch => {
-                "The mpv IPC pipe did not belong to the process launched by Doriya."
-            }
             Self::MediaLoadFailed => "mpv could not load the requested media.",
             Self::Exited => "The mpv sidecar exited.",
             Self::InvalidCommand => "The playback command or value is invalid.",
@@ -167,6 +226,7 @@ struct PlaybackMetrics {
 
 struct PendingLoad {
     saw_start: bool,
+    deadline: Instant,
 }
 
 struct CommandReply {
@@ -226,11 +286,17 @@ impl PlayerController {
     }
 
     pub fn open(&mut self, media: ValidatedMedia) -> Result<PlayerSnapshot, PlayerError> {
-        self.ensure_runtime()?;
+        let deadline = Instant::now() + self.command_deadline_budget();
+        self.ensure_runtime_until(deadline)?;
+        if let Err(error) = self.configure_relay_for_media(&media, deadline) {
+            self.fail_and_cleanup(error);
+            return Err(error);
+        }
         // Flush events already queued for the previous load before starting a new generation.
-        if let Err(error) =
-            self.runtime_command_ignoring_events(&json!(["get_property", "mpv-version"]))
-        {
+        if let Err(error) = self.runtime_command_ignoring_events_until(
+            &json!(["get_property", "mpv-version"]),
+            deadline,
+        ) {
             self.fail_and_cleanup(error);
             return Err(error);
         }
@@ -244,14 +310,13 @@ impl PlayerController {
         log_count("header_allowlist_count", headers.len());
         let result = (|| {
             // Any end-file from the previous item belongs to the old generation.
-            self.runtime_command_ignoring_events(&json!(["stop"]))?;
-            self.runtime_command_ignoring_events(&json!([
-                "set_property",
-                "http-header-fields",
-                headers
-            ]))?;
-            self.runtime_command(&json!(["loadfile", media.url()]))?;
-            self.runtime_command(&json!(["set_property", "pause", false]))?;
+            self.runtime_command_ignoring_events_until(&json!(["stop"]), deadline)?;
+            self.runtime_command_ignoring_events_until(
+                &json!(["set_property", "http-header-fields", headers]),
+                deadline,
+            )?;
+            self.runtime_command_until(&json!(["loadfile", media.url()]), deadline)?;
+            self.runtime_command_until(&json!(["set_property", "pause", false]), deadline)?;
             Ok::<(), PlayerError>(())
         })();
 
@@ -289,25 +354,29 @@ impl PlayerController {
             _ => {}
         }
 
-        self.ensure_runtime()?;
+        let deadline = Instant::now() + self.command_deadline_budget();
+        self.ensure_runtime_until(deadline)?;
 
         let result = (|| {
             let (next_state, next_paused, next_volume) = match command {
                 PlaybackCommand::Play => {
-                    self.runtime_command(&json!(["set_property", "pause", false]))?;
+                    self.runtime_command_until(&json!(["set_property", "pause", false]), deadline)?;
                     (Some(PlayerState::Playing), Some(false), None)
                 }
                 PlaybackCommand::Pause => {
-                    self.runtime_command(&json!(["set_property", "pause", true]))?;
+                    self.runtime_command_until(&json!(["set_property", "pause", true]), deadline)?;
                     (Some(PlayerState::Paused), Some(true), None)
                 }
                 PlaybackCommand::TogglePause => {
                     let paused = !self
-                        .runtime_command(&json!(["get_property", "pause"]))?
+                        .runtime_command_until(&json!(["get_property", "pause"]), deadline)?
                         .data
                         .and_then(|value| value.as_bool())
                         .ok_or(PlayerError::IpcProtocol)?;
-                    self.runtime_command(&json!(["set_property", "pause", paused]))?;
+                    self.runtime_command_until(
+                        &json!(["set_property", "pause", paused]),
+                        deadline,
+                    )?;
                     (
                         Some(if paused {
                             PlayerState::Paused
@@ -319,15 +388,18 @@ impl PlayerController {
                     )
                 }
                 PlaybackCommand::Seek(seconds) => {
-                    self.runtime_command(&json!(["seek", seconds, "relative"]))?;
+                    self.runtime_command_until(&json!(["seek", seconds, "relative"]), deadline)?;
                     (None, None, None)
                 }
                 PlaybackCommand::SetVolume(volume) => {
-                    self.runtime_command(&json!(["set_property", "volume", volume]))?;
+                    self.runtime_command_until(
+                        &json!(["set_property", "volume", volume]),
+                        deadline,
+                    )?;
                     (None, None, Some(volume))
                 }
                 PlaybackCommand::ToggleFullscreen => {
-                    self.runtime_command(&json!(["cycle", "fullscreen"]))?;
+                    self.runtime_command_until(&json!(["cycle", "fullscreen"]), deadline)?;
                     (None, None, None)
                 }
             };
@@ -382,7 +454,7 @@ impl PlayerController {
             return self.snapshot();
         }
 
-        let result = self.read_status_metrics();
+        let result = self.read_status_metrics(Instant::now() + self.operation_timeout());
         if let Err(error) = result {
             self.fail_and_cleanup(error);
             return self.snapshot();
@@ -391,19 +463,17 @@ impl PlayerController {
         if self.terminal_event_error().is_some() {
             return self.snapshot();
         }
+        if self.opening_timed_out() {
+            self.fail_and_cleanup(PlayerError::MediaOpenTimeout);
+            return self.snapshot();
+        }
 
         if self.media_loaded {
-            if self.status_metrics.position_seconds.is_some()
-                || self.status_metrics.duration_seconds.is_some()
-            {
-                self.state = if self.status_metrics.paused == Some(true) {
-                    PlayerState::Paused
-                } else {
-                    PlayerState::Playing
-                };
+            self.state = if self.status_metrics.paused == Some(true) {
+                PlayerState::Paused
             } else {
-                self.state = PlayerState::Opening;
-            }
+                PlayerState::Playing
+            };
         } else if self.pending_load.is_some() {
             self.state = PlayerState::Opening;
         } else if self.runtime.is_some() {
@@ -427,11 +497,52 @@ impl PlayerController {
         let _ = self.stop();
     }
 
-    fn ensure_runtime(&mut self) -> Result<(), PlayerError> {
+    fn command_deadline_budget(&self) -> Duration {
         if self.runtime.is_none() {
-            self.start()?;
+            MPV_STARTUP_TIMEOUT + IPC_OPERATION_TIMEOUT
+        } else {
+            self.operation_timeout()
+        }
+    }
+
+    fn ensure_runtime_until(&mut self, deadline: Instant) -> Result<(), PlayerError> {
+        if self.runtime.is_none() {
+            let startup_deadline = capped_startup_deadline(deadline);
+            self.start_with(|| MpvRuntime::spawn_until(startup_deadline))?;
         } else {
             self.check_runtime_exit()?;
+        }
+        Ok(())
+    }
+
+    fn configure_relay_for_media(
+        &mut self,
+        media: &ValidatedMedia,
+        deadline: Instant,
+    ) -> Result<(), PlayerError> {
+        let proxy_url = {
+            let runtime = self.runtime.as_ref().ok_or(PlayerError::Internal)?;
+            match runtime.egress_mode {
+                EgressMode::RelayRequired => {
+                    let relay = runtime.relay.as_ref().ok_or(PlayerError::Internal)?;
+                    let origin = media.relay_origin().ok_or(PlayerError::Internal)?;
+                    Some(
+                        relay
+                            .begin_playback(origin)
+                            .map_err(|_| PlayerError::Internal)?,
+                    )
+                }
+                EgressMode::DirectLoopbackFixture if media.url_scheme() == "http" => None,
+                EgressMode::DirectLoopbackFixture => return Err(PlayerError::Internal),
+                #[cfg(test)]
+                EgressMode::TestFake => None,
+            }
+        };
+        if let Some(proxy_url) = proxy_url {
+            self.runtime_command_ignoring_events_until(
+                &json!(["set_property", "http-proxy", proxy_url]),
+                deadline,
+            )?;
         }
         Ok(())
     }
@@ -464,30 +575,30 @@ impl PlayerController {
         }
     }
 
-    fn read_status_metrics(&mut self) -> Result<(), PlayerError> {
+    fn read_status_metrics(&mut self, deadline: Instant) -> Result<(), PlayerError> {
         let paused = self
-            .runtime_optional_command(&json!(["get_property", "pause"]))?
+            .runtime_optional_command_until(&json!(["get_property", "pause"]), deadline)?
             .data
             .and_then(|value| value.as_bool());
         if self.terminal_event_error().is_some() {
             return Ok(());
         }
         let position = self
-            .runtime_optional_command(&json!(["get_property", "time-pos"]))?
+            .runtime_optional_command_until(&json!(["get_property", "time-pos"]), deadline)?
             .data
             .and_then(numeric_or_null);
         if self.terminal_event_error().is_some() {
             return Ok(());
         }
         let duration = self
-            .runtime_optional_command(&json!(["get_property", "duration"]))?
+            .runtime_optional_command_until(&json!(["get_property", "duration"]), deadline)?
             .data
             .and_then(numeric_or_null);
         if self.terminal_event_error().is_some() {
             return Ok(());
         }
         let volume = self
-            .runtime_optional_command(&json!(["get_property", "volume"]))?
+            .runtime_optional_command_until(&json!(["get_property", "volume"]), deadline)?
             .data
             .and_then(numeric_or_null);
         self.status_metrics.paused = paused;
@@ -498,34 +609,61 @@ impl PlayerController {
     }
 
     fn begin_load(&mut self) {
-        self.pending_load = Some(PendingLoad { saw_start: false });
+        self.pending_load = Some(PendingLoad {
+            saw_start: false,
+            deadline: Instant::now() + MEDIA_OPEN_TIMEOUT,
+        });
         self.media_loaded = false;
         self.status_metrics = PlaybackMetrics::default();
     }
 
-    fn runtime_command(&mut self, command: &Value) -> Result<CommandReply, PlayerError> {
-        let reply = self.runtime_mut()?.command(command)?;
-        self.apply_events(reply.events);
-        Ok(CommandReply {
-            data: reply.data,
-            events: Vec::new(),
-        })
+    fn opening_timed_out(&self) -> bool {
+        self.pending_load
+            .as_ref()
+            .is_some_and(|pending| !self.media_loaded && Instant::now() >= pending.deadline)
     }
 
-    fn runtime_optional_command(&mut self, command: &Value) -> Result<CommandReply, PlayerError> {
-        let reply = self.runtime_mut()?.optional_command(command)?;
-        self.apply_events(reply.events);
-        Ok(CommandReply {
-            data: reply.data,
-            events: Vec::new(),
-        })
+    fn operation_timeout(&self) -> Duration {
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.operation_timeout)
+            .unwrap_or(IPC_OPERATION_TIMEOUT)
     }
 
-    fn runtime_command_ignoring_events(
+    fn runtime_command_until(
         &mut self,
         command: &Value,
+        deadline: Instant,
     ) -> Result<CommandReply, PlayerError> {
-        self.runtime_mut()?.command(command)
+        let reply = self.runtime_mut()?.command_until(command, deadline)?;
+        self.apply_events(reply.events);
+        Ok(CommandReply {
+            data: reply.data,
+            events: Vec::new(),
+        })
+    }
+
+    fn runtime_optional_command_until(
+        &mut self,
+        command: &Value,
+        deadline: Instant,
+    ) -> Result<CommandReply, PlayerError> {
+        let reply = self
+            .runtime_mut()?
+            .optional_command_until(command, deadline)?;
+        self.apply_events(reply.events);
+        Ok(CommandReply {
+            data: reply.data,
+            events: Vec::new(),
+        })
+    }
+
+    fn runtime_command_ignoring_events_until(
+        &mut self,
+        command: &Value,
+        deadline: Instant,
+    ) -> Result<CommandReply, PlayerError> {
+        self.runtime_mut()?.command_until(command, deadline)
     }
 
     fn apply_events(&mut self, events: Vec<MpvEvent>) {
@@ -644,68 +782,133 @@ impl Drop for PlayerController {
 }
 
 struct MpvRuntime {
-    child: Option<Child>,
+    child: Option<PlatformChild>,
     ipc: Option<IpcWorker>,
+    relay: Option<RelayProxy>,
+    egress_mode: EgressMode,
     next_request_id: u64,
+    operation_timeout: Duration,
+    #[cfg(windows)]
+    job: Option<JobObject>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EgressMode {
+    RelayRequired,
+    DirectLoopbackFixture,
+    #[cfg(test)]
+    TestFake,
 }
 
 impl MpvRuntime {
+    #[cfg(windows)]
     fn spawn() -> Result<Self, PlayerError> {
-        let executable = mpv_executable();
+        Self::spawn_until(Instant::now() + MPV_STARTUP_TIMEOUT)
+    }
+
+    #[cfg(windows)]
+    fn spawn_until(startup_deadline: Instant) -> Result<Self, PlayerError> {
+        let executable = verified_mpv_executable()?;
+        let direct_loopback_fixture = loopback_http_enabled();
+        let egress_mode = if direct_loopback_fixture {
+            EgressMode::DirectLoopbackFixture
+        } else {
+            EgressMode::RelayRequired
+        };
+        let relay = if direct_loopback_fixture {
+            None
+        } else {
+            Some(RelayProxy::start().map_err(|_| PlayerError::MpvStartFailed)?)
+        };
         let pipe_path = next_pipe_path()?;
-        let args = mpv_arguments(&pipe_path);
+        let user_sid = current_user_sid().map_err(|error| {
+            log_pipe_error("mpv_user_sid_error", error);
+            PlayerError::MpvStartFailed
+        })?;
+        let user_session_id = current_user_session_id().map_err(|error| {
+            log_pipe_error("mpv_user_session_error", error);
+            PlayerError::MpvStartFailed
+        })?;
+        let pipe_server = NamedPipeServer::create(&pipe_path, &user_sid).map_err(|error| {
+            log_pipe_error("mpv_pipe_create_error", error);
+            PlayerError::MpvStartFailed
+        })?;
+        let client = pipe_server
+            .connect_client_until(startup_deadline)
+            .map_err(|error| {
+                log_pipe_error("mpv_pipe_client_error", error);
+                PlayerError::MpvStartFailed
+            })?;
+        let args = mpv_arguments();
+        let job = JobObject::new_kill_on_close().map_err(|error| {
+            log_pipe_error("mpv_job_create_error", error);
+            PlayerError::MpvStartFailed
+        })?;
 
-        let mut command = Command::new(executable);
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        configure_sidecar_environment(&mut command);
-        configure_hidden_process(&mut command);
-
-        let mut child = command.spawn().map_err(|error| {
+        let environment = sidecar_environment();
+        let mut child = PlatformChild::spawn_restricted(
+            executable.path.as_os_str(),
+            &args,
+            &environment,
+            client,
+            &job,
+        )
+        .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 PlayerError::MpvExecutableMissing
             } else {
                 PlayerError::MpvStartFailed
             }
         })?;
+        // The verification handle denies write/delete sharing until the image
+        // has been handed to CreateProcessW, closing the hash/spawn swap gap.
+        drop(executable);
 
-        let deadline = Instant::now() + CONNECT_TIMEOUT;
-        let ipc = loop {
-            if child
-                .try_wait()
-                .map_err(|_| PlayerError::MpvStartFailed)?
-                .is_some()
-            {
-                let _ = child.wait();
+        if let Err(error) = job.ensure_assigned(&child) {
+            log_pipe_error("mpv_job_assign_error", error);
+            terminate_child(&mut child);
+            return Err(PlayerError::MpvStartFailed);
+        }
+        if let Err(error) = verify_process_identity(&child, &user_sid, user_session_id) {
+            log_pipe_error("mpv_process_identity_error", error);
+            terminate_child(&mut child);
+            return Err(PlayerError::MpvStartFailed);
+        }
+
+        if child
+            .try_wait()
+            .map_err(|_| PlayerError::MpvStartFailed)?
+            .is_some()
+        {
+            return Err(PlayerError::MpvStartFailed);
+        }
+        if let Some(relay) = relay.as_ref() {
+            let creation_time = child.creation_time().map_err(|error| {
+                log_io_error("mpv_process_time_error", error);
+                PlayerError::MpvStartFailed
+            })?;
+            if relay.bind_process(child.id(), creation_time).is_err() {
+                terminate_child(&mut child);
                 return Err(PlayerError::MpvStartFailed);
             }
-            match JsonPipe::connect(&pipe_path, Duration::from_millis(80)) {
-                Ok(ipc) => break ipc,
-                Err(_) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(40));
-                }
-                Err(_) => {
-                    terminate_child(&mut child);
-                    return Err(PlayerError::IpcTimeout);
-                }
-            }
-        };
-
-        if let Err(error) = verify_ipc_server_pid(&ipc, child.id()) {
-            terminate_child(&mut child);
-            return Err(error);
         }
+
+        let transport = pipe_server.into_transport();
+        let ipc = JsonPipe::from_parts(Box::new(transport.clone()), Box::new(transport));
 
         let mut runtime = Self {
             child: Some(child),
             ipc: Some(IpcWorker::new(Box::new(ipc), IPC_REQUEST_TIMEOUT)),
+            relay,
+            egress_mode,
             next_request_id: 1,
+            operation_timeout: IPC_OPERATION_TIMEOUT,
+            job: Some(job),
         };
 
-        if let Err(error) = runtime.command(&json!(["get_property", "mpv-version"])) {
+        if let Err(error) =
+            runtime.command_until(&json!(["get_property", "mpv-version"]), startup_deadline)
+        {
             runtime.abort();
             return Err(error);
         }
@@ -715,8 +918,27 @@ impl MpvRuntime {
         Ok(runtime)
     }
 
+    #[cfg(not(windows))]
+    fn spawn() -> Result<Self, PlayerError> {
+        Self::spawn_until(Instant::now() + MPV_STARTUP_TIMEOUT)
+    }
+
+    #[cfg(not(windows))]
+    fn spawn_until(_startup_deadline: Instant) -> Result<Self, PlayerError> {
+        Err(PlayerError::MpvStartFailed)
+    }
+
+    #[cfg(test)]
     fn command(&mut self, command: &Value) -> Result<CommandReply, PlayerError> {
-        let reply = self.optional_command(command)?;
+        self.command_until(command, Instant::now() + self.operation_timeout)
+    }
+
+    fn command_until(
+        &mut self,
+        command: &Value,
+        deadline: Instant,
+    ) -> Result<CommandReply, PlayerError> {
+        let reply = self.optional_command_until(command, deadline)?;
         if reply.data.is_some() {
             Ok(reply)
         } else {
@@ -724,7 +946,16 @@ impl MpvRuntime {
         }
     }
 
+    #[cfg(test)]
     fn optional_command(&mut self, command: &Value) -> Result<CommandReply, PlayerError> {
+        self.optional_command_until(command, Instant::now() + self.operation_timeout)
+    }
+
+    fn optional_command_until(
+        &mut self,
+        command: &Value,
+        deadline: Instant,
+    ) -> Result<CommandReply, PlayerError> {
         let command = command.as_array().ok_or(PlayerError::InvalidCommand)?;
         self.try_reap()?;
         let request_id = self.next_request_id;
@@ -733,7 +964,7 @@ impl MpvRuntime {
             .ipc
             .as_mut()
             .ok_or(PlayerError::Exited)?
-            .request(request_id, command);
+            .request_until(request_id, command, deadline);
         match reply {
             Ok(reply) => Ok(CommandReply {
                 data: reply.data,
@@ -751,6 +982,11 @@ impl MpvRuntime {
             Some(_) => {
                 self.child = None;
                 self.ipc = None;
+                self.relay = None;
+                #[cfg(windows)]
+                {
+                    self.job = None;
+                }
                 Ok(true)
             }
             None => Ok(false),
@@ -758,10 +994,13 @@ impl MpvRuntime {
     }
 
     fn pid(&self) -> Option<u32> {
-        self.child.as_ref().map(Child::id)
+        self.child.as_ref().map(|child| child.id())
     }
 
     fn shutdown(&mut self) {
+        if let Some(relay) = self.relay.as_ref() {
+            relay.disarm();
+        }
         let quit = json!(["quit"]);
         if let (Some(ipc), Some(command)) = (self.ipc.as_mut(), quit.as_array()) {
             let _ = ipc.notify(command);
@@ -772,14 +1011,27 @@ impl MpvRuntime {
         }
         self.child = None;
         self.ipc = None;
+        self.relay = None;
+        #[cfg(windows)]
+        {
+            self.job = None;
+        }
     }
 
     fn abort(&mut self) {
+        if let Some(relay) = self.relay.as_ref() {
+            relay.disarm();
+        }
         if let Some(child) = self.child.as_mut() {
             terminate_child(child);
         }
         self.child = None;
         self.ipc = None;
+        self.relay = None;
+        #[cfg(windows)]
+        {
+            self.job = None;
+        }
     }
 
     #[cfg(test)]
@@ -794,15 +1046,25 @@ impl MpvRuntime {
         request_timeout: Duration,
     ) -> Self {
         Self {
-            child: Some(child),
+            child: Some(child.into()),
             ipc: Some(IpcWorker::new(ipc, request_timeout)),
+            relay: None,
+            egress_mode: EgressMode::TestFake,
             next_request_id: 1,
+            operation_timeout: request_timeout,
+            #[cfg(windows)]
+            job: None,
         }
     }
 
     #[cfg(test)]
     fn has_child(&self) -> bool {
         self.child.is_some()
+    }
+
+    #[cfg(all(test, windows))]
+    fn job_is_configured(&self) -> bool {
+        self.job.is_some()
     }
 }
 
@@ -848,7 +1110,16 @@ impl IpcWorker {
         }
     }
 
-    fn request(&self, request_id: u64, command: &[Value]) -> Result<IpcReply, IpcError> {
+    fn request_until(
+        &self,
+        request_id: u64,
+        command: &[Value],
+        deadline: Instant,
+    ) -> Result<IpcReply, IpcError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(IpcError::Timeout);
+        }
         let (response, receiver) = mpsc::sync_channel(1);
         self.commands
             .send(WorkerCommand::Request {
@@ -858,7 +1129,7 @@ impl IpcWorker {
             })
             .map_err(|_| IpcError::Closed)?;
 
-        match receiver.recv_timeout(self.request_timeout) {
+        match receiver.recv_timeout(remaining.min(self.request_timeout)) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => Err(IpcError::Timeout),
             Err(RecvTimeoutError::Disconnected) => Err(IpcError::Closed),
@@ -878,16 +1149,114 @@ impl Drop for MpvRuntime {
     }
 }
 
-fn mpv_executable() -> OsString {
-    env::var_os("DORIYA_W0_MPV_PATH")
+#[cfg(windows)]
+struct VerifiedMpvExecutable {
+    path: PathBuf,
+    _verification_handle: File,
+}
+
+#[cfg(windows)]
+fn verified_mpv_executable() -> Result<VerifiedMpvExecutable, PlayerError> {
+    let configured_path = env::var_os("DORIYA_W0_MPV_PATH")
         .filter(|path| !path.is_empty())
-        .unwrap_or_else(|| OsString::from("mpv"))
+        .ok_or(PlayerError::MpvExecutableMissing)?;
+    let configured_path = PathBuf::from(configured_path);
+    if !configured_path.is_absolute() {
+        return Err(PlayerError::MpvExecutableMissing);
+    }
+
+    let expected = env::var("DORIYA_W0_MPV_SHA256").map_err(|_| PlayerError::MpvIdentityMissing)?;
+    let expected = parse_sha256(&expected).ok_or(PlayerError::MpvIdentityInvalid)?;
+    let expected_signer = env::var_os("DORIYA_W0_MPV_SIGNER_SHA256")
+        .map(|value| {
+            value
+                .to_str()
+                .and_then(parse_sha256)
+                .ok_or(PlayerError::MpvPublisherInvalid)
+        })
+        .transpose()?;
+    verify_mpv_executable(&configured_path, expected, expected_signer)
 }
 
-fn configure_sidecar_environment(command: &mut Command) {
-    apply_sidecar_environment(command, env::vars_os());
+#[cfg(windows)]
+fn verify_mpv_executable(
+    path: &Path,
+    expected: [u8; 32],
+    expected_signer: Option<[u8; 32]>,
+) -> Result<VerifiedMpvExecutable, PlayerError> {
+    let path = fs::canonicalize(path).map_err(|_| PlayerError::MpvExecutableMissing)?;
+    if !path.is_file() {
+        return Err(PlayerError::MpvExecutableMissing);
+    }
+    let mut verification_handle = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&path)
+        .map_err(|_| PlayerError::MpvExecutableMissing)?;
+    let actual = sha256_file(&mut verification_handle)?;
+    if actual != expected {
+        return Err(PlayerError::MpvIdentityMismatch);
+    }
+    if let Some(expected_signer) = expected_signer {
+        let signer =
+            verify_embedded_signature(&path, &verification_handle).map_err(map_signature_error)?;
+        if signer != expected_signer {
+            return Err(PlayerError::MpvPublisherMismatch);
+        }
+    }
+
+    Ok(VerifiedMpvExecutable {
+        path,
+        _verification_handle: verification_handle,
+    })
 }
 
+#[cfg(windows)]
+fn map_signature_error(error: SignatureError) -> PlayerError {
+    match error {
+        SignatureError::Missing | SignatureError::NoSigner => PlayerError::MpvSignatureMissing,
+        SignatureError::Invalid | SignatureError::Untrusted | SignatureError::Thumbprint => {
+            PlayerError::MpvSignatureInvalid
+        }
+    }
+}
+
+#[cfg(windows)]
+fn sha256_file(file: &mut File) -> Result<[u8; 32], PlayerError> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| PlayerError::MpvStartFailed)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest.finalize().into())
+}
+
+#[cfg(windows)]
+fn parse_sha256(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&value[start..start + 2], 16).ok()?;
+    }
+    Some(bytes)
+}
+
+fn sidecar_environment() -> Vec<(OsString, OsString)> {
+    env::vars_os()
+        .filter(|(name, _)| is_sidecar_environment_variable(name))
+        .collect()
+}
+
+#[cfg(test)]
 fn apply_sidecar_environment(
     command: &mut Command,
     variables: impl IntoIterator<Item = (OsString, OsString)>,
@@ -907,19 +1276,43 @@ fn is_sidecar_environment_variable(name: &OsString) -> bool {
         .any(|allowed| name.eq_ignore_ascii_case(allowed))
 }
 
-fn mpv_arguments(pipe_path: &Path) -> Vec<OsString> {
+fn loopback_http_enabled() -> bool {
+    cfg!(debug_assertions)
+        && env::var("DORIYA_W0_ALLOW_LOOPBACK_HTTP").is_ok_and(|value| value == "1")
+}
+
+fn mpv_arguments() -> Vec<OsString> {
+    let protocols = if loopback_http_enabled() {
+        "http,https,tcp,tls,crypto,httpproxy"
+    } else {
+        "https,tcp,tls,crypto,httpproxy"
+    };
     vec![
         OsString::from("--no-config"),
+        OsString::from("--no-load-scripts"),
+        OsString::from("--no-autoload-files"),
         OsString::from("--idle=yes"),
         OsString::from("--force-window=yes"),
         OsString::from("--keep-open=yes"),
         OsString::from("--no-terminal"),
         OsString::from("--really-quiet"),
         OsString::from("--osc=no"),
+        OsString::from("--sub-auto=no"),
+        OsString::from("--audio-file-auto=no"),
+        OsString::from("--cover-art-auto=no"),
+        OsString::from("--load-unsafe-playlists=no"),
+        OsString::from("--tls-verify=yes"),
+        OsString::from("--ytdl=no"),
+        OsString::from("--network-timeout=15"),
         OsString::from(format!(
-            "--input-ipc-server={}",
-            pipe_path.to_string_lossy()
+            "--stream-lavf-o-append=protocol_whitelist={protocols}"
         )),
+        OsString::from(format!(
+            "--demuxer-lavf-o-append=protocol_whitelist={protocols}"
+        )),
+        OsString::from("--stream-lavf-o-append=max_redirects=3"),
+        OsString::from("--demuxer-lavf-o-append=max_redirects=3"),
+        OsString::from("--input-ipc-client=fd://0"),
         OsString::from("--title=Doriya W0 mpv sidecar"),
     ]
 }
@@ -939,26 +1332,23 @@ fn next_pipe_path() -> Result<PathBuf, PlayerError> {
 }
 
 #[cfg(windows)]
-fn verify_ipc_server_pid(ipc: &dyn IpcConnection, expected_pid: u32) -> Result<(), PlayerError> {
-    match ipc.server_pid() {
-        Ok(server_pid) if server_pid == expected_pid => Ok(()),
-        _ => {
-            log_code("mpv_ipc_peer_mismatch", PlayerError::IpcPeerMismatch.code());
-            Err(PlayerError::IpcPeerMismatch)
-        }
-    }
+fn log_pipe_error(event: &'static str, error: PipeError) {
+    eprintln!("[doriya-w0-mpv] event={event} reason={}", error.code());
 }
 
-#[cfg(not(windows))]
-fn verify_ipc_server_pid(_ipc: &dyn IpcConnection, _expected_pid: u32) -> Result<(), PlayerError> {
-    Ok(())
+#[cfg(windows)]
+fn log_io_error(event: &'static str, error: std::io::Error) {
+    eprintln!(
+        "[doriya-w0-mpv] event={event} reason=os_{}",
+        error.raw_os_error().unwrap_or_default()
+    );
 }
 
 fn numeric_or_null(value: Value) -> Option<f64> {
     value.as_f64().filter(|number| number.is_finite())
 }
 
-fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+fn wait_for_exit(child: &mut PlatformChild, timeout: Duration) -> Option<ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -969,7 +1359,7 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     }
 }
 
-fn terminate_child(child: &mut Child) {
+fn terminate_child(child: &mut PlatformChild) {
     if matches!(child.try_wait(), Ok(None)) {
         let _ = child.kill();
     }
@@ -997,25 +1387,120 @@ fn log_code(event: &'static str, value: &'static str) {
     eprintln!("[doriya-w0-mpv] event={event} code={value}");
 }
 
-#[cfg(windows)]
-fn configure_hidden_process(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(windows))]
-fn configure_hidden_process(_command: &mut Command) {}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::collections::{HashSet, VecDeque};
-    use std::process::Command;
+    #[cfg(windows)]
+    use std::io::{BufRead, BufReader};
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
 
     use super::*;
     use crate::player::media::{validate_media, MediaLoadRequest, MediaPolicy};
+
+    #[cfg(windows)]
+    #[derive(serde::Deserialize)]
+    struct LoopbackFixtureInfo {
+        url: String,
+        referer: String,
+        user_agent: String,
+    }
+
+    #[cfg(windows)]
+    struct LoopbackFixtureServer {
+        child: Child,
+        info: LoopbackFixtureInfo,
+    }
+
+    #[cfg(windows)]
+    impl Drop for LoopbackFixtureServer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(windows)]
+    fn start_loopback_fixture() -> LoopbackFixtureServer {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let script = root.join("fixtures/header-range-server.py");
+        let media = root.join("fixtures/synthetic/s1-h264-aac.mp4");
+        assert!(
+            script.is_file(),
+            "missing fixture server at {}",
+            script.display()
+        );
+        assert!(
+            media.is_file(),
+            "missing synthetic media at {}",
+            media.display()
+        );
+
+        let mut child = Command::new("python")
+            .args(["-u"])
+            .arg(&script)
+            .arg("--file")
+            .arg(&media)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("start loopback fixture server");
+        let stdout = child.stdout.take().expect("fixture server stdout");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let mut line = String::new();
+            let _ = BufReader::new(stdout).read_line(&mut line);
+            let _ = sender.send(line);
+        });
+        let line = match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok(line) if !line.trim().is_empty() => line,
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fixture server did not publish its URL within 10 seconds");
+            }
+        };
+        let info = match serde_json::from_str::<LoopbackFixtureInfo>(line.trim()) {
+            Ok(info) => info,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("invalid fixture server metadata: {error}");
+            }
+        };
+        LoopbackFixtureServer { child, info }
+    }
+
+    #[cfg(windows)]
+    fn wait_for_playing(player: &mut PlayerController) -> PlayerSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let snapshot = player.status();
+            if snapshot.state == PlayerState::Playing && snapshot.media_loaded {
+                return snapshot;
+            }
+            if matches!(
+                snapshot.state,
+                PlayerState::Error | PlayerState::Exited | PlayerState::Stopped
+            ) {
+                panic!(
+                    "player entered {:?} with {:?}",
+                    snapshot.state, snapshot.last_error_code
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "player did not reach Playing within 20 seconds; last state={:?}",
+                snapshot.state
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
 
     fn reply(data: Value) -> IpcReply {
         IpcReply {
@@ -1056,10 +1541,6 @@ mod tests {
         fn notify(&mut self, _command: &[Value]) -> Result<(), IpcError> {
             Ok(())
         }
-
-        fn server_pid(&self) -> Result<u32, IpcError> {
-            Ok(std::process::id())
-        }
     }
 
     struct RejectLoadIpc;
@@ -1075,10 +1556,6 @@ mod tests {
 
         fn notify(&mut self, _command: &[Value]) -> Result<(), IpcError> {
             Ok(())
-        }
-
-        fn server_pid(&self) -> Result<u32, IpcError> {
-            Ok(std::process::id())
         }
     }
 
@@ -1107,10 +1584,6 @@ mod tests {
         fn notify(&mut self, _command: &[Value]) -> Result<(), IpcError> {
             Ok(())
         }
-
-        fn server_pid(&self) -> Result<u32, IpcError> {
-            Ok(std::process::id())
-        }
     }
 
     struct RejectControlIpc;
@@ -1126,26 +1599,6 @@ mod tests {
 
         fn notify(&mut self, _command: &[Value]) -> Result<(), IpcError> {
             Ok(())
-        }
-
-        fn server_pid(&self) -> Result<u32, IpcError> {
-            Ok(std::process::id())
-        }
-    }
-
-    struct FixedPidIpc(u32);
-
-    impl IpcConnection for FixedPidIpc {
-        fn request(&mut self, _request_id: u64, _command: &[Value]) -> Result<IpcReply, IpcError> {
-            Ok(reply(Value::Null))
-        }
-
-        fn notify(&mut self, _command: &[Value]) -> Result<(), IpcError> {
-            Ok(())
-        }
-
-        fn server_pid(&self) -> Result<u32, IpcError> {
-            Ok(self.0)
         }
     }
 
@@ -1171,10 +1624,6 @@ mod tests {
         fn notify(&mut self, _command: &[Value]) -> Result<(), IpcError> {
             Ok(())
         }
-
-        fn server_pid(&self) -> Result<u32, IpcError> {
-            Ok(std::process::id())
-        }
     }
 
     struct NeverRespondingIpc;
@@ -1188,9 +1637,18 @@ mod tests {
         fn notify(&mut self, _command: &[Value]) -> Result<(), IpcError> {
             Ok(())
         }
+    }
 
-        fn server_pid(&self) -> Result<u32, IpcError> {
-            Ok(std::process::id())
+    struct SlowRespondingIpc(Duration);
+
+    impl IpcConnection for SlowRespondingIpc {
+        fn request(&mut self, _request_id: u64, _command: &[Value]) -> Result<IpcReply, IpcError> {
+            thread::sleep(self.0);
+            Ok(reply(Value::Null))
+        }
+
+        fn notify(&mut self, _command: &[Value]) -> Result<(), IpcError> {
+            Ok(())
         }
     }
 
@@ -1268,19 +1726,143 @@ mod tests {
 
     #[test]
     fn sidecar_arguments_never_receive_media_or_headers() {
-        let pipe = PathBuf::from(r"\\.\pipe\doriya-w0-test");
-        let args = mpv_arguments(&pipe)
+        let args = mpv_arguments()
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         let joined = args.join(" ");
 
-        assert!(joined.contains("--input-ipc-server"));
+        assert!(args.contains(&"--input-ipc-client=fd://0".to_owned()));
+        assert!(args.contains(&"--tls-verify=yes".to_owned()));
+        assert!(args.contains(&"--ytdl=no".to_owned()));
+        assert!(args.contains(&"--network-timeout=15".to_owned()));
+        assert!(args.contains(&"--no-load-scripts".to_owned()));
+        assert!(args.contains(&"--no-autoload-files".to_owned()));
+        assert!(args.contains(&"--sub-auto=no".to_owned()));
+        assert!(args.contains(&"--audio-file-auto=no".to_owned()));
+        assert!(args.contains(&"--cover-art-auto=no".to_owned()));
+        assert!(args.contains(&"--load-unsafe-playlists=no".to_owned()));
+        assert!(args.iter().any(|argument| argument.starts_with(
+            "--stream-lavf-o-append=protocol_whitelist=https,tcp,tls,crypto,httpproxy"
+        ) || argument.starts_with(
+            "--stream-lavf-o-append=protocol_whitelist=http,https,tcp,tls,crypto,httpproxy"
+        )));
+        assert!(args.iter().any(|argument| argument.starts_with(
+            "--demuxer-lavf-o-append=protocol_whitelist=https,tcp,tls,crypto,httpproxy"
+        ) || argument.starts_with(
+            "--demuxer-lavf-o-append=protocol_whitelist=http,https,tcp,tls,crypto,httpproxy"
+        )));
+        assert!(args.contains(&"--stream-lavf-o-append=max_redirects=3".to_owned()));
+        assert!(args.contains(&"--demuxer-lavf-o-append=max_redirects=3".to_owned()));
+        assert!(!joined.contains("--input-ipc-server"));
+        assert!(!joined.contains(r"\\.\pipe"));
+        assert!(!joined.contains("--http-proxy"));
         assert!(!joined.contains("http://"));
         assert!(!joined.contains("https://"));
         assert!(!joined.to_ascii_lowercase().contains("referer"));
         assert!(!joined.to_ascii_lowercase().contains("cookie"));
         assert!(!joined.contains("secret"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sha256_identity_parser_rejects_malformed_values() {
+        assert!(
+            parse_sha256("2CF24DBA5FB0A30E26E83B2AC5B9E29E1B161E5C1FA7425E73043362938B9824")
+                .is_some()
+        );
+        assert!(parse_sha256("not-a-sha256").is_none());
+        assert!(
+            parse_sha256("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b982z")
+                .is_none()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sha256_file_matches_a_known_digest() {
+        let path =
+            PathBuf::from("target").join(format!("doriya-w0-sha256-{}.tmp", std::process::id()));
+        fs::create_dir_all("target").expect("create hash fixture directory");
+        fs::write(&path, b"hello").expect("write hash fixture");
+        let mut file = File::open(&path).expect("open hash fixture");
+        let actual = sha256_file(&mut file).expect("hash fixture");
+        let _ = fs::remove_file(path);
+        assert_eq!(
+            actual,
+            parse_sha256("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+                .expect("known digest")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executable_identity_mismatch_fails_before_spawn() {
+        let path =
+            PathBuf::from("target").join(format!("doriya-w0-identity-{}.tmp", std::process::id()));
+        fs::create_dir_all("target").expect("create identity fixture directory");
+        fs::write(&path, b"not mpv").expect("write identity fixture");
+        assert!(matches!(
+            verify_mpv_executable(&path, [0u8; 32], None),
+            Err(PlayerError::MpvIdentityMismatch)
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn configured_publisher_pin_rejects_an_unsigned_hash_matching_file() {
+        let path = PathBuf::from("target")
+            .join(format!("doriya-w0-unsigned-pin-{}.tmp", std::process::id()));
+        fs::create_dir_all("target").expect("create unsigned pin fixture directory");
+        fs::write(&path, b"unsigned but hash matching").expect("write unsigned pin fixture");
+        let expected = {
+            let mut file = File::open(&path).expect("open unsigned pin fixture");
+            sha256_file(&mut file).expect("hash unsigned pin fixture")
+        };
+
+        assert!(matches!(
+            verify_mpv_executable(&path, expected, Some([0u8; 32])),
+            Err(PlayerError::MpvSignatureMissing)
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn configured_publisher_pin_accepts_the_matching_signer() {
+        let path = Path::new(r"C:\Windows\explorer.exe");
+        if !path.is_file() {
+            return;
+        }
+        let expected = {
+            let mut file = File::open(path).expect("open signed system binary for hashing");
+            sha256_file(&mut file).expect("hash signed system binary")
+        };
+        let signer = {
+            let file = File::open(path).expect("open signed system binary for signature");
+            verify_embedded_signature(path, &file).expect("read signed system binary signer")
+        };
+
+        assert!(verify_mpv_executable(path, expected, Some(signer)).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn configured_publisher_pin_rejects_a_different_signer() {
+        let path = Path::new(r"C:\Windows\explorer.exe");
+        if !path.is_file() {
+            return;
+        }
+        let expected = {
+            let mut file = File::open(path).expect("open signed system binary for hashing");
+            sha256_file(&mut file).expect("hash signed system binary")
+        };
+
+        assert!(matches!(
+            verify_mpv_executable(path, expected, Some([0u8; 32])),
+            Err(PlayerError::MpvPublisherMismatch)
+        ));
     }
 
     #[test]
@@ -1300,6 +1882,33 @@ mod tests {
         );
         assert!(!snapshot.media_loaded);
         assert!(snapshot.pid.is_none());
+    }
+
+    #[test]
+    fn cold_command_budget_covers_startup_and_one_operation() {
+        let player = PlayerController::new();
+        assert_eq!(
+            player.command_deadline_budget(),
+            MPV_STARTUP_TIMEOUT + IPC_OPERATION_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn cold_operation_caps_startup_before_the_remaining_operation_budget() {
+        let request_deadline = Instant::now() + MPV_STARTUP_TIMEOUT + IPC_OPERATION_TIMEOUT;
+        let startup_deadline = capped_startup_deadline(request_deadline);
+
+        assert!(
+            request_deadline.saturating_duration_since(startup_deadline)
+                >= IPC_OPERATION_TIMEOUT - Duration::from_millis(10)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn warm_command_budget_uses_only_the_operation_timeout() {
+        let player = controller_with_runtime(Box::new(FakeIpc));
+        assert_eq!(player.command_deadline_budget(), IPC_OPERATION_TIMEOUT);
     }
 
     #[test]
@@ -1483,6 +2092,45 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn file_loaded_transitions_to_playing_without_timing_metrics() {
+        let mut player = controller_with_runtime(Box::new(FakeIpc));
+        player.pending_load = Some(PendingLoad {
+            saw_start: true,
+            deadline: Instant::now() + MEDIA_OPEN_TIMEOUT,
+        });
+        player.media_loaded = true;
+        player.state = PlayerState::Opening;
+
+        let snapshot = player.status();
+
+        assert_eq!(snapshot.state, PlayerState::Playing);
+        assert_eq!(snapshot.last_error_code, None);
+        player.shutdown();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opening_timeout_releases_runtime_and_reports_a_stable_error() {
+        let mut player = controller_with_runtime(Box::new(FakeIpc));
+        player.pending_load = Some(PendingLoad {
+            saw_start: true,
+            deadline: Instant::now() - Duration::from_secs(1),
+        });
+        player.state = PlayerState::Opening;
+
+        let snapshot = player.status();
+
+        assert_eq!(snapshot.state, PlayerState::Error);
+        assert_eq!(
+            snapshot.last_error_code,
+            Some(PlayerError::MediaOpenTimeout.code())
+        );
+        assert!(!snapshot.media_loaded);
+        assert!(player.runtime.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn load_error_event_enters_stable_error_state() {
         let ipc = ScriptedIpc::new([
             Ok(reply(Value::Null)),
@@ -1660,6 +2308,27 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn status_metrics_share_one_operation_deadline() {
+        let mut player = controller_with_runtime_timeout(
+            Box::new(SlowRespondingIpc(Duration::from_millis(80))),
+            Duration::from_millis(120),
+        );
+        let started = Instant::now();
+
+        let result = player.read_status_metrics(Instant::now() + player.operation_timeout());
+
+        assert!(matches!(result, Err(PlayerError::IpcTimeout)));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "the whole status read must share one deadline"
+        );
+        if let Some(mut runtime) = player.runtime.take() {
+            runtime.abort();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn shutdown_is_bounded_when_the_ipc_worker_is_stuck() {
         let mut runtime = MpvRuntime::from_test_parts_with_timeout(
             spawn_long_lived_child(),
@@ -1699,16 +2368,6 @@ mod tests {
             .collect::<HashSet<_>>();
 
         assert_eq!(paths.len(), 64, "random pipe names must not collide");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn ipc_peer_pid_must_match_the_launched_child() {
-        assert_eq!(verify_ipc_server_pid(&FixedPidIpc(42), 42), Ok(()));
-        assert_eq!(
-            verify_ipc_server_pid(&FixedPidIpc(41), 42),
-            Err(PlayerError::IpcPeerMismatch)
-        );
     }
 
     #[cfg(windows)]
@@ -1753,6 +2412,25 @@ mod tests {
     #[ignore = "requires an installed mpv; no media is loaded"]
     fn installed_mpv_accepts_json_ipc_and_shuts_down() {
         let mut runtime = MpvRuntime::spawn().expect("start installed mpv");
+        assert!(
+            runtime.job_is_configured(),
+            "mpv must be assigned to its job"
+        );
+        let proxy_url = {
+            let relay = runtime
+                .relay
+                .as_ref()
+                .expect("strict mode must install an egress relay");
+            let origin = test_media()
+                .relay_origin()
+                .expect("test media must have a relay origin");
+            relay
+                .begin_playback(origin)
+                .expect("start playback relay session")
+        };
+        runtime
+            .command(&json!(["set_property", "http-proxy", proxy_url]))
+            .expect("mpv must accept the runtime proxy setting");
         let version = runtime
             .command(&json!(["get_property", "mpv-version"]))
             .expect("read mpv version through JSON IPC");
@@ -1768,5 +2446,110 @@ mod tests {
         runtime.shutdown();
         assert!(!runtime.has_child(), "mpv child must be released");
         assert!(runtime.ipc.is_none(), "IPC pipe must be released");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an installed mpv and Python fixture server"]
+    fn installed_mpv_loads_header_protected_loopback_fixture_and_seeks() {
+        let fixture = start_loopback_fixture();
+        env::set_var("DORIYA_W0_ALLOW_LOOPBACK_HTTP", "1");
+        let media = validate_media(
+            MediaLoadRequest {
+                url: fixture.info.url.clone(),
+                headers: [
+                    ("Referer".to_owned(), fixture.info.referer.clone()),
+                    ("User-Agent".to_owned(), fixture.info.user_agent.clone()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            MediaPolicy::from_environment(),
+        )
+        .expect("valid loopback fixture media");
+
+        let mut player = PlayerController::new();
+        player.open(media).expect("open Header-protected fixture");
+        let playing = wait_for_playing(&mut player);
+        assert!(
+            playing
+                .duration_seconds
+                .is_some_and(|duration| duration >= 2.0),
+            "fixture duration must be available"
+        );
+
+        let paused = player
+            .control(PlaybackCommand::Pause)
+            .expect("pause fixture playback");
+        assert_eq!(paused.state, PlayerState::Paused);
+
+        for index in 0..20 {
+            let offset = match index % 4 {
+                0 => 0.1,
+                1 => -0.1,
+                2 => 0.25,
+                _ => -0.25,
+            };
+            let snapshot = player
+                .control(PlaybackCommand::Seek(offset))
+                .expect("seek fixture playback");
+            assert_eq!(snapshot.state, PlayerState::Paused);
+            assert!(snapshot.media_loaded);
+            assert_eq!(snapshot.last_error_code, None);
+        }
+
+        player
+            .control(PlaybackCommand::Play)
+            .expect("resume fixture playback");
+        let resumed = wait_for_playing(&mut player);
+        assert_eq!(resumed.last_error_code, None);
+        player.shutdown();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an installed mpv and public network access"]
+    fn installed_mpv_routes_public_https_through_connect_relay() {
+        let mut runtime = MpvRuntime::spawn().expect("start installed mpv");
+        let proxy_url = {
+            let relay = runtime
+                .relay
+                .as_ref()
+                .expect("strict mode must install an egress relay");
+            let media = validate_media(
+                MediaLoadRequest {
+                    url: "https://example.com/".to_owned(),
+                    headers: Default::default(),
+                },
+                MediaPolicy::from_environment(),
+            )
+            .expect("valid public HTTPS probe");
+            let origin = media.relay_origin().expect("public HTTPS relay origin");
+            relay
+                .begin_playback(origin)
+                .expect("start public HTTPS relay session")
+        };
+        runtime
+            .command(&json!(["set_property", "http-proxy", proxy_url]))
+            .expect("mpv must accept the proxy setting");
+        runtime
+            .command(&json!(["loadfile", "https://example.com/"]))
+            .expect("mpv must accept the public HTTPS probe");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let relay = runtime.relay.as_ref().expect("relay remains installed");
+            if relay.established_tunnel_count() > 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mpv did not establish an owner-bound tunnel through the relay (raw={}, session={})",
+                relay.raw_connection_count(),
+                relay.session_connection_count()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        runtime.shutdown();
     }
 }

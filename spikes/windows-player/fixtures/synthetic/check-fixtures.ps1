@@ -45,10 +45,22 @@ foreach ($fixture in $fixtures) {
   }
 
   if (-not $SkipMpv) {
-    & $MpvPath --no-config --vo=null --ao=null --really-quiet --frames=1 `
-      --force-window=no $path
-    if ($LASTEXITCODE -ne 0) {
-      throw "mpv decode failed for $($fixture.Name) with exit code $LASTEXITCODE."
+    $mpvProcess = Start-Process `
+      -FilePath $MpvPath `
+      -ArgumentList @(
+        "--no-config",
+        "--vo=null",
+        "--ao=null",
+        "--really-quiet",
+        "--frames=1",
+        "--force-window=no",
+        $path
+      ) `
+      -WindowStyle Hidden `
+      -Wait `
+      -PassThru
+    if ($mpvProcess.ExitCode -ne 0) {
+      throw "mpv decode failed for $($fixture.Name) with exit code $($mpvProcess.ExitCode)."
     }
   }
 
