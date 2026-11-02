@@ -5,10 +5,11 @@ Bilibili/OpenList media and cannot close S1-S5 acceptance gates.
 
 ## Synthetic codecs
 
-`synthetic/` contains small H.264/AAC, H.264/E-AC-3 and HEVC Main10/FLAC
-files. Run `synthetic/check-fixtures.ps1` for codec metadata and mpv null-output
-decode checks. The E-AC-3 file is synthetic; the real S2 sample is still
-required.
+`synthetic/` contains small H.264/AAC, H.264/E-AC-3, HEVC Main10/FLAC and
+HEVC Main10/FLAC/ASS files. Run `synthetic/check-fixtures.ps1` for codec
+metadata and mpv null-output decode checks. The E-AC-3 and ASS files are
+synthetic; the real S2 sample, real subtitle rendering and real-source
+acceptance are still required.
 
 ## Header and Range server
 

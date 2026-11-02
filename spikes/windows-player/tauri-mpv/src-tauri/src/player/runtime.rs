@@ -204,7 +204,6 @@ pub enum PlaybackCommand {
     TogglePause,
     Seek(f64),
     SetVolume(f64),
-    ToggleFullscreen,
 }
 
 pub struct PlayerController {
@@ -214,6 +213,7 @@ pub struct PlayerController {
     last_error_code: Option<&'static str>,
     status_metrics: PlaybackMetrics,
     pending_load: Option<PendingLoad>,
+    video_target: Option<isize>,
 }
 
 #[derive(Default)]
@@ -243,11 +243,32 @@ impl PlayerController {
             last_error_code: None,
             status_metrics: PlaybackMetrics::default(),
             pending_load: None,
+            video_target: None,
         }
     }
 
     pub fn start(&mut self) -> Result<PlayerSnapshot, PlayerError> {
-        self.start_with(MpvRuntime::spawn)
+        let video_target = self.video_target.ok_or(PlayerError::InvalidCommand)?;
+        self.start_with(|| MpvRuntime::spawn_with_video_target(Some(video_target)))
+    }
+
+    #[cfg(test)]
+    fn start_standalone(&mut self) -> Result<PlayerSnapshot, PlayerError> {
+        self.start_with(|| MpvRuntime::spawn_with_video_target(None))
+    }
+
+    pub fn set_video_target(&mut self, video_target: isize) -> Result<(), PlayerError> {
+        if !valid_video_target(video_target) {
+            return Err(PlayerError::InvalidCommand);
+        }
+        if self.video_target == Some(video_target) {
+            return Ok(());
+        }
+        if self.runtime.is_some() {
+            self.stop();
+        }
+        self.video_target = Some(video_target);
+        Ok(())
     }
 
     fn start_with(
@@ -398,10 +419,6 @@ impl PlayerController {
                     )?;
                     (None, None, Some(volume))
                 }
-                PlaybackCommand::ToggleFullscreen => {
-                    self.runtime_command_until(&json!(["cycle", "fullscreen"]), deadline)?;
-                    (None, None, None)
-                }
             };
             Ok::<_, PlayerError>((next_state, next_paused, next_volume))
         })();
@@ -508,7 +525,8 @@ impl PlayerController {
     fn ensure_runtime_until(&mut self, deadline: Instant) -> Result<(), PlayerError> {
         if self.runtime.is_none() {
             let startup_deadline = capped_startup_deadline(deadline);
-            self.start_with(|| MpvRuntime::spawn_until(startup_deadline))?;
+            let video_target = self.video_target.ok_or(PlayerError::InvalidCommand)?;
+            self.start_with(|| MpvRuntime::spawn_until(startup_deadline, Some(video_target)))?;
         } else {
             self.check_runtime_exit()?;
         }
@@ -801,13 +819,21 @@ enum EgressMode {
 }
 
 impl MpvRuntime {
-    #[cfg(windows)]
+    #[cfg(all(windows, test))]
     fn spawn() -> Result<Self, PlayerError> {
-        Self::spawn_until(Instant::now() + MPV_STARTUP_TIMEOUT)
+        Self::spawn_with_video_target(None)
     }
 
     #[cfg(windows)]
-    fn spawn_until(startup_deadline: Instant) -> Result<Self, PlayerError> {
+    fn spawn_with_video_target(video_target: Option<isize>) -> Result<Self, PlayerError> {
+        Self::spawn_until(Instant::now() + MPV_STARTUP_TIMEOUT, video_target)
+    }
+
+    #[cfg(windows)]
+    fn spawn_until(
+        startup_deadline: Instant,
+        video_target: Option<isize>,
+    ) -> Result<Self, PlayerError> {
         let executable = verified_mpv_executable()?;
         let direct_loopback_fixture = loopback_http_enabled();
         let egress_mode = if direct_loopback_fixture {
@@ -839,7 +865,7 @@ impl MpvRuntime {
                 log_pipe_error("mpv_pipe_client_error", error);
                 PlayerError::MpvStartFailed
             })?;
-        let args = mpv_arguments();
+        let args = mpv_arguments(video_target);
         let job = JobObject::new_kill_on_close().map_err(|error| {
             log_pipe_error("mpv_job_create_error", error);
             PlayerError::MpvStartFailed
@@ -919,12 +945,15 @@ impl MpvRuntime {
     }
 
     #[cfg(not(windows))]
-    fn spawn() -> Result<Self, PlayerError> {
-        Self::spawn_until(Instant::now() + MPV_STARTUP_TIMEOUT)
+    fn spawn_with_video_target(_video_target: Option<isize>) -> Result<Self, PlayerError> {
+        Self::spawn_until(Instant::now() + MPV_STARTUP_TIMEOUT, None)
     }
 
     #[cfg(not(windows))]
-    fn spawn_until(_startup_deadline: Instant) -> Result<Self, PlayerError> {
+    fn spawn_until(
+        _startup_deadline: Instant,
+        _video_target: Option<isize>,
+    ) -> Result<Self, PlayerError> {
         Err(PlayerError::MpvStartFailed)
     }
 
@@ -1281,13 +1310,13 @@ fn loopback_http_enabled() -> bool {
         && env::var("DORIYA_W0_ALLOW_LOOPBACK_HTTP").is_ok_and(|value| value == "1")
 }
 
-fn mpv_arguments() -> Vec<OsString> {
+fn mpv_arguments(video_target: Option<isize>) -> Vec<OsString> {
     let protocols = if loopback_http_enabled() {
         "http,https,tcp,tls,crypto,httpproxy"
     } else {
         "https,tcp,tls,crypto,httpproxy"
     };
-    vec![
+    let mut arguments = vec![
         OsString::from("--no-config"),
         OsString::from("--no-load-scripts"),
         OsString::from("--no-autoload-files"),
@@ -1314,7 +1343,15 @@ fn mpv_arguments() -> Vec<OsString> {
         OsString::from("--demuxer-lavf-o-append=max_redirects=3"),
         OsString::from("--input-ipc-client=fd://0"),
         OsString::from("--title=Doriya W0 mpv sidecar"),
-    ]
+    ];
+    if let Some(video_target) = video_target.filter(|target| valid_video_target(*target)) {
+        arguments.push(OsString::from(format!("--wid={video_target}")));
+    }
+    arguments
+}
+
+fn valid_video_target(video_target: isize) -> bool {
+    video_target > 0 && video_target as u64 <= u64::from(u32::MAX)
 }
 
 fn next_pipe_path() -> Result<PathBuf, PlayerError> {
@@ -1396,6 +1433,8 @@ mod tests {
     #[cfg(windows)]
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
+    #[cfg(windows)]
+    use std::sync::{Mutex, MutexGuard};
 
     use super::*;
     use crate::player::media::{validate_media, MediaLoadRequest, MediaPolicy};
@@ -1415,6 +1454,42 @@ mod tests {
     }
 
     #[cfg(windows)]
+    static OPT_IN_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(windows)]
+    struct OptInEnvironmentGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    #[cfg(windows)]
+    fn set_opt_in_environment(loopback_fixture: bool) -> OptInEnvironmentGuard {
+        let lock = OPT_IN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = env::var_os("DORIYA_W0_ALLOW_LOOPBACK_HTTP");
+        if loopback_fixture {
+            env::set_var("DORIYA_W0_ALLOW_LOOPBACK_HTTP", "1");
+        } else {
+            env::remove_var("DORIYA_W0_ALLOW_LOOPBACK_HTTP");
+        }
+        OptInEnvironmentGuard {
+            _lock: lock,
+            previous,
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for OptInEnvironmentGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => env::set_var("DORIYA_W0_ALLOW_LOOPBACK_HTTP", value),
+                None => env::remove_var("DORIYA_W0_ALLOW_LOOPBACK_HTTP"),
+            }
+        }
+    }
+
+    #[cfg(windows)]
     impl Drop for LoopbackFixtureServer {
         fn drop(&mut self) {
             let _ = self.child.kill();
@@ -1423,12 +1498,12 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn start_loopback_fixture() -> LoopbackFixtureServer {
+    fn start_loopback_fixture(media_name: &str) -> LoopbackFixtureServer {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let script = root.join("fixtures/header-range-server.py");
-        let media = root.join("fixtures/synthetic/s1-h264-aac.mp4");
+        let media = root.join("fixtures/synthetic").join(media_name);
         assert!(
             script.is_file(),
             "missing fixture server at {}",
@@ -1500,6 +1575,108 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[cfg(windows)]
+    fn player_property(player: &mut PlayerController, name: &str) -> Value {
+        player
+            .runtime_optional_command_until(
+                &json!(["get_property", name]),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap_or_else(|error| panic!("read mpv property {name}: {error:?}"))
+            .data
+            .unwrap_or_else(|| panic!("mpv property {name} returned no data"))
+    }
+
+    #[cfg(windows)]
+    fn set_player_property(player: &mut PlayerController, name: &str, value: Value) {
+        player
+            .runtime_command_until(
+                &json!(["set_property", name, value]),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap_or_else(|error| panic!("set mpv property {name}: {error:?}"));
+    }
+
+    #[cfg(windows)]
+    fn player_time_position(player: &mut PlayerController) -> f64 {
+        player_property(player, "time-pos")
+            .as_f64()
+            .expect("mpv time-pos")
+    }
+
+    #[cfg(windows)]
+    fn wait_for_seek_position(player: &mut PlayerController, target: f64) -> f64 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let seeking = player_property(player, "seeking")
+                .as_bool()
+                .unwrap_or(false);
+            let position = player_time_position(player);
+            if !seeking && (position - target).abs() <= 0.35 {
+                return position;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "seek did not settle near {target:.3}s; seeking={seeking}, position={position:.3}s"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(windows)]
+    fn verify_twenty_player_seeks(player: &mut PlayerController, label: &str) {
+        set_player_property(player, "hr-seek", Value::String("yes".to_owned()));
+        let mut observed = HashSet::new();
+        for index in 0..20 {
+            let target = 0.2 + ((index * 7) % 25) as f64 * 0.1;
+            let current = player_time_position(player);
+            let snapshot = player
+                .control(PlaybackCommand::Seek(target - current))
+                .unwrap_or_else(|error| panic!("{label}: seek {index} failed: {error:?}"));
+            assert_eq!(snapshot.state, PlayerState::Paused);
+            assert!(snapshot.media_loaded);
+            assert_eq!(snapshot.last_error_code, None);
+            let actual = wait_for_seek_position(player, target);
+            observed.insert((actual * 10.0).round() as i64);
+        }
+        assert!(
+            observed.len() >= 12,
+            "{label}: seeks collapsed onto too few positions: {observed:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    fn verify_playback_advances(player: &mut PlayerController, label: &str) {
+        let current = player_time_position(player);
+        let target = 0.2_f64.max(current.min(1.5));
+        if (current - target).abs() > 0.05 {
+            player
+                .control(PlaybackCommand::Seek(target - current))
+                .unwrap_or_else(|error| panic!("{label}: reset seek failed: {error:?}"));
+            wait_for_seek_position(player, target);
+        }
+        player
+            .control(PlaybackCommand::Play)
+            .unwrap_or_else(|error| panic!("{label}: resume failed: {error:?}"));
+        let before = player_time_position(player);
+        let audio_before = player_property(player, "audio-pts")
+            .as_f64()
+            .expect("audio pts before playback");
+        thread::sleep(Duration::from_millis(350));
+        let after = player_time_position(player);
+        let audio_after = player_property(player, "audio-pts")
+            .as_f64()
+            .expect("audio pts after playback");
+        assert!(
+            after >= before + 0.1,
+            "{label}: playback position did not advance: {before:.3} -> {after:.3}"
+        );
+        assert!(
+            audio_after >= audio_before + 0.1,
+            "{label}: audio PTS did not advance: {audio_before:.3} -> {audio_after:.3}"
+        );
     }
 
     fn reply(data: Value) -> IpcReply {
@@ -1681,6 +1858,7 @@ mod tests {
             last_error_code: None,
             status_metrics: PlaybackMetrics::default(),
             pending_load: None,
+            video_target: None,
         }
     }
 
@@ -1726,7 +1904,7 @@ mod tests {
 
     #[test]
     fn sidecar_arguments_never_receive_media_or_headers() {
-        let args = mpv_arguments()
+        let args = mpv_arguments(None)
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
@@ -1757,11 +1935,70 @@ mod tests {
         assert!(!joined.contains("--input-ipc-server"));
         assert!(!joined.contains(r"\\.\pipe"));
         assert!(!joined.contains("--http-proxy"));
+        assert!(!joined.contains("--wid="));
         assert!(!joined.contains("http://"));
         assert!(!joined.contains("https://"));
         assert!(!joined.to_ascii_lowercase().contains("referer"));
         assert!(!joined.to_ascii_lowercase().contains("cookie"));
         assert!(!joined.contains("secret"));
+    }
+
+    #[test]
+    fn embedded_arguments_target_only_the_owned_surface_hwnd() {
+        let args = mpv_arguments(Some(0x1234))
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let joined = args.join(" ");
+
+        assert!(args.contains(&"--wid=4660".to_owned()));
+        assert!(args.contains(&"--force-window=yes".to_owned()));
+        assert_eq!(
+            args.iter()
+                .filter(|argument| argument.starts_with("--wid="))
+                .count(),
+            1
+        );
+        assert!(!joined.contains("http://"));
+        assert!(!joined.contains("https://"));
+    }
+
+    #[test]
+    fn invalid_video_targets_are_never_forwarded_to_mpv() {
+        for target in [Some(0), Some(-1)] {
+            let args = mpv_arguments(target)
+                .into_iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(!args.iter().any(|argument| argument.starts_with("--wid=")));
+        }
+    }
+
+    #[test]
+    fn controller_rejects_invalid_video_targets() {
+        let mut player = PlayerController::new();
+        for target in [0, -1] {
+            assert_eq!(
+                player.set_video_target(target),
+                Err(PlayerError::InvalidCommand)
+            );
+        }
+    }
+
+    #[test]
+    fn controller_requires_a_video_target_before_spawning() {
+        let mut player = PlayerController::new();
+
+        assert!(matches!(player.start(), Err(PlayerError::InvalidCommand)));
+        assert_eq!(
+            player
+                .control(PlaybackCommand::TogglePause)
+                .err()
+                .expect("targetless control must fail"),
+            PlayerError::InvalidCommand
+        );
+        assert!(player.runtime.is_none());
+        assert_eq!(player.snapshot().state, PlayerState::Stopped);
     }
 
     #[cfg(windows)]
@@ -1942,6 +2179,7 @@ mod tests {
             last_error_code: None,
             status_metrics: PlaybackMetrics::default(),
             pending_load: None,
+            video_target: None,
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2411,6 +2649,7 @@ mod tests {
     #[test]
     #[ignore = "requires an installed mpv; no media is loaded"]
     fn installed_mpv_accepts_json_ipc_and_shuts_down() {
+        let _environment = set_opt_in_environment(false);
         let mut runtime = MpvRuntime::spawn().expect("start installed mpv");
         assert!(
             runtime.job_is_configured(),
@@ -2452,8 +2691,8 @@ mod tests {
     #[test]
     #[ignore = "requires an installed mpv and Python fixture server"]
     fn installed_mpv_loads_header_protected_loopback_fixture_and_seeks() {
-        let fixture = start_loopback_fixture();
-        env::set_var("DORIYA_W0_ALLOW_LOOPBACK_HTTP", "1");
+        let _environment = set_opt_in_environment(true);
+        let fixture = start_loopback_fixture("s1-h264-aac.mp4");
         let media = validate_media(
             MediaLoadRequest {
                 url: fixture.info.url.clone(),
@@ -2469,6 +2708,11 @@ mod tests {
         .expect("valid loopback fixture media");
 
         let mut player = PlayerController::new();
+        player
+            .start_standalone()
+            .expect("start player for S1 fixture");
+        set_player_property(&mut player, "hr-seek", Value::String("yes".to_owned()));
+        set_player_property(&mut player, "hwdec", Value::String("no".to_owned()));
         player.open(media).expect("open Header-protected fixture");
         let playing = wait_for_playing(&mut player);
         assert!(
@@ -2482,34 +2726,185 @@ mod tests {
             .control(PlaybackCommand::Pause)
             .expect("pause fixture playback");
         assert_eq!(paused.state, PlayerState::Paused);
-
-        for index in 0..20 {
-            let offset = match index % 4 {
-                0 => 0.1,
-                1 => -0.1,
-                2 => 0.25,
-                _ => -0.25,
-            };
-            let snapshot = player
-                .control(PlaybackCommand::Seek(offset))
-                .expect("seek fixture playback");
-            assert_eq!(snapshot.state, PlayerState::Paused);
-            assert!(snapshot.media_loaded);
-            assert_eq!(snapshot.last_error_code, None);
-        }
-
-        player
-            .control(PlaybackCommand::Play)
-            .expect("resume fixture playback");
-        let resumed = wait_for_playing(&mut player);
-        assert_eq!(resumed.last_error_code, None);
+        verify_twenty_player_seeks(&mut player, "S1");
+        verify_playback_advances(&mut player, "S1");
         player.shutdown();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an installed mpv and Python fixture server"]
+    fn installed_mpv_decodes_synthetic_eac3_and_hevc10_fixtures_and_seeks() {
+        let _environment = set_opt_in_environment(true);
+
+        for case in [
+            ("s2-h264-eac3.mkv", "h264", "eac3", "yuv420p", None),
+            (
+                "s3-hevc10-flac-ass.mkv",
+                "hevc",
+                "flac",
+                "yuv420p10",
+                Some("ass"),
+            ),
+        ] {
+            let (
+                media_name,
+                expected_video,
+                expected_audio,
+                expected_pixel_format,
+                expected_subtitle,
+            ) = case;
+            let fixture = start_loopback_fixture(media_name);
+            let media = validate_media(
+                MediaLoadRequest {
+                    url: fixture.info.url.clone(),
+                    headers: [
+                        ("Referer".to_owned(), fixture.info.referer.clone()),
+                        ("User-Agent".to_owned(), fixture.info.user_agent.clone()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+                MediaPolicy::from_environment(),
+            )
+            .expect("valid synthetic loopback media");
+
+            let mut player = PlayerController::new();
+            player
+                .start_standalone()
+                .unwrap_or_else(|error| panic!("{media_name}: start player: {error:?}"));
+            set_player_property(&mut player, "hr-seek", Value::String("yes".to_owned()));
+            set_player_property(&mut player, "hwdec", Value::String("no".to_owned()));
+            player.open(media).expect("open synthetic fixture");
+            let playing = wait_for_playing(&mut player);
+            assert!(
+                playing
+                    .duration_seconds
+                    .is_some_and(|duration| duration >= 2.0),
+                "{media_name} duration must be available"
+            );
+            player
+                .control(PlaybackCommand::Pause)
+                .expect("pause synthetic fixture");
+
+            let video_codec = player_property(&mut player, "video-codec")
+                .as_str()
+                .expect("video codec string")
+                .to_ascii_lowercase();
+            assert!(
+                video_codec.contains(expected_video)
+                    || (expected_video == "hevc" && video_codec.contains("h265"))
+                    || (expected_video == "h264" && video_codec.contains("avc")),
+                "{media_name} decoded unexpected video codec: {video_codec}"
+            );
+            if expected_video == "hevc" {
+                assert_eq!(
+                    player_property(&mut player, "current-tracks/video/codec-profile")
+                        .as_str()
+                        .expect("video codec profile"),
+                    "Main 10",
+                    "{media_name} must decode the Main 10 profile"
+                );
+            }
+            assert_eq!(
+                player_property(&mut player, "audio-codec-name")
+                    .as_str()
+                    .expect("audio codec string"),
+                expected_audio,
+                "{media_name} decoded unexpected audio codec"
+            );
+            let pixel_format = player_property(&mut player, "video-params/pixelformat")
+                .as_str()
+                .expect("pixel format string")
+                .to_ascii_lowercase();
+            assert_eq!(
+                pixel_format.trim_end_matches("le"),
+                expected_pixel_format,
+                "{media_name} decoded unexpected pixel format"
+            );
+            assert_eq!(player_property(&mut player, "width").as_i64(), Some(320));
+            assert_eq!(player_property(&mut player, "height").as_i64(), Some(180));
+            assert!(
+                player_property(&mut player, "video-frame-info/picture-type")
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "{media_name} must report a decoded video frame"
+            );
+            assert_eq!(
+                player_property(&mut player, "audio-params/samplerate").as_i64(),
+                Some(48_000)
+            );
+            assert_eq!(
+                player_property(&mut player, "audio-params/channel-count").as_i64(),
+                Some(1)
+            );
+            assert_eq!(
+                player_property(&mut player, "hwdec-current").as_str(),
+                Some("no")
+            );
+            if let Some(expected_subtitle) = expected_subtitle {
+                let tracks = player_property(&mut player, "track-list");
+                let subtitle_track = tracks
+                    .as_array()
+                    .and_then(|tracks| {
+                        tracks.iter().find(|track| {
+                            track.get("type").and_then(Value::as_str) == Some("sub")
+                                && track.get("codec").and_then(Value::as_str)
+                                    == Some(expected_subtitle)
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{media_name} must expose an embedded {expected_subtitle} subtitle track")
+                    });
+                assert_eq!(
+                    subtitle_track.get("external").and_then(Value::as_bool),
+                    Some(false),
+                    "{media_name} subtitle track must be embedded"
+                );
+                let subtitle_id = subtitle_track
+                    .get("id")
+                    .and_then(Value::as_i64)
+                    .expect("embedded subtitle track id");
+                player
+                    .runtime_command_until(
+                        &json!(["set_property", "sid", subtitle_id]),
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                    .expect("select embedded ASS subtitle track");
+                assert_eq!(
+                    player_property(&mut player, "current-tracks/sub/codec")
+                        .as_str()
+                        .expect("selected subtitle codec"),
+                    expected_subtitle,
+                    "{media_name} must select the embedded subtitle track"
+                );
+            }
+
+            verify_twenty_player_seeks(&mut player, media_name);
+            if expected_subtitle.is_some() {
+                assert_eq!(
+                    player_property(&mut player, "current-tracks/sub/codec").as_str(),
+                    expected_subtitle,
+                    "{media_name} must retain the selected subtitle after seeks"
+                );
+            }
+            verify_playback_advances(&mut player, media_name);
+            if expected_subtitle.is_some() {
+                assert_eq!(
+                    player_property(&mut player, "current-tracks/sub/codec").as_str(),
+                    expected_subtitle,
+                    "{media_name} must retain the selected subtitle after resume"
+                );
+            }
+            player.shutdown();
+        }
     }
 
     #[cfg(windows)]
     #[test]
     #[ignore = "requires an installed mpv and public network access"]
     fn installed_mpv_routes_public_https_through_connect_relay() {
+        let _environment = set_opt_in_environment(false);
         let mut runtime = MpvRuntime::spawn().expect("start installed mpv");
         let proxy_url = {
             let relay = runtime

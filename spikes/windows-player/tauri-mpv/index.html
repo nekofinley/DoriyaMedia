@@ -24,6 +24,14 @@
       </header>
 
       <main>
+        <section class="video-stage" id="video-stage" aria-label="mpv 原生视频表面">
+          <div class="video-stage__placeholder">
+            <span>NATIVE VIDEO SURFACE</span>
+            <small>启动 sidecar 后由 Windows 子窗口承载，WebView 不承载视频帧</small>
+          </div>
+          <span class="video-stage__corner" aria-hidden="true">W0 / HWND</span>
+        </section>
+
         <section class="telemetry" aria-label="播放器状态">
           <article class="readout readout--wide">
             <span class="readout__label">STATE</span>
@@ -149,12 +157,18 @@
 
             <div class="button-row">
               <button class="button" id="fullscreen-button" type="button">
-                mpv 全屏切换
+                进入主窗口全屏
+              </button>
+              <button class="button" id="diagnostics-button" type="button" hidden>
+                窗口几何诊断
               </button>
               <button class="button button--danger" id="stop-button" type="button">
                 停止并清理
               </button>
             </div>
+            <p class="field-note" id="diagnostics-note">
+              debug 构建可读取主窗口、视频子窗口、DPI 和当前显示器几何。
+            </p>
           </div>
 
           <aside class="event-panel">

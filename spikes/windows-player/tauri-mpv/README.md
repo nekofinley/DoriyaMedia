@@ -1,6 +1,6 @@
 # Doriya Windows W0: Tauri 2 + mpv
 
-> Status: mechanism spike implemented and locally buildable. W0 is **not closed**. No 30-minute playback, 20-seek synchronization, DPI/display, GPU, Windows 11, or network matrix has been executed.
+> Status: mechanism spike implemented and locally buildable. W0 is **not closed**. A synthetic-media embedded-window/100%-fullscreen/resize smoke has passed, but no 30-minute playback, 20-seek synchronization on real media, DPI/display, GPU, Windows 11, or network matrix has been executed.
 
 This is an isolated feasibility prototype. It must not be copied into `clients/windows/` or used as a distributable installer.
 
@@ -37,6 +37,13 @@ The frontend is a control and status surface only. Rust owns:
   new playback or disarming the guard actively shuts down registered tunnels.
 - Header validation for only `Accept`, `Accept-Language`, `Origin`, `Referer`, and `User-Agent`.
 - Coded, non-sensitive errors and allowlisted diagnostic fields.
+- A dedicated Win32 child HWND owned by the Tauri main window. mpv is started
+  with `--wid=<surface>` and renders only inside the WebView-reported video
+  stage; HTML controls remain outside that rectangle because independent native
+  HWNDs cannot overlay the WebView with CSS.
+- Host-window fullscreen through Tauri. The video stage and its mpv child are
+  resized from the same DOM geometry, while a compact control strip remains
+  outside the native video surface.
 
 Media URLs and Header values are never placed in mpv command-line arguments,
 Tauri capabilities, local storage, or application log messages. The pipe name
@@ -89,7 +96,8 @@ and nested-resource policy as complete.
 `file-loaded` within that period, the host stops the sidecar and transitions to
 a stable error instead of remaining in `Opening` indefinitely.
 
-The application does not auto-load media. Use the masked URL input, or provide an environment input before starting:
+The application does not auto-load media by default. Use the masked URL input,
+or provide an environment input before starting:
 
 ```powershell
 $env:DORIYA_W0_MEDIA_URL = 'https://media.example.invalid/path'
@@ -99,6 +107,23 @@ $env:DORIYA_W0_MEDIA_ORIGIN = 'https://www.example.invalid'
 ```
 
 Environment values remain in the parent process environment and are not written by this spike. Prefer terminal-local environment variables and do not use shell history for production credentials.
+
+Debug builds also accept a strict loopback fixture shorthand and an explicit
+GUI automation hook:
+
+```powershell
+$env:DORIYA_W0_LOOPBACK_FIXTURE = '18431/s3-hevc10-flac-ass.mkv'
+$env:DORIYA_W0_AUTO_OPEN = '1'
+$env:DORIYA_W0_DEBUG_TRACE_PATH = 'C:\temp\doriya-w0-events.log'
+```
+
+`DORIYA_W0_LOOPBACK_FIXTURE` is accepted only in debug builds and is still
+validated by `DORIYA_W0_ALLOW_LOOPBACK_HTTP`. It constructs a loopback URL from
+the fixed host, numeric port, and a path restricted to safe filename segments.
+`DORIYA_W0_AUTO_OPEN` waits for one successful video-surface sync before opening
+the environment media. `DORIYA_W0_DEBUG_TRACE_PATH` records fixed event names
+and geometry-safe outcomes only; URLs, query strings, and Header values are not
+written.
 
 ## Verification performed
 
@@ -127,6 +152,10 @@ The Rust tests cover:
 - Enforcing a fixed five-second response deadline without blocking the controller
   thread, then forcing sidecar termination and state cleanup on timeout.
 - Proving sidecar arguments do not contain media URL, Header, or Cookie material.
+- Rejecting invalid video target handles instead of silently launching a
+  non-embedded mpv window, and marshalling all Win32 surface operations onto
+  Tauri's main event-loop thread through a bounded result channel. Blocking
+  mpv startup and IPC work is dispatched to Tauri's blocking pool.
 - Clearing the inherited environment and passing only an explicit allowlist to mpv.
 - Generating collision-resistant random pipe names, creating a one-ACE
   current-user DACL, rejecting remote clients, and proving a second client
@@ -156,6 +185,9 @@ The Rust tests cover:
 - Loading a Header-protected loopback MP4 through the full Tauri controller,
   pausing, issuing 20 relative seeks, resuming playback, and verifying no stale
   player error or leftover sidecar state.
+- Loading synthetic E-AC-3 and HEVC Main10/FLAC/ASS MKV fixtures through the
+  same controller, asserting decoded codecs, 10-bit pixel format, embedded ASS
+  track selection, and 20 relative seeks per fixture.
 - Keeping failed starts/open operations from publishing loaded or stale-session state.
 - Replacing a reaped runtime on a later start and clearing state after control transport failure.
 - Reading the current pause property before toggling instead of deriving it from stale UI metrics.
@@ -194,6 +226,23 @@ S1-S5 media, network, timing, or device acceptance. The test enables the direct
 loopback HTTP fixture mode, so it does not exercise or validate the CONNECT
 egress guard.
 
+The synthetic codec coverage test is also opt-in and requires Python:
+
+```powershell
+cargo test --locked installed_mpv_decodes_synthetic_eac3_and_hevc10_fixtures_and_seeks -- --ignored --nocapture
+```
+
+It loads `s2-h264-eac3.mkv` and `s3-hevc10-flac-ass.mkv` through the full
+controller with deterministic software decoding. It asserts `eac3`, `flac`,
+HEVC Main 10, the exact `yuv420p`/`yuv420p10` format, a decoded video frame,
+48 kHz mono audio, advancing audio PTS, and the embedded ASS track selected by
+its actual track ID. It then performs 20 controller seeks per fixture, waiting
+for each seek to settle and verifying `time-pos`, with at least 12 distinct
+landing positions. Subtitle selection is rechecked after seeks and resume.
+This proves synthetic demux/decode/track/seek wiring only; it does not replace a
+real S2 E-AC-3 sample, S3 ASS/PGS rendering, 30-minute play, or device
+acceptance.
+
 The public HTTPS relay probe is opt-in and requires network access:
 
 ```powershell
@@ -218,7 +267,7 @@ cmd.exe /d /s /c '"C:\Program Files\Microsoft Visual Studio\2022\Community\Commo
 
 `--no-bundle` is intentional: this Spike does not create a distributable installer and does not copy or package mpv, FFmpeg, VLC, or their codecs.
 
-Local verification on 2026-11-01:
+Local verification through 2026-11-02:
 
 | Gate | Result |
 | --- | --- |
@@ -226,16 +275,32 @@ Local verification on 2026-11-01:
 | `pnpm build` | Pass |
 | `cargo fmt --all -- --check` | Pass |
 | `cargo clippy --all-targets --locked -- -D warnings` | Pass |
-| `cargo test --locked` | Pass: 75 passed, 3 opt-in tests ignored |
+| `cargo test --locked` | Pass: 80 passed, 4 opt-in tests ignored |
 | Installed-mpv IPC smoke test | Pass: 3/3 consecutive runs |
 | Header-protected loopback MP4 + 20 seeks | Pass: 3/3 consecutive runs |
+| Synthetic S2 E-AC-3 + S3 HEVC10/FLAC/ASS + 20 position-verified seeks each | Pass: 3/3 consecutive runs |
 | Public HTTPS CONNECT with mpv owner-PID binding | Pass: 3/3 consecutive runs |
+| All four opt-in tests in one parallel invocation | Pass: 4/4 |
 | `pnpm tauri build --debug --no-bundle` | Pass |
-| Explorer-launched GUI smoke | Pass: window created, process responsive, clean process exit |
+| Final-build embedded synthetic S3 smoke | Pass: after main-thread marshalling and blocking-pool player commands, external Win32 reading observed `DoriyaW0MpvSurface` and mpv child both `WS_CHILD`, correct parent/PID ownership, and matching 1117x344 outer/client rectangles |
+| Final-build UI responsiveness during auto-open | Pass: 120/120 `SendMessageTimeout` probes completed with no hung window; maximum 12 ms, average 0.2 ms |
+| Host fullscreen with embedded video | Pass on the preceding build: 1920x1080 host, 1920x1017 video surface, compact controls retained |
+| Resize with embedded video | Pass on the preceding build: 900x650 host, 821x210 video surface, mpv child remained exactly aligned |
+| Stop lifecycle | Pass on the preceding build; forced host termination on the final build also left no mpv process |
 
 The first Tauri build attempt exhausted the host's free disk while producing full debug symbols. The successful final build set `CARGO_PROFILE_DEV_DEBUG=0`; this changes debug information, not application behavior, and produced the executable at `src-tauri/target/debug/doriya-w0-tauri-mpv.exe`. Generated build directories are ignored and are not part of the deliverable.
 
-Directly launching the generated GUI from the restricted Codex automation token made WebView2 return OS error 5 (`Access denied`). Launching the same executable through Explorer in the interactive desktop session succeeded. Use an interactive desktop session for GUI smoke tests; this is a harness constraint, not an application capability failure.
+The restricted automation session needed a writable WebView2 user-data folder
+and a software-rendered WebView2 UI before the page could load:
+
+```powershell
+$env:WEBVIEW2_USER_DATA_FOLDER = 'C:\temp\doriya-w0-ebwebview'
+$env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--disable-gpu'
+```
+
+This affects only the WebView2 control UI. mpv rendered the synthetic video in
+its own native HWND. The workaround is a harness constraint, not evidence for
+the normal user profile or a supported deployment configuration.
 
 ## Not executed
 
@@ -244,12 +309,24 @@ The following remain **open W0 gates** and must not be inferred from passing uni
 - Real S1-S5 media playback, including MKV, HEVC 10-bit, FLAC, ASS/PGS, Range and Header behavior.
 - Any 30-minute continuous playback run.
 - 20 random seeks on each real S1-S5 sample, seek recovery, or audio/video offset measurement against the 100 ms gate. The synthetic loopback fixture covers controller/seek mechanics only.
-- Fullscreen, 100%/150%/200% DPI, single/dual display, display hot-plug, sleep/resume, or window crossing.
+- 150%/200% DPI, mixed DPI, dual display, display hot-plug, sleep/resume, or window crossing. Fullscreen and resize were exercised only on one 1920x1080 display at 100%.
 - Windows 11, Intel/NVIDIA/AMD device matrix, Wi-Fi/hotspot/VPN/region changes.
 - Real Bilibili dual-stream `direct-dash`, audio/video merge, or expiry/fallback behavior.
 - License/distribution review for the installed mpv, FFmpeg and codec builds.
 - Production ticket storage, authentication, refresh, or the product
   `local-relay` transport. The W0 loopback egress guard is not that transport.
+
+Current fullscreen/display constraints:
+
+- The Tauri main window now drives fullscreen. The dedicated video surface and
+  its mpv child resize together, and the HTML control strip remains outside the
+  native video rectangle. CSS overlays over the video are intentionally not
+  supported by this prototype.
+- The current harness has one active 1920x1080 display at 100% scaling. It
+  cannot produce 150%, 200%, mixed-DPI, or dual-display evidence.
+- The configured minimum window is now 640x480 logical pixels, removing the
+  previous 620-pixel minimum-height contradiction at a hypothetical 200% scale.
+  This is a layout mitigation, not DPI acceptance evidence.
 
 ## Toolchain notes
 

@@ -5,6 +5,7 @@ pub mod media;
 mod network;
 mod relay;
 pub mod runtime;
+pub(crate) mod video_surface;
 #[cfg(windows)]
 pub(crate) mod windows_security;
 #[cfg(windows)]

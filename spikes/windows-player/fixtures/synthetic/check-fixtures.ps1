@@ -19,6 +19,10 @@ $fixtures = @(
   @{
     Name = "s3-hevc10-flac.mkv"
     Codecs = @("hevc", "flac")
+  },
+  @{
+    Name = "s3-hevc10-flac-ass.mkv"
+    Codecs = @("hevc", "flac", "ass")
   }
 )
 

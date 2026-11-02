@@ -157,7 +157,7 @@ pub fn validate_media(
 }
 
 pub fn request_from_environment() -> Result<MediaLoadRequest, MediaError> {
-    let url = env::var("DORIYA_W0_MEDIA_URL").map_err(|_| MediaError::UrlRequired)?;
+    let url = environment_media_url().ok_or(MediaError::UrlRequired)?;
     let mut headers = BTreeMap::new();
 
     for (variable, header) in [
@@ -173,6 +173,37 @@ pub fn request_from_environment() -> Result<MediaLoadRequest, MediaError> {
     }
 
     Ok(MediaLoadRequest { url, headers })
+}
+
+pub fn environment_media_url() -> Option<String> {
+    if let Ok(url) = env::var("DORIYA_W0_MEDIA_URL") {
+        if !url.is_empty() {
+            return Some(url);
+        }
+    }
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    env::var("DORIYA_W0_LOOPBACK_FIXTURE")
+        .ok()
+        .and_then(|value| parse_loopback_fixture(&value))
+}
+
+fn parse_loopback_fixture(value: &str) -> Option<String> {
+    let (port, path) = value.split_once('/')?;
+    let port = port.parse::<u16>().ok().filter(|port| *port > 0)?;
+    if path.is_empty()
+        || path.contains(['?', '#', '\\'])
+        || path
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "..")
+        || !path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
+    {
+        return None;
+    }
+    Some(format!("http://127.0.0.1:{port}/{path}"))
 }
 
 pub fn environment_header_count() -> usize {
@@ -364,6 +395,29 @@ mod tests {
                 .err()
                 .expect("URL must be rejected");
             assert_eq!(error, expected);
+        }
+    }
+
+    #[test]
+    fn loopback_fixture_shorthand_is_strictly_parsed() {
+        assert_eq!(
+            parse_loopback_fixture("18431/s3-hevc10-flac-ass.mkv").as_deref(),
+            Some("http://127.0.0.1:18431/s3-hevc10-flac-ass.mkv")
+        );
+        for invalid in [
+            "",
+            "0/file.mkv",
+            "18431/",
+            "18431/../secret.mkv",
+            "18431/sub//file.mkv",
+            "18431/file.mkv?token=x",
+            "18431/file.mkv#fragment",
+            "18431/file.mkv\\escape",
+        ] {
+            assert!(
+                parse_loopback_fixture(invalid).is_none(),
+                "accepted invalid fixture: {invalid}"
+            );
         }
     }
 

@@ -128,6 +128,60 @@ h2 {
   box-shadow: 0 0 0 4px rgba(20, 108, 103, 0.16);
 }
 
+.video-stage {
+  position: relative;
+  height: clamp(240px, 42vh, 520px);
+  margin-top: 22px;
+  overflow: hidden;
+  border: 1px solid var(--ink);
+  color: #f4f0e4;
+  background:
+    radial-gradient(circle at 50% 42%, rgba(232, 80, 28, 0.2), transparent 34%),
+    repeating-linear-gradient(
+      0deg,
+      rgba(255, 255, 255, 0.03) 0,
+      rgba(255, 255, 255, 0.03) 1px,
+      transparent 1px,
+      transparent 5px
+    ),
+    #0e1210;
+}
+
+.video-stage__placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  gap: 8px;
+  padding: 24px;
+  text-align: center;
+}
+
+.video-stage__placeholder span,
+.video-stage__corner {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  letter-spacing: 0.16em;
+}
+
+.video-stage__placeholder span {
+  color: #f0a72f;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.video-stage__placeholder small {
+  color: #aeb5a9;
+  font-size: 0.7rem;
+}
+
+.video-stage__corner {
+  position: absolute;
+  right: 12px;
+  bottom: 10px;
+  color: rgba(244, 240, 228, 0.46);
+  font-size: 0.58rem;
+}
+
 .telemetry {
   display: grid;
   grid-template-columns: 1.4fr repeat(3, minmax(0, 1fr));
@@ -189,7 +243,7 @@ h2 {
 
 .event-panel {
   display: flex;
-  min-height: 650px;
+  min-height: 520px;
   flex-direction: column;
   color: #ece9de;
   background:
@@ -434,6 +488,82 @@ footer {
   letter-spacing: 0.08em;
 }
 
+.shell--fullscreen,
+.shell--fullscreen body {
+  height: 100%;
+  overflow: hidden;
+  background: #090b09;
+}
+
+.shell--fullscreen .shell {
+  display: flex;
+  width: 100%;
+  height: 100vh;
+  margin: 0;
+  padding: 0;
+  flex-direction: column;
+  animation: none;
+}
+
+.shell--fullscreen .masthead,
+.shell--fullscreen .telemetry,
+.shell--fullscreen .event-panel,
+.shell--fullscreen footer {
+  display: none;
+}
+
+.shell--fullscreen main {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.shell--fullscreen .video-stage {
+  height: auto;
+  min-height: 0;
+  margin: 0;
+  flex: 1;
+  border: 0;
+}
+
+.shell--fullscreen .workspace {
+  display: block;
+  flex: 0 0 auto;
+  background: var(--paper);
+}
+
+.shell--fullscreen .control-panel {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-width: 1px 0 0;
+}
+
+.shell--fullscreen .control-panel > form,
+.shell--fullscreen .section-heading,
+.shell--fullscreen .range-control,
+.shell--fullscreen #diagnostics-note {
+  display: none;
+}
+
+.shell--fullscreen .transport {
+  flex: 1;
+  grid-template-columns: minmax(70px, 0.45fr) minmax(140px, 1fr) minmax(70px, 0.45fr);
+  gap: 8px;
+}
+
+.shell--fullscreen .transport__key,
+.shell--fullscreen .button {
+  min-height: 42px;
+}
+
+.shell--fullscreen .button-row {
+  margin: 0;
+  flex-wrap: nowrap;
+}
+
 @keyframes settle {
   from {
     opacity: 0;
@@ -528,6 +658,16 @@ footer {
 
   footer {
     display: grid;
+  }
+}
+
+@media (max-height: 700px) {
+  .video-stage {
+    height: 210px;
+  }
+
+  .event-panel {
+    min-height: 340px;
   }
 }
 

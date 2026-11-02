@@ -26,6 +26,8 @@ interface EnvironmentStatus {
   mediaUrlConfigured: boolean;
   headerCount: number;
   allowLoopbackHttp: boolean;
+  debugBuild: boolean;
+  autoOpen: boolean;
 }
 
 interface PlaybackCommand {
@@ -34,11 +36,69 @@ interface PlaybackCommand {
     | "pause"
     | "togglePause"
     | "seek"
-    | "setVolume"
-    | "toggleFullscreen";
+    | "setVolume";
   seconds?: number;
   volume?: number;
-  enabled?: boolean;
+}
+
+interface WindowLayoutState {
+  fullscreen: boolean;
+}
+
+interface SurfaceBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface WindowDiagnostics {
+  debugBuild: boolean;
+  fullscreen: boolean;
+  tauriScaleFactor: number;
+  tauriInnerWidth: number;
+  tauriInnerHeight: number;
+  monitor: {
+    name: string | null;
+    width: number;
+    height: number;
+    x: number;
+    y: number;
+    scaleFactor: number;
+  } | null;
+  surfaceCreated: boolean;
+  surfaceVisible: boolean;
+  surfaceBounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null;
+  native: {
+    clientWidth: number;
+    clientHeight: number;
+    dpi: number;
+    dpiScale: number;
+    monitorLeft: number;
+    monitorTop: number;
+    monitorRight: number;
+    monitorBottom: number;
+    workLeft: number;
+    workTop: number;
+    workRight: number;
+    workBottom: number;
+    mpvChild: {
+      className: string;
+      ownerPid: number;
+      parentMatches: boolean;
+      style: number;
+      visible: boolean;
+      width: number;
+      height: number;
+      clientWidth: number;
+      clientHeight: number;
+    } | null;
+  } | null;
 }
 
 interface SafeCommandError {
@@ -78,6 +138,9 @@ const errorLabels: Readonly<Record<string, string>> = {
   mpv_busy: "播放器正忙",
   invalid_command: "控制命令超出白名单或参数范围",
   internal_error: "本地命令层内部错误",
+  video_surface_unavailable: "原生视频表面不可用或拒绝当前边界",
+  window_control_failed: "主窗口原生操作失败",
+  debug_only: "窗口诊断仅在 debug 构建可用",
 };
 
 function element<T extends HTMLElement>(id: string): T {
@@ -114,8 +177,11 @@ const ui = {
   volume: element<HTMLInputElement>("volume"),
   volumeOutput: element<HTMLOutputElement>("volume-output"),
   fullscreenButton: element<HTMLButtonElement>("fullscreen-button"),
+  diagnosticsButton: element<HTMLButtonElement>("diagnostics-button"),
+  diagnosticsNote: element<HTMLElement>("diagnostics-note"),
   stopButton: element<HTMLButtonElement>("stop-button"),
   eventList: element<HTMLOListElement>("event-list"),
+  videoStage: element<HTMLElement>("video-stage"),
 };
 
 const isTauri = "__TAURI_INTERNALS__" in window;
@@ -124,6 +190,14 @@ let pollInFlight = false;
 let actionInFlight = false;
 let eventCount = 0;
 let lastLoggedErrorCode: string | null = null;
+let latestSnapshot: PlayerSnapshot | null = null;
+let surfaceVisible = false;
+let surfaceSyncFrame: number | null = null;
+let surfaceSyncInFlight = false;
+let surfaceSyncPending = false;
+let lastSurfaceSyncKey: string | null = null;
+let surfaceReady = false;
+let fullscreen = false;
 
 function recordEvent(message: string): void {
   const item = document.createElement("li");
@@ -186,6 +260,7 @@ function stateLabel(state: PlayerState): string {
 }
 
 function renderSnapshot(snapshot: PlayerSnapshot): void {
+  latestSnapshot = snapshot;
   ui.metricState.textContent = snapshot.state.toUpperCase();
   ui.metricSubstate.textContent = stateLabel(snapshot.state);
   ui.metricPid.textContent = snapshot.pid === null ? "—" : String(snapshot.pid);
@@ -208,6 +283,17 @@ function renderSnapshot(snapshot: PlayerSnapshot): void {
     lastLoggedErrorCode = snapshot.lastErrorCode;
   } else if (snapshot.lastErrorCode === null) {
     lastLoggedErrorCode = null;
+  }
+  const shouldShowSurface =
+    snapshot.state !== "stopped" &&
+    snapshot.state !== "exited" &&
+    snapshot.state !== "error";
+  if (shouldShowSurface !== surfaceVisible) {
+    surfaceVisible = shouldShowSurface;
+    scheduleSurfaceSync();
+    window.setTimeout(scheduleSurfaceSync, 80);
+    window.setTimeout(scheduleSurfaceSync, 260);
+    window.setTimeout(scheduleSurfaceSync, 600);
   }
 }
 
@@ -249,11 +335,105 @@ function setControlsDisabled(disabled: boolean): void {
     ui.seekForward,
     ui.pauseButton,
     ui.fullscreenButton,
+    ui.diagnosticsButton,
     ui.stopButton,
   ]) {
     button.disabled = disabled;
   }
   ui.envButton.disabled = disabled || !environmentReady;
+}
+
+function scheduleSurfaceSync(): void {
+  if (!isTauri || surfaceSyncFrame !== null) {
+    return;
+  }
+  surfaceSyncFrame = window.requestAnimationFrame(() => {
+    surfaceSyncFrame = null;
+    void syncSurface();
+  });
+}
+
+async function syncSurface(): Promise<boolean> {
+  if (!isTauri) {
+    return false;
+  }
+  if (surfaceSyncInFlight) {
+    surfaceSyncPending = true;
+    return false;
+  }
+  const rect = ui.videoStage.getBoundingClientRect();
+  const left = Math.max(0, rect.left);
+  const top = Math.max(0, rect.top);
+  const right = Math.min(window.innerWidth, rect.right);
+  const bottom = Math.min(window.innerHeight, rect.bottom);
+  const width = Math.max(0, right - left);
+  const height = Math.max(0, bottom - top);
+  const dpr = window.devicePixelRatio || 1;
+  const request = {
+    x: Math.round(left * dpr),
+    y: Math.round(top * dpr),
+    width: Math.round(width * dpr),
+    height: Math.round(height * dpr),
+    visible:
+      surfaceVisible &&
+      latestSnapshot !== null &&
+      width >= 2 &&
+      height >= 2,
+  };
+  const key = [
+    request.x,
+    request.y,
+    request.width,
+    request.height,
+    request.visible ? 1 : 0,
+  ].join(":");
+  if (key === lastSurfaceSyncKey) {
+    return true;
+  }
+  surfaceSyncInFlight = true;
+  try {
+    const applied = await callPlayer<SurfaceBounds>("sync_video_surface", { request });
+    lastSurfaceSyncKey = [
+      applied.x,
+      applied.y,
+      applied.width,
+      applied.height,
+      request.visible ? 1 : 0,
+    ].join(":");
+    surfaceReady = true;
+    return true;
+  } catch {
+    // A transient resize during teardown should not flood the event log.
+    lastSurfaceSyncKey = null;
+    surfaceReady = false;
+    return false;
+  } finally {
+    surfaceSyncInFlight = false;
+    if (surfaceSyncPending) {
+      surfaceSyncPending = false;
+      scheduleSurfaceSync();
+    }
+  }
+}
+
+async function ensureSurfaceSynced(): Promise<boolean> {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    if (await syncSurface()) {
+      return true;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+  }
+  return false;
+}
+
+function applyFullscreenState(next: boolean): void {
+  fullscreen = next;
+  lastSurfaceSyncKey = null;
+  document.documentElement.classList.toggle("shell--fullscreen", next);
+  ui.fullscreenButton.textContent = next ? "退出主窗口全屏" : "进入主窗口全屏";
+  scheduleSurfaceSync();
+  window.setTimeout(scheduleSurfaceSync, 80);
+  window.setTimeout(scheduleSurfaceSync, 260);
 }
 
 function clearSensitiveInputs(): void {
@@ -347,7 +527,32 @@ ui.seekForward.addEventListener("click", () => {
 });
 
 ui.fullscreenButton.addEventListener("click", () => {
-  void runAction("全屏切换", () => sendCommand({ kind: "toggleFullscreen" }));
+  void runAction("全屏切换", async () => {
+    const layout = await callPlayer<WindowLayoutState>("set_main_fullscreen", {
+      fullscreen: !fullscreen,
+    });
+    applyFullscreenState(layout.fullscreen);
+    recordEvent(layout.fullscreen ? "主窗口进入全屏 / 视频表面随视口同步" : "主窗口退出全屏");
+  });
+});
+
+ui.diagnosticsButton.addEventListener("click", () => {
+  void runAction("窗口诊断", async () => {
+    const diagnostics = await callPlayer<WindowDiagnostics>("window_diagnostics");
+    const monitor = diagnostics.monitor;
+    const native = diagnostics.native;
+    ui.diagnosticsNote.textContent = [
+      `window=${diagnostics.tauriInnerWidth}x${diagnostics.tauriInnerHeight}`,
+      `scale=${diagnostics.tauriScaleFactor.toFixed(2)}`,
+      `nativeDpi=${native ? `${native.dpi} (${native.dpiScale.toFixed(2)}x)` : "unavailable"}`,
+      `surface=${diagnostics.surfaceVisible ? "visible" : "hidden"} ${diagnostics.surfaceBounds?.width ?? 0}x${diagnostics.surfaceBounds?.height ?? 0}`,
+      `mpv=${native?.mpvChild ? `${native.mpvChild.className || "unknown"} pid=${native.mpvChild.ownerPid} ${native.mpvChild.visible ? "visible" : "hidden"} ${native.mpvChild.clientWidth}x${native.mpvChild.clientHeight}` : "missing"}`,
+      monitor
+        ? `monitor=${monitor.width}x${monitor.height}@${monitor.scaleFactor.toFixed(2)}`
+        : "monitor=unknown",
+    ].join(" · ");
+    recordEvent(`窗口诊断 / ${ui.diagnosticsNote.textContent}`);
+  });
 });
 
 ui.stopButton.addEventListener("click", () => {
@@ -367,6 +572,29 @@ ui.volume.addEventListener("change", () => {
   void runAction("音量", () => sendCommand({ kind: "setVolume", volume }));
 });
 
+window.addEventListener("resize", scheduleSurfaceSync);
+window.addEventListener("scroll", scheduleSurfaceSync, {
+  capture: true,
+  passive: true,
+});
+window.addEventListener("animationend", scheduleSurfaceSync, true);
+window.addEventListener("transitionend", scheduleSurfaceSync, true);
+window.visualViewport?.addEventListener("resize", scheduleSurfaceSync);
+window.visualViewport?.addEventListener("scroll", scheduleSurfaceSync);
+document.addEventListener("visibilitychange", scheduleSurfaceSync);
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && fullscreen && !actionInFlight) {
+    event.preventDefault();
+    void runAction("退出全屏", async () => {
+      const layout = await callPlayer<WindowLayoutState>("set_main_fullscreen", {
+        fullscreen: false,
+      });
+      applyFullscreenState(layout.fullscreen);
+    });
+  }
+});
+
 async function bootstrap(): Promise<void> {
   recordEvent("界面已加载 / 无媒体自动请求");
   if (!isTauri) {
@@ -378,15 +606,29 @@ async function bootstrap(): Promise<void> {
   }
 
   try {
+    setControlsDisabled(true);
     const environment = await callPlayer<EnvironmentStatus>("environment_status");
     environmentReady = environment.mediaUrlConfigured;
+    ui.diagnosticsButton.hidden = !environment.debugBuild;
     ui.envNote.textContent = environment.mediaUrlConfigured
       ? `环境输入可用：URL 已配置，${environment.headerCount} 个白名单 Header${environment.allowLoopbackHttp ? "，允许 loopback HTTP" : ""}。`
       : "未检测到 DORIYA_W0_MEDIA_URL；可使用上方受控输入。输入值不会持久化。";
-    setControlsDisabled(false);
     const snapshot = await callPlayer<PlayerSnapshot>("player_status");
     renderSnapshot(snapshot);
-    recordEvent("Rust 命令层可用");
+    if (!(await ensureSurfaceSynced()) || !surfaceReady) {
+      throw { code: "video_surface_unavailable" };
+    }
+    setControlsDisabled(false);
+    recordEvent("Rust 命令层与原生视频表面可用");
+    new ResizeObserver(scheduleSurfaceSync).observe(ui.videoStage);
+    if (environment.autoOpen) {
+      recordEvent("debug 自动装载已启用");
+      await runAction("自动装载", async () => {
+        const opened = await callPlayer<PlayerSnapshot>("player_open_from_environment");
+        renderSnapshot(opened);
+        recordEvent("环境媒体已提交到受控命令层");
+      });
+    }
   } catch (error: unknown) {
     ui.statusLabel.textContent = safeErrorLabel(error);
     recordEvent(`初始化失败 / ${safeErrorLabel(error)}`);

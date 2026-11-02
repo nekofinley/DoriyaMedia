@@ -16,8 +16,8 @@
         "title": "Doriya W0 / Tauri + mpv",
         "width": 1180,
         "height": 820,
-        "minWidth": 720,
-        "minHeight": 620,
+        "minWidth": 640,
+        "minHeight": 480,
         "resizable": true,
         "fullscreen": false,
         "center": true
