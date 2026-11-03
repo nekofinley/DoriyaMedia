@@ -1,8 +1,8 @@
 # Windows 播放内核 W0 Spike
 
-> 状态：两个候选均已形成隔离机制原型并通过本机构建、自动测试和无真实媒体的启动/探针冒烟；W0 尚未完成。
+> 状态：两个候选均已形成隔离机制原型并通过本机构建、自动测试和无真实媒体的启动/探针冒烟；Tauri 通过合成双流 `audio-add`、20 次 seek、PTS 诊断和失败清理，WinUI 通过 headless 双源 slave、20 次位置校验 seek 和有界停止；W0 尚未完成。
 >
-> 截至 2026-11-02，S1-S5 均未运行；30 分钟连续播放、真实样本 20 次随机 seek、音画差、真实 Bilibili 双流和 DPI/多显示器矩阵均无实测结果。
+> 截至 2026-11-04，S1-S5 均未运行；30 分钟连续播放、真实样本 20 次随机 seek、音画差、真实 Bilibili 双流和 DPI/多显示器矩阵均无实测结果。
 
 ## 1. 范围
 
@@ -56,7 +56,7 @@
 - 适用于目标架构的 LibVLCSharp NuGet 包。
 - 与 LibVLCSharp 版本匹配的 libVLC 动态库和 plugins。
 
-当前状态：本机已安装 .NET SDK `8.0.427`，原型位于 `winui-libvlcsharp/`。该项目能从已安装 VLC `3.0.19` 初始化 LibVLCSharp、显示 WinUI video surface、构造音频 slave，并支持 `Referer`/`User-Agent` 白名单 Header；其他 Header 或两流不同 Header 会 fail-closed。已用两个 loopback 合成源验证 `Opening -> Playing`，但没有真实来源、音画同步、seek 或 30 分钟结果。`libvlc.dll` 可加载不等于目标样本可解码，也不等于可随产品分发。
+当前状态：本机已安装 .NET SDK `8.0.427`，原型位于 `winui-libvlcsharp/`。该项目能从已安装 VLC `3.0.19` 初始化 LibVLCSharp、显示 WinUI video surface、构造音频 slave，并支持 `Referer`/`User-Agent` 白名单 Header；其他 Header 或两流不同 Header 会 fail-closed。headless 合成双源 probe 已用独立 loopback 视频/音频验证 `Opening -> Playing`、`AddSlave`、双轨保持、20 次位置校验 seek、恢复推进和有界停止；但没有真实来源、真实音画同步、真实来源 seek 或 30 分钟结果。`libvlc.dll` 可加载不等于目标样本可解码，也不等于可随产品分发。
 
 ## 3. 落盘目录
 
@@ -69,7 +69,7 @@ spikes/windows-player/
   tauri-mpv/                Tauri 2 + mpv 机制原型
   winui-libvlcsharp/        WinUI 3 + LibVLCSharp 机制原型
   fixtures/                 合成 S1-S3 样本与 Header/Range loopback fixture
-  results/                  脱敏机制记录；2026-11-02 嵌入窗口 smoke 已记录
+  results/                  脱敏机制记录；2026-11-02 至 2026-11-04 窗口/双流 probe 已记录
   artifacts/                未来本机构建产物；不进入版本控制
 ```
 
@@ -136,7 +136,7 @@ PREFLIGHT|<category>|<id>|<status>|<detail>|<source>
 | WebView2 | 155.0.4283.62 |
 | VLC | `libvlc.dll` 3.0.19 被发现；同目录 core 与 366 个 plugins DLL 的 PE 架构均为 x64；`vlc` 命令入口未发现 |
 | Tauri + mpv | `READY_FOR_PROTOTYPE`；机制原型已构建并通过空载 IPC smoke |
-| WinUI + LibVLCSharp | `READY_FOR_PROTOTYPE`；机制原型已构建并通过 LibVLC probe/app smoke |
+| WinUI + LibVLCSharp | `READY_FOR_PROTOTYPE`；机制原型已构建并通过 LibVLC probe、app 和双源 playback probe smoke |
 | 预检 summary | `READY_FOR_PROTOTYPE W0_NOT_RUN` |
 | Java、Gradle、adb、cmake | 已补齐；Java、Gradle、adb 不是 Windows W0 两个候选的直接构建依赖，cmake 只是可选构建工具 |
 
@@ -152,12 +152,12 @@ PREFLIGHT|<category>|<id>|<status>|<detail>|<source>
 
 | 候选 | 已验证 | 未验证 |
 | --- | --- | --- |
-| Tauri 2 + mpv | `pnpm install --frozen-lockfile`、`pnpm build`、`cargo fmt`、`cargo clippy -D warnings`、80 个 Rust tests（另 4 个需真实 mpv/Python/公网的 opt-in 测试）、真实 mpv 空载 IPC 连续 3/3、Header 保护 loopback MP4 + 20 次 seek 连续 3/3、合成 S2 E-AC-3 与 S3 HEVC10/FLAC/ASS codec 断言 + 各 20 次 seek 连续 3/3、公网 HTTPS CONNECT 的 mpv PID + 创建时间绑定探针连续 3/3；Tauri debug exe 构建、surface 原生操作主线程化、播放器阻塞 IPC 移入 blocking pool 后的最终构建普通窗口 smoke 和 UI 响应性探针、专用 Win32 视频子窗口 + mpv `--wid` 的合成 S3 GUI 嵌入、前一构建单屏 100% 全屏/resize 尺寸对齐和停止清理 smoke | 真实 S1-S5、双流、真实 Header 来源、30 分钟、真机 seek、150%/200%/双屏 DPI、GPU、网络、许可证 |
-| WinUI 3 + LibVLCSharp | .NET restore/build（0 warnings/errors）、91 个 xUnit tests、LibVLC 3.0.19 probe（含 audio slave/Header 构造）、Windows App SDK self-contained app smoke、loopback 双源 GUI 机制 smoke | 真实 S1-S5、真实 Bilibili 双流、跨源重定向、30 分钟、seek、音画差、DPI、GPU、网络、许可证 |
+| Tauri 2 + mpv | `pnpm install --frozen-lockfile`、`pnpm build`、`cargo fmt`、`cargo clippy -D warnings`、97 个 Rust tests（另 6 个需真实 mpv/Python/公网的 opt-in 测试）、真实 mpv 空载 IPC 连续 3/3、Header 保护 loopback MP4 + 20 次 seek 连续 3/3、合成 S2 E-AC-3 与 S3 HEVC10/FLAC/ASS codec 断言 + 各 20 次 seek 连续 3/3、独立 loopback video/audio 双流 `audio-add` + 20 次 seek 连续 3/3、缺失外部音频 fail-closed/清理连续 3/3、公网 HTTPS CONNECT 的 mpv PID + 创建时间绑定探针连续 3/3；Tauri debug exe 构建、surface 原生操作主线程化、播放器阻塞 IPC 移入 blocking pool、专用 Win32 视频子窗口 + mpv `--wid`、当前构建 `7be9a184...` 双流 GUI 自动装载、普通/1920x1080 全屏/640x480/1542x931 resize 几何一致、120/120 UI 响应性，以及正常关闭/强制终止零残留 smoke | 真实 S1-S5、真实双流/音画差、真实 Header 来源、30 分钟、真机 seek、150%/200%/双屏 DPI、GPU、网络、许可证 |
+| WinUI 3 + LibVLCSharp | .NET restore/build（0 warnings/errors）、91 个 core xUnit tests、独立 headless 双源 playback probe 1/1（聚焦连续 10/10，验证外部 audio slave、双轨保持、20 次位置校验 seek 和恢复推进）、LibVLC 3.0.19 probe（含 audio slave/Header 构造）、Windows App SDK self-contained app smoke、loopback 双源 GUI 机制 smoke | 真实 S1-S5、真实 Bilibili 双流、真实音画差、跨源重定向、30 分钟、真实来源 seek、DPI、GPU、实际 WinUI 合成、网络、许可证 |
 
-两个结果都只证明代码、依赖、窗口/进程生命周期和基础探针可工作，不能替代播放器级验收。Tauri 已隔离 mpv 环境变量、使用 128 位随机命名管道、校验原始进程句柄的 user SID/session、以绝对路径和 SHA-256 固定 sidecar、支持可选的同一句柄 Authenticode leaf signer SHA-256 pin、通过 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 使用 `KILL_ON_JOB_CLOSE` Job Object，将 capability 权限收紧为空，并实现有界 IPC 请求、`start-file`/`file-loaded`/`end-file` 状态、30 秒 `file-loaded` watchdog 和超时强杀清理；mpv 另启用 TLS 校验、禁用脚本/本地自动加载和 yt-dlp、设置网络超时，并配置 stream/demuxer Lavf 协议白名单与 redirect 上限；初始 HTTPS 预检拒绝私网/本机 IP literal 与 `localhost`。严格模式还使用无凭据的 `127.0.0.1` `CONNECT` egress guard：仅允许当前播放的精确 HTTPS CONNECT authority，在 Tauri 进程内按播放会话单次解析并固定 DNS、拒绝公私混合结果、只连接固定数字地址，并通过 `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` 匹配客户端侧 ESTABLISHED 行，要求连接 owner PID 和进程创建时间均等于已验证 mpv sidecar；监听器使用 `SO_EXCLUSIVEADDRUSE`，DNS 单飞解析的 CONNECT handler 最多等待 5 秒且不持有 relay 全局状态锁（底层 resolver worker 不可取消），新播放会话和 disarm 会主动关闭已登记隧道。隧道建立后不检查 TLS SNI、HTTP Host、path/query、method、Header 或响应内容；DNS 不在会话内重解析，严格 DNS/PID/relay 失败也不直连回退。重要残留风险：真实 HTTPS 要求 Lavf 白名单保留 `tcp`，而 `tcp://` 不使用 HTTP proxy，恶意嵌套 playlist 仍可能绕过 CONNECT guard 直接建连，因此 W0 不是进程级 egress fail-closed；正式安全门禁前需要 WFP、AppContainer、进程级防火墙或等价网络层。新增 opt-in 集成测试已让真实 mpv 经完整 Tauri 控制器加载 Header 保护的 loopback 合成 MP4，暂停后执行 20 次相对 seek 并恢复播放，连续 3/3；S2/S3 合成 MKV 另断言 E-AC-3、HEVC Main10、FLAC、`yuv420p10` 和嵌入 ASS 轨道选择，并各执行 20 次位置校验 seek（等待 seek 收敛、验证 `time-pos`，至少 12 个不同落点），连续 3/3；公网 HTTPS CONNECT 的 owner-PID + 创建时间探针也连续 3/3。该结果只证明 Header、IPC、状态机、合成 seek 和单-authority egress guard 机制，不是 S1-S5 真机结果。仍需完成真实签名发行物、签名版本清单、生产强制发布者门禁、跨 origin HLS/DASH 重定向/嵌套资源矩阵和真实媒体验证。PID + 创建时间匹配是进程所有权关联而非密码学认证；普通 PID 复用已被缩小，handle 复制、内核失陷和同用户调试/注入被明确置于 W0 威胁模型之外。WinUI 已实现 `Referer`/`User-Agent` media option 与音频 slave，但 LibVLC 3.0.19 不能安全表达 `Origin`/`Accept`/`Accept-Language` 或两流不同 Header，因此这些场景必须拒绝。
+两个结果都只证明代码、依赖、窗口/进程生命周期和基础探针可工作，不能替代播放器级验收。Tauri 已隔离 mpv 环境变量、使用 128 位随机命名管道、校验原始进程句柄的 user SID/session、以绝对路径和 SHA-256 固定 sidecar、支持可选的同一句柄 Authenticode leaf signer SHA-256 pin、通过 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 使用 `KILL_ON_JOB_CLOSE` Job Object，将 capability 权限收紧为空，并实现有界 IPC 请求、`start-file`/`file-loaded`/`end-file` 状态、30 秒 `file-loaded` watchdog 和超时强杀清理；mpv 另启用 TLS 校验、禁用脚本/本地自动加载和 yt-dlp、设置网络超时，并配置 stream/demuxer Lavf 协议白名单与 redirect 上限；初始 HTTPS 预检拒绝私网/本机 IP literal 与 `localhost`。双流请求只接受主视频 + 可选外部音频，两路 URL 分别校验、Header 必须完全一致，严格 relay 模式拒绝跨 origin 音频；控制器在 `loadfile` 前先设置 pause，等待主轨后执行 `audio-add <url> select`，确认外部音轨选中后才恢复播放。严格模式还使用无凭据的 `127.0.0.1` `CONNECT` egress guard：仅允许当前播放的精确 HTTPS CONNECT authority，在 Tauri 进程内按播放会话单次解析并固定 DNS、拒绝公私混合结果、只连接固定数字地址，并通过 `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` 匹配客户端侧 ESTABLISHED 行，要求连接 owner PID 和进程创建时间均等于已验证 mpv sidecar；监听器使用 `SO_EXCLUSIVEADDRUSE`，DNS 单飞解析的 CONNECT handler 最多等待 5 秒且不持有 relay 全局状态锁（底层 resolver worker 不可取消），新播放会话和 disarm 会主动关闭已登记隧道；每个播放最多接受 512 个已通过 origin 校验的连接，新播放重置预算，并另有 16 个并发连接上限。隧道建立后不检查 TLS SNI、HTTP Host、path/query、method、Header 或响应内容；DNS 不在会话内重解析，严格 DNS/PID/relay 失败也不直连回退。重要残留风险：真实 HTTPS 要求 Lavf 白名单保留 `tcp`，而 `tcp://` 不使用 HTTP proxy，恶意嵌套 playlist 仍可能绕过 CONNECT guard 直接建连，因此 W0 不是进程级 egress fail-closed；正式安全门禁前需要 WFP、AppContainer、进程级防火墙或等价网络层。新增 opt-in 集成测试已让真实 mpv 经完整 Tauri 控制器加载 Header 保护的 loopback 合成 MP4，暂停后执行 20 次相对 seek 并恢复播放，连续 3/3；S2/S3 合成 MKV 另断言 E-AC-3、HEVC Main10、FLAC、`yuv420p10` 和嵌入 ASS 轨道选择，并各执行 20 次位置校验 seek（等待 seek 收敛、验证 `time-pos`，至少 12 个不同落点），连续 3/3；双流测试用两个独立 loopback origin 验证视频轨 + 外部 AAC 轨均选中、20 次 seek 后保持，并记录 0.027-0.031 秒的合成 PTS 诊断样本，连续 3/3；缺失音频路径连续 3/3 fail-closed 且无运行时残留。公网 HTTPS CONNECT 的 owner-PID + 创建时间探针此前连续 3/3；本轮合并 opt-in 运行时因本机直连未建立上游隧道（`raw=1`，`session=0`），不计为双流回归。当前构建 `7be9a184...` 又在自动装载期间完成 120/120 次窗口响应探测（最大 13.62 ms、平均 0.61 ms），正常关闭和强制终止后均无 host/mpv 残留。该结果只证明 Header、IPC、状态机、合成 seek、合成双流、当前构建窗口/生命周期和单-authority egress guard 机制，不是 S1-S5 真机结果。仍需完成真实签名发行物、签名版本清单、生产强制发布者门禁、跨 origin HLS/DASH 重定向/嵌套资源矩阵和真实媒体验证。PID + 创建时间匹配是进程所有权关联而非密码学认证；普通 PID 复用已被缩小，handle 复制、内核失陷和同用户调试/注入被明确置于 W0 威胁模型之外。WinUI 已实现 `Referer`/`User-Agent` media option 与音频 slave，独立 headless 双源 probe 已在 dummy 输出下连续 10/10 通过 20 次位置校验 seek 和双轨保持；诊断中定位到 LibVLC 3.0.19 在清除 pause 后立即高频读取 `State`/`Time` 会触发 D3D11 卸载竞态，probe 现在等待 100 ms 后再轮询，后端也不再从 `Stopped` 回调读取 LibVLC 属性；但 LibVLC 3.0.19 不能安全表达 `Origin`/`Accept`/`Accept-Language` 或两流不同 Header，因此这些场景必须拒绝。该 probe 不证明实际 WinUI swap-chain、音频设备、真实音画差或真实来源。
 
-`fixtures/synthetic/` 中已有 H.264/AAC、H.264/E-AC-3、HEVC Main10/FLAC 和 HEVC Main10/FLAC/ASS 四个合成样本，并通过 `ffprobe` 与 mpv 空输出解码检查；真实 S2 E-AC-3 样本仍未提供。Tauri opt-in 集成测试通过完整控制器加载 S2/S3 样本，强制软件解码并断言 E-AC-3/FLAC/HEVC Main 10、精确 `yuv420p`/`yuv420p10`、已解码视频帧、48 kHz 单声道音频、推进的 audio PTS，以及按真实 track ID 选择并在 seek/resume 后保持的嵌入 ASS 轨道。两个样本各执行 20 次位置校验 seek，每次等待 seek 收敛并验证 `time-pos`，至少出现 12 个不同落点，连续 3/3。`fixtures/header-range-server.py` 和 `check-header-range.ps1` 已通过 HEAD 200、100-byte Range 206、416、缺失 Header 403 和 mpv HTTP Header 注入检查。合成样本只验证机制，不关闭 S1-S5，也不证明真实 ASS/PGS 渲染质量。
+`fixtures/synthetic/` 中已有 H.264/AAC、H.264/E-AC-3、HEVC Main10/FLAC、HEVC Main10/FLAC/ASS，以及从 S1 派生的纯视频/纯音频六个合成样本，并通过 `ffprobe` 与 mpv 空输出解码检查；真实 S2 E-AC-3 样本仍未提供。Tauri opt-in 集成测试通过完整控制器加载 S2/S3 样本，强制软件解码并断言 E-AC-3/FLAC/HEVC Main 10、精确 `yuv420p`/`yuv420p10`、已解码视频帧、48 kHz 单声道音频、推进的 audio PTS，以及按真实 track ID 选择并在 seek/resume 后保持的嵌入 ASS 轨道。两个样本各执行 20 次位置校验 seek，每次等待 seek 收敛并验证 `time-pos`，至少出现 12 个不同落点，连续 3/3。双流测试另用独立 loopback origin 加载纯视频与纯音频，断言外部 AAC 轨选中并在 20 次 seek 后保持，连续 3/3；缺失外部音频路径也连续 3/3 清理。`fixtures/header-range-server.py` 和 `check-header-range.ps1` 已通过 HEAD 200、100-byte Range 206、416、缺失 Header 403 和 mpv HTTP Header 注入检查。合成样本只验证机制，不关闭 S1-S5，也不证明真实 ASS/PGS 渲染质量或 100 ms 音画差门禁。
 
 ```powershell
 .\fixtures\synthetic\check-fixtures.ps1
@@ -207,10 +207,10 @@ S4/S5 结果只能在脱敏记录中保留样本 ID、host:port、状态码、Ra
 ## 8. 尚未执行
 
 - 未执行 S1-S5 的实际播放、解码、字幕、Header、双流或 fallback 测试。
-- 未在真实 S1-S5 样本上执行 30 分钟连续播放、20 次随机 seek、音画差测量或 DPI/多显示器矩阵；合成 loopback 样本的 20 次 seek 仅为机制证据。
+- 未在真实 S1-S5 样本上执行 30 分钟连续播放、20 次随机 seek、音画差测量或 DPI/多显示器矩阵；合成 loopback 样本的 20 次 seek 与 PTS 样本仅为机制证据。
 - 未在 Windows 11、Intel GPU、真实双屏/混合 DPI 或睡眠恢复环境验证。
-- Tauri 已改为宿主窗口全屏，并在 Tauri 主窗口内创建专用 Win32 视频子窗口；mpv 通过 `--wid` 嵌入该容器，合成 S3 媒体在 1180x820、1920x1080 全屏和 900x650 resize 下均验证了父 HWND、可见性和尺寸一致。当前测试机仍只有单块 1920x1080、100% 活动显示器，无法生成双屏、150%/200% 或混合 DPI 证据；CSS 覆盖控件与透明 WebView2 合成也未验证。
-- 未验证真实 Bilibili 双流、源 URL 过期、地区错误、单流 403 或 Wi-Fi/热点切换。
+- Tauri 已改为宿主窗口全屏，并在 Tauri 主窗口内创建专用 Win32 视频子窗口；mpv 通过 `--wid` 嵌入该容器。当前构建 `7be9a184...` 已在合成 S3 媒体上复测普通窗口 Tauri 外框/客户区 1196x859/1180x820（视频容器与 mpv 均为 1117x344）、1920x1080 全屏（均为 1920x1017）、640x480/1542x931 client resize（分别为 601x171/1380x391），并验证父 HWND、`WS_CHILD`、可见性和尺寸一致；自动装载期间 120/120 次窗口响应探测通过，`F11` 切换全屏，`Escape` 仅退出全屏。当前测试机仍只有单块 1920x1080、100% 活动显示器，无法生成双屏、150%/200% 或混合 DPI 证据；CSS 覆盖控件与透明 WebView2 合成也未验证。
+- 未验证真实 Bilibili 双流、源 URL 过期、地区错误、单流 403 或 Wi-Fi/热点切换；Tauri 的合成双流只使用独立的本地 HTTP fixture，不能替代 S4/S5。
 - Tauri 已有可选的 Authenticode leaf signer SHA-256 pin、Lavf 协议白名单/redirect 上限、30 秒 `file-loaded` watchdog，以及单播放会话、精确 CONNECT authority、DNS pin、mpv PID + 创建时间绑定的 W0 egress guard；但尚无真实签名 mpv 发行物、生产强制发布者门禁、签名版本清单、轮换/吊销策略、产品 `local-relay`、完整跨 origin HLS/DASH 重定向/嵌套资源矩阵和真实媒体验证。未配置 signer pin 时，内容 SHA-256 仍只固定文件、不证明发布者身份。由于 Lavf 白名单必须保留 `tcp`，嵌套 `tcp://` 仍可绕过 HTTP proxy/CONNECT guard，当前 guard 不是进程级 egress fail-closed；正式安全门禁前需要 WFP、AppContainer、进程级防火墙或等价网络层。egress guard 也不防同用户调试器/进程注入，不能作为产品 relay 或 S3 安全门禁证据。
 - WinUI 只支持对两路源同时生效的 `Referer`/`User-Agent`；`Origin`、`Accept`、`Accept-Language`、两流不同 Header、跨源重定向和真实 Bilibili 双流均未验收。
 - 未完成两个候选的许可证与发布义务复核。

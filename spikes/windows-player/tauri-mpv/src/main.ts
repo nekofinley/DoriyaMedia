@@ -24,6 +24,7 @@ interface PlayerSnapshot {
 
 interface EnvironmentStatus {
   mediaUrlConfigured: boolean;
+  audioUrlConfigured: boolean;
   headerCount: number;
   allowLoopbackHttp: boolean;
   debugBuild: boolean;
@@ -114,6 +115,8 @@ const errorLabels: Readonly<Record<string, string>> = {
   media_url_scheme: "媒体 URL 仅允许 HTTPS",
   media_url_insecure: "非 loopback HTTP 被拒绝",
   media_url_host_not_public: "媒体 URL 不能指向私网或本机主机",
+  media_audio_url_duplicate: "音频 URL 必须与主媒体 URL 不同",
+  media_audio_headers_mismatch: "双流必须使用完全相同的白名单 Header",
   header_not_allowed: "Header 名称不在白名单",
   header_duplicate: "Header 名称重复",
   header_value_invalid: "Header 值含非法字符或格式错误",
@@ -134,6 +137,9 @@ const errorLabels: Readonly<Record<string, string>> = {
   mpv_ipc_rejected: "mpv 拒绝命令",
   mpv_ipc_peer_mismatch: "mpv IPC 端点身份校验失败",
   mpv_media_load_failed: "mpv 媒体加载失败",
+  mpv_media_audio_load_failed: "mpv 外部音频流加载失败",
+  mpv_media_dual_origin_unsupported: "当前出站模式不支持跨 origin 双流",
+  mpv_egress_mode_unsupported: "当前出站模式不支持该媒体来源",
   mpv_exited: "mpv sidecar 已退出",
   mpv_busy: "播放器正忙",
   invalid_command: "控制命令超出白名单或参数范围",
@@ -164,6 +170,7 @@ const ui = {
   metricPaused: element<HTMLElement>("metric-paused"),
   loadForm: element<HTMLFormElement>("load-form"),
   mediaUrl: element<HTMLInputElement>("media-url"),
+  audioUrl: element<HTMLInputElement>("audio-url"),
   referer: element<HTMLInputElement>("header-referer"),
   userAgent: element<HTMLInputElement>("header-user-agent"),
   origin: element<HTMLInputElement>("header-origin"),
@@ -438,6 +445,7 @@ function applyFullscreenState(next: boolean): void {
 
 function clearSensitiveInputs(): void {
   ui.mediaUrl.value = "";
+  ui.audioUrl.value = "";
   ui.referer.value = "";
   ui.userAgent.value = "";
   ui.origin.value = "";
@@ -483,15 +491,24 @@ async function refreshStatus(): Promise<void> {
 ui.loadForm.addEventListener("submit", (event) => {
   event.preventDefault();
   const url = ui.mediaUrl.value.trim();
+  const audioUrl = ui.audioUrl.value.trim();
   if (url === "") {
     recordEvent("装载被拒绝 / URL 为空");
     return;
   }
   const headers = buildHeaders();
+  const request: {
+    url: string;
+    headers: Record<string, string>;
+    audio?: { url: string; headers: Record<string, string> };
+  } = { url, headers };
+  if (audioUrl !== "") {
+    request.audio = { url: audioUrl, headers };
+  }
   clearSensitiveInputs();
   void runAction("装载", async () => {
     const snapshot = await callPlayer<PlayerSnapshot>("player_open", {
-      request: { url, headers },
+      request,
     });
     renderSnapshot(snapshot);
     recordEvent("装载命令已受理 / 输入已清空");
@@ -526,14 +543,16 @@ ui.seekForward.addEventListener("click", () => {
   void runAction("前进", () => sendCommand({ kind: "seek", seconds: 10 }));
 });
 
-ui.fullscreenButton.addEventListener("click", () => {
-  void runAction("全屏切换", async () => {
-    const layout = await callPlayer<WindowLayoutState>("set_main_fullscreen", {
-      fullscreen: !fullscreen,
-    });
-    applyFullscreenState(layout.fullscreen);
-    recordEvent(layout.fullscreen ? "主窗口进入全屏 / 视频表面随视口同步" : "主窗口退出全屏");
+async function switchFullscreen(next: boolean): Promise<void> {
+  const layout = await callPlayer<WindowLayoutState>("set_main_fullscreen", {
+    fullscreen: next,
   });
+  applyFullscreenState(layout.fullscreen);
+  recordEvent(layout.fullscreen ? "主窗口进入全屏 / 视频表面随视口同步" : "主窗口退出全屏");
+}
+
+ui.fullscreenButton.addEventListener("click", () => {
+  void runAction("全屏切换", () => switchFullscreen(!fullscreen));
 });
 
 ui.diagnosticsButton.addEventListener("click", () => {
@@ -584,14 +603,14 @@ window.visualViewport?.addEventListener("scroll", scheduleSurfaceSync);
 document.addEventListener("visibilitychange", scheduleSurfaceSync);
 
 document.addEventListener("keydown", (event) => {
+  if (event.key === "F11" && !actionInFlight) {
+    event.preventDefault();
+    void runAction("全屏切换", () => switchFullscreen(!fullscreen));
+    return;
+  }
   if (event.key === "Escape" && fullscreen && !actionInFlight) {
     event.preventDefault();
-    void runAction("退出全屏", async () => {
-      const layout = await callPlayer<WindowLayoutState>("set_main_fullscreen", {
-        fullscreen: false,
-      });
-      applyFullscreenState(layout.fullscreen);
-    });
+    void runAction("退出全屏", () => switchFullscreen(false));
   }
 });
 
@@ -611,7 +630,7 @@ async function bootstrap(): Promise<void> {
     environmentReady = environment.mediaUrlConfigured;
     ui.diagnosticsButton.hidden = !environment.debugBuild;
     ui.envNote.textContent = environment.mediaUrlConfigured
-      ? `环境输入可用：URL 已配置，${environment.headerCount} 个白名单 Header${environment.allowLoopbackHttp ? "，允许 loopback HTTP" : ""}。`
+      ? `环境输入可用：主媒体 URL 已配置${environment.audioUrlConfigured ? "，外部音频 URL 已配置" : ""}，${environment.headerCount} 个白名单 Header${environment.allowLoopbackHttp ? "，允许 loopback HTTP" : ""}。`
       : "未检测到 DORIYA_W0_MEDIA_URL；可使用上方受控输入。输入值不会持久化。";
     const snapshot = await callPlayer<PlayerSnapshot>("player_status");
     renderSnapshot(snapshot);

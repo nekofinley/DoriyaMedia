@@ -53,7 +53,8 @@ framework-dependent on the installed .NET 8 runtime.
 ## Reproduce
 
 The verification script keeps NuGet packages, HTTP cache, CLI state, and
-temporary data under this spike directory:
+temporary data under this spike directory. The playback probe additionally
+requires an installed VLC 3.x runtime and `python` on `PATH`:
 
 ```powershell
 .\verify.ps1
@@ -65,6 +66,7 @@ Equivalent explicit commands:
 dotnet restore .\DoriyaMedia.WinUISpike.sln --configfile .\NuGet.Config
 dotnet build .\DoriyaMedia.WinUISpike.sln -c Debug --no-restore
 dotnet test .\tests\DoriyaMedia.WinUISpike.Core.Tests\DoriyaMedia.WinUISpike.Core.Tests.csproj -c Debug --arch x64 --no-build --no-restore
+dotnet test .\tests\DoriyaMedia.WinUISpike.PlaybackProbe.Tests\DoriyaMedia.WinUISpike.PlaybackProbe.Tests.csproj -c Debug --arch x64 --no-build --no-restore
 dotnet run --project .\tools\DoriyaMedia.WinUISpike.VlcProbe\DoriyaMedia.WinUISpike.VlcProbe.csproj -c Debug --no-build --no-restore
 ```
 
@@ -79,7 +81,9 @@ path, so use the executable path above.
 
 ## Actual verification results
 
-Recorded on 2026-11-01 on Windows 10 22H2 (`10.0.19045`, x64):
+Recorded on 2026-11-01 on Windows 10 22H2 (`10.0.19045`, x64), with the
+deterministic dual-source playback probe added on 2026-11-03 and the current
+LibVLC resume race mitigated on 2026-11-04:
 
 - `dotnet restore`: PASS, exit code 0.
 - `dotnet build -c Debug`: PASS, 0 warnings and 0 errors.
@@ -95,6 +99,22 @@ Recorded on 2026-11-01 on Windows 10 22H2 (`10.0.19045`, x64):
   by separate loopback fixture servers with exact `Referer`/`User-Agent`
   requirements; the UI reached `Opening` then `Playing`. This proves mechanism
   wiring only, not real-source, synchronization, seek, or codec acceptance.
+- Deterministic headless dual-source playback probe: PASS on 2026-11-04. The
+  automatic test starts the same two loopback fixture servers, applies the
+  production `MediaLoadPlanBuilder` validation, attaches the audio-only MP4
+  with `Media.AddSlave(MediaSlaveType.Audio, ...)`, and observes `Opening` and
+  `Playing` with one selected H.264 video track and one selected AAC slave
+  track. It performs 20 position-checked seeks while paused and rechecks both
+  tracks after every seek, then resumes and checks forward progress. The probe
+  also bounds `MediaPlayer.Stop()` and fixture-process cleanup. This remains
+  synthetic mechanism evidence only; it does not measure audio/video sync.
+  LibVLC 3.0.19 crashed in `D3D11.DLL_unloaded` when the probe polled
+  `State`/`Time` immediately after clearing pause; a 100 ms resume-settle
+  window before polling eliminated the failure. Ten consecutive clean-build
+  runs passed with 20 distinct position samples each.
+- Full `.\verify.ps1` on 2026-11-04: PASS, including fixture integrity, solution
+  build with 0 warnings / 0 errors, 91 core tests, the dual-source playback
+  probe, 94 relay tests, and the LibVLC initialization/slave construction probe.
 - The framework-dependent diagnostic launch failed with `0x80070005` before
   window creation in the Codex host, as described above.
 
@@ -158,7 +178,8 @@ fragment, escaped-separator, malformed-host and value-redaction cases; VLC
 location success and failure branches through a fake filesystem; header
 allowlisting and exact LibVLC option construction; audio-slave planning;
 playback adapter state mapping; and diagnostic redaction. The synthetic
-loopback GUI smoke is separate from the automatic test suite.
+loopback playback probe is an integration test because it starts Python fixture
+servers and a real LibVLC instance; the GUI smoke remains separate.
 
 ## Gates not executed
 
@@ -166,7 +187,12 @@ The following gates remain open and must not be inferred from a successful
 build:
 
 - S1-S5 end-to-end client scenarios were not executed.
-- No 30-minute playback, memory, network-switch, seek, or recovery soak was run.
+- No 30-minute playback, memory, network-switch, real-source seek, or recovery
+  soak was run. The 20 seeks above are synthetic mechanism evidence only.
+- The LibVLC 3.0.19 resume-time D3D11 unload race was avoided in the probe by
+  not calling player properties during the native resume transition. The WinUI
+  surface itself uses backend events and still needs interactive
+  open/pause/resume/seek/close soak testing.
 - No per-monitor DPI, mixed-DPI, display hot-plug, or accessibility review was
   run. The manifest declares PerMonitorV2, but that is not DPI acceptance.
 - No license/compliance gate was executed. LibVLCSharp is LGPL-2.1-or-later,

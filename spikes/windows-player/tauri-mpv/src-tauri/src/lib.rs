@@ -5,8 +5,8 @@ use std::sync::{mpsc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use player::media::{
-    environment_header_count, environment_media_url, request_from_environment, validate_media,
-    MediaError, MediaLoadRequest, MediaPolicy,
+    environment_audio_url, environment_header_count, environment_media_url,
+    request_from_environment, validate_media, MediaError, MediaLoadRequest, MediaPolicy,
 };
 use player::runtime::{PlaybackCommand, PlayerController, PlayerError, PlayerSnapshot};
 use player::video_surface::{self, NativeWindowMetrics, SurfaceBounds, VideoSurface};
@@ -159,6 +159,7 @@ impl From<CommandRequest> for PlaybackCommand {
 #[serde(rename_all = "camelCase")]
 struct EnvironmentStatus {
     media_url_configured: bool,
+    audio_url_configured: bool,
     header_count: usize,
     allow_loopback_http: bool,
     debug_build: bool,
@@ -235,6 +236,7 @@ fn environment_status() -> EnvironmentStatus {
     let media_url_configured = environment_media_url().is_some();
     EnvironmentStatus {
         media_url_configured,
+        audio_url_configured: environment_audio_url().is_some(),
         header_count: environment_header_count(),
         allow_loopback_http: policy.allows_loopback_http(),
         debug_build: cfg!(debug_assertions),

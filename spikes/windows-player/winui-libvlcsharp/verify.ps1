@@ -16,6 +16,9 @@ $env:DOTNET_NOLOGO = '1'
 
 Push-Location $root
 try {
+    & (Join-Path $root '..\fixtures\synthetic\check-fixtures.ps1') -SkipMpv
+    if ($LASTEXITCODE -ne 0) { throw "fixture integrity check failed with exit code $LASTEXITCODE" }
+
     dotnet restore .\DoriyaMedia.WinUISpike.sln --configfile .\NuGet.Config
     if ($LASTEXITCODE -ne 0) { throw "dotnet restore failed with exit code $LASTEXITCODE" }
 
@@ -23,8 +26,19 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "dotnet build failed with exit code $LASTEXITCODE" }
 
     dotnet test .\tests\DoriyaMedia.WinUISpike.Core.Tests\DoriyaMedia.WinUISpike.Core.Tests.csproj `
-        -c Debug --arch x64 --no-build --no-restore
+        -c Debug --arch x64 --no-build --no-restore `
+        --blame-hang-timeout 45s
     if ($LASTEXITCODE -ne 0) { throw "dotnet test failed with exit code $LASTEXITCODE" }
+
+    dotnet test .\tests\DoriyaMedia.WinUISpike.PlaybackProbe.Tests\DoriyaMedia.WinUISpike.PlaybackProbe.Tests.csproj `
+        -c Debug --arch x64 --no-build --no-restore `
+        --blame-hang-timeout 45s
+    if ($LASTEXITCODE -ne 0) { throw "dual-source playback probe failed with exit code $LASTEXITCODE" }
+
+    dotnet test .\tests\DoriyaMedia.WinUISpike.LoopbackRelayProbe.Tests\DoriyaMedia.WinUISpike.LoopbackRelayProbe.Tests.csproj `
+        -c Debug --no-build --no-restore `
+        --blame-hang-timeout 45s
+    if ($LASTEXITCODE -ne 0) { throw "loopback relay probe failed with exit code $LASTEXITCODE" }
 
     dotnet run --project .\tools\DoriyaMedia.WinUISpike.VlcProbe\DoriyaMedia.WinUISpike.VlcProbe.csproj `
         -c Debug --no-build --no-restore

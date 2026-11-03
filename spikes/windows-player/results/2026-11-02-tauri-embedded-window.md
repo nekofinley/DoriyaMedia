@@ -1,7 +1,12 @@
-# Tauri embedded-window smoke (2026-11-02)
+# Tauri embedded-window smoke (2026-11-02 to 2026-11-03)
 
 Status: local mechanism evidence only. This does not close W0, G4, or any real
 media gate.
+
+The interaction geometry in this document belongs to the historical
+`da851673...` build. Current-build geometry, responsiveness, keyboard
+transitions, and forced-cleanup evidence is recorded in
+`2026-11-04-tauri-current-build-window.md`.
 
 ## Environment
 
@@ -43,34 +48,37 @@ Results:
 - Rust tests: 80 passed, 0 failed, 4 opt-in tests ignored.
 - Opt-in tests: 4 passed, 0 failed.
 - Final debug executable SHA-256:
-  `2a84396de4895a38941b1754f8441b43e097723e8471930cc9bf8787674ec6d3`.
+  `da8516735cd8b499d5a9790c84a20b6b131e93631327a706e814ad4f487c00b0`.
 
 The final build marshals video-surface creation, bounds changes, visibility
 changes, and native diagnostics onto Tauri's main event-loop thread. A worker
 thread only waits on a bounded one-result channel. Invalid video targets are
 rejected instead of silently removing mpv's `--wid` argument. Blocking process
 startup, IPC, status, and stop work runs on Tauri's blocking pool rather than
-the WebView/IPC callback thread.
+the WebView/IPC callback thread. The 2026-11-03 final build also accepts `F11`
+as a fullscreen toggle; `Escape` remains an exit-only shortcut.
 
-## Final-build thread-marshalling recheck
+## Prior-build interaction recheck (`da851673...`)
 
 The final executable auto-opened the same synthetic S3 fixture. An external
-Win32 reading observed:
+Win32 reading observed the normal window, fullscreen, and two resize
+geometries:
 
-| Window | Owner PID | Parent | Style | WS_CHILD | Outer | Client |
-| --- | ---: | ---: | --- | --- | ---: | ---: |
-| `DoriyaW0MpvSurface` | 25364 | Tauri main | `0x56000000` | yes | 1117x344 | 1117x344 |
-| `mpv` | 7696 | video surface | `0x58000000` | yes | 1117x344 | 1117x344 |
-| `WRY_WEBVIEW` | 25364 | Tauri main | `0x52000000` | yes | 1180x820 | 1180x820 |
+| State | Tauri main outer/client | Video surface outer/client | mpv outer/client |
+| --- | ---: | ---: | ---: |
+| Normal launch | 1196x859 / 1180x820 | 1117x344 / 1117x344 | 1117x344 / 1117x344 |
+| `F11` fullscreen | 1920x1080 / 1920x1080 | 1920x1017 / 1920x1017 | 1920x1017 / 1920x1017 |
+| Native Size, minimum | 656x519 / 640x480 | 601x171 / 601x171 | 601x171 / 601x171 |
+| Native Size, larger | 1558x970 / 1542x931 | 1380x391 / 1380x391 | 1380x391 / 1380x391 |
 
 The parent chain and exact geometry agreement remained valid after routing the
-surface operations through the main thread. During MPV startup and fixture
-loading, 120 `WM_NULL`/`SendMessageTimeout` probes all completed with no hung
-window; observed maximum latency was 12 ms and average latency was 0.2 ms.
-Forced host termination also released the Job Object and left no mpv process.
-This run did not repeat the fullscreen or 900x650 resize interaction after the
-thread-marshalling change; those geometry rows below remain earlier-build
-evidence.
+surface operations through the main thread. Both the fullscreen button path and
+the new `F11` path produced the 1920x1017 video rectangle while retaining the
+HTML control strip. Exiting with either `F11` or `Escape` returned to windowed
+mode. During MPV startup and fixture loading, 120
+`WM_NULL`/`SendMessageTimeout` probes all completed with no hung window;
+observed maximum latency was 11 ms and average latency was 0.1 ms. Forced host
+termination also released the Job Object and left no mpv process.
 
 ## GUI fixture
 
@@ -78,19 +86,18 @@ The fixture server bound only to `127.0.0.1:18431`. Debug-only environment
 variables selected the checked-out synthetic S3 MKV and requested one automatic
 open after a successful video-surface sync.
 
-Earlier-build fullscreen Win32 readings:
+Prior-build fullscreen Win32 readings:
 
 | Window | Owner PID | Parent | Style | WS_CHILD | Outer | Client |
 | --- | ---: | ---: | --- | --- | ---: | ---: |
-| Tauri main | 29924 | desktop | n/a | n/a | 1920x1080 | 1920x1080 |
-| `DoriyaW0MpvSurface` | 29924 | Tauri main | `0x56000000` | yes | 1920x1017 | 1920x1017 |
-| `mpv` | 25348 | video surface | `0x58000000` | yes | 1920x1017 | 1920x1017 |
-| `WRY_WEBVIEW` | 29924 | Tauri main | `0x52000000` | yes | 1920x1080 | 1920x1080 |
+| Tauri main | 14144 | desktop | n/a | n/a | 1920x1080 | 1920x1080 |
+| `DoriyaW0MpvSurface` | 14144 | Tauri main | `0x56000000` | yes | 1920x1017 | 1920x1017 |
+| `mpv` | 9408 | video surface | `0x58000000` | yes | 1920x1017 | 1920x1017 |
+| `WRY_WEBVIEW` | 14144 | Tauri main | `0x52000000` | yes | 1920x1080 | 1920x1080 |
 
-An 1180x820 normal-window run reported the video surface and mpv child as
-1117x344 outer and client rectangles. A 900x650 resize run reported both as
-821x210. These runs verified the same parent chain, both `WS_CHILD` styles, and
-exact container/mpv geometry agreement.
+The normal-window run used PIDs 3228/22000 for the host/mpv pair. The resize
+run used PIDs 8548/21980. All three interaction runs retained the same parent
+chain, both `WS_CHILD` styles, and exact container/mpv geometry agreement.
 
 ## Lifecycle
 

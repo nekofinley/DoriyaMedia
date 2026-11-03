@@ -26,14 +26,51 @@ pub struct MediaLoadRequest {
     pub url: String,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub audio: Option<MediaStreamRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MediaStreamRequest {
+    pub url: String,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
 }
 
 pub struct ValidatedMedia {
+    video: ValidatedStream,
+    audio: Option<ValidatedStream>,
+}
+
+pub struct ValidatedStream {
     url: Url,
     headers: Vec<ValidatedHeader>,
 }
 
 impl ValidatedMedia {
+    pub fn url(&self) -> &str {
+        self.video.url()
+    }
+
+    pub fn url_scheme(&self) -> &str {
+        self.video.url_scheme()
+    }
+
+    pub fn header_fields(&self) -> Vec<String> {
+        self.video.header_fields()
+    }
+
+    pub fn audio(&self) -> Option<&ValidatedStream> {
+        self.audio.as_ref()
+    }
+
+    pub(crate) fn relay_origin(&self) -> Option<RelayOrigin> {
+        self.video.relay_origin()
+    }
+}
+
+impl ValidatedStream {
     pub fn url(&self) -> &str {
         self.url.as_str()
     }
@@ -54,6 +91,7 @@ impl ValidatedMedia {
     }
 }
 
+#[derive(Eq, PartialEq)]
 struct ValidatedHeader {
     name: &'static str,
     value: String,
@@ -105,6 +143,8 @@ pub enum MediaError {
     HeaderDuplicate,
     HeaderValueInvalid,
     HeaderTooLarge,
+    AudioUrlDuplicate,
+    AudioHeadersMismatch,
 }
 
 impl MediaError {
@@ -122,6 +162,8 @@ impl MediaError {
             Self::HeaderDuplicate => "header_duplicate",
             Self::HeaderValueInvalid => "header_value_invalid",
             Self::HeaderTooLarge => "header_too_large",
+            Self::AudioUrlDuplicate => "media_audio_url_duplicate",
+            Self::AudioHeadersMismatch => "media_audio_headers_mismatch",
         }
     }
 
@@ -139,6 +181,10 @@ impl MediaError {
             Self::HeaderDuplicate => "A header was supplied more than once.",
             Self::HeaderValueInvalid => "A header value is malformed.",
             Self::HeaderTooLarge => "The supplied headers exceed the configured limit.",
+            Self::AudioUrlDuplicate => "The audio stream must use a different media URL.",
+            Self::AudioHeadersMismatch => {
+                "Both media streams must use the same allowlisted headers."
+            }
         }
     }
 }
@@ -147,11 +193,33 @@ pub fn validate_media(
     request: MediaLoadRequest,
     policy: MediaPolicy,
 ) -> Result<ValidatedMedia, MediaError> {
-    validate_url(&request.url, policy)?;
-    let headers = validate_headers(request.headers, policy)?;
+    let video = validate_stream(request.url, request.headers, policy)?;
+    let audio = request
+        .audio
+        .map(|request| validate_stream(request.url, request.headers, policy))
+        .transpose()?;
 
-    Ok(ValidatedMedia {
-        url: Url::parse(&request.url).map_err(|_| MediaError::UrlInvalid)?,
+    if let Some(audio) = audio.as_ref() {
+        if video.url == audio.url {
+            return Err(MediaError::AudioUrlDuplicate);
+        }
+        if video.headers != audio.headers {
+            return Err(MediaError::AudioHeadersMismatch);
+        }
+    }
+
+    Ok(ValidatedMedia { video, audio })
+}
+
+fn validate_stream(
+    url: String,
+    headers: BTreeMap<String, String>,
+    policy: MediaPolicy,
+) -> Result<ValidatedStream, MediaError> {
+    validate_url(&url, policy)?;
+    let headers = validate_headers(headers, policy)?;
+    Ok(ValidatedStream {
+        url: Url::parse(&url).map_err(|_| MediaError::UrlInvalid)?,
         headers,
     })
 }
@@ -172,7 +240,16 @@ pub fn request_from_environment() -> Result<MediaLoadRequest, MediaError> {
         }
     }
 
-    Ok(MediaLoadRequest { url, headers })
+    let audio = environment_audio_url().map(|url| MediaStreamRequest {
+        url,
+        headers: headers.clone(),
+    });
+
+    Ok(MediaLoadRequest {
+        url,
+        headers,
+        audio,
+    })
 }
 
 pub fn environment_media_url() -> Option<String> {
@@ -187,6 +264,12 @@ pub fn environment_media_url() -> Option<String> {
     env::var("DORIYA_W0_LOOPBACK_FIXTURE")
         .ok()
         .and_then(|value| parse_loopback_fixture(&value))
+}
+
+pub fn environment_audio_url() -> Option<String> {
+    env::var("DORIYA_W0_AUDIO_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
 fn parse_loopback_fixture(value: &str) -> Option<String> {
@@ -315,6 +398,7 @@ fn validate_headers(
         });
     }
 
+    validated.sort_by_key(|header| header.name);
     Ok(validated)
 }
 
@@ -339,6 +423,7 @@ mod tests {
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                 .collect(),
+            audio: None,
         }
     }
 
@@ -521,5 +606,77 @@ mod tests {
         .expect("duplicate header must be rejected");
 
         assert_eq!(error, MediaError::HeaderDuplicate);
+    }
+
+    #[test]
+    fn accepts_distinct_video_and_audio_streams_with_matching_headers() {
+        let mut request = request(
+            "https://media.example.invalid/video.mp4",
+            &[("Referer", "https://www.example.invalid/")],
+        );
+        request.audio = Some(MediaStreamRequest {
+            url: "https://media.example.invalid/audio.mp4".to_owned(),
+            headers: request.headers.clone(),
+        });
+
+        let media = validate_media(request, MediaPolicy::strict()).expect("valid dual stream");
+
+        assert_eq!(
+            media.audio().map(ValidatedStream::url),
+            Some("https://media.example.invalid/audio.mp4")
+        );
+        assert_eq!(
+            media.audio().expect("audio stream").header_fields(),
+            vec!["Referer: https://www.example.invalid/".to_owned()]
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_audio_url_and_mismatched_headers() {
+        let url = "https://media.example.invalid/video.mp4";
+        let mut duplicate = request(url, &[]);
+        duplicate.audio = Some(MediaStreamRequest {
+            url: url.to_owned(),
+            headers: Default::default(),
+        });
+        assert_eq!(
+            validate_media(duplicate, MediaPolicy::strict())
+                .err()
+                .expect("duplicate URL must fail"),
+            MediaError::AudioUrlDuplicate
+        );
+
+        let mut mismatched = request(url, &[("User-Agent", "Doriya-W0/0.1")]);
+        mismatched.audio = Some(MediaStreamRequest {
+            url: "https://media.example.invalid/audio.mp4".to_owned(),
+            headers: [("User-Agent".to_owned(), "Doriya-W0/0.2".to_owned())]
+                .into_iter()
+                .collect(),
+        });
+        assert_eq!(
+            validate_media(mismatched, MediaPolicy::strict())
+                .err()
+                .expect("mismatched headers must fail"),
+            MediaError::AudioHeadersMismatch
+        );
+    }
+
+    #[test]
+    fn compares_headers_after_canonical_normalization() {
+        let mut request = request(
+            "https://media.example.invalid/video.mp4",
+            &[("Accept", "video/*"), ("user-agent", "Doriya-W0/0.1")],
+        );
+        request.audio = Some(MediaStreamRequest {
+            url: "https://media.example.invalid/audio.mp4".to_owned(),
+            headers: [
+                ("User-Agent".to_owned(), "Doriya-W0/0.1".to_owned()),
+                ("accept".to_owned(), "video/*".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        });
+
+        assert!(validate_media(request, MediaPolicy::strict()).is_ok());
     }
 }

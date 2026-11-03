@@ -17,6 +17,10 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tools", "tools", "{6BC6DB04
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DoriyaMedia.WinUISpike.VlcProbe", "tools\DoriyaMedia.WinUISpike.VlcProbe\DoriyaMedia.WinUISpike.VlcProbe.csproj", "{D72A5324-F717-4D33-A4FF-CA17B81154D8}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DoriyaMedia.WinUISpike.PlaybackProbe.Tests", "tests\DoriyaMedia.WinUISpike.PlaybackProbe.Tests\DoriyaMedia.WinUISpike.PlaybackProbe.Tests.csproj", "{806D35C5-2CE7-4BAF-881A-335966C76748}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DoriyaMedia.WinUISpike.LoopbackRelayProbe.Tests", "tests\DoriyaMedia.WinUISpike.LoopbackRelayProbe.Tests\DoriyaMedia.WinUISpike.LoopbackRelayProbe.Tests.csproj", "{A9F46B6F-28FD-4786-9EEA-7BEAEC36B4F0}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -42,11 +46,21 @@ Global
 		{D72A5324-F717-4D33-A4FF-CA17B81154D8}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{D72A5324-F717-4D33-A4FF-CA17B81154D8}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{D72A5324-F717-4D33-A4FF-CA17B81154D8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{806D35C5-2CE7-4BAF-881A-335966C76748}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{806D35C5-2CE7-4BAF-881A-335966C76748}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{806D35C5-2CE7-4BAF-881A-335966C76748}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{806D35C5-2CE7-4BAF-881A-335966C76748}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A9F46B6F-28FD-4786-9EEA-7BEAEC36B4F0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A9F46B6F-28FD-4786-9EEA-7BEAEC36B4F0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A9F46B6F-28FD-4786-9EEA-7BEAEC36B4F0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A9F46B6F-28FD-4786-9EEA-7BEAEC36B4F0}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{9D742CFB-2368-4BDE-92E4-017402D2F49A} = {CD5568EF-564D-44DF-A5F3-5C14E9CD414B}
 		{38C5A88E-F479-4F71-8CCE-E79CA192A4D1} = {CD5568EF-564D-44DF-A5F3-5C14E9CD414B}
 		{E139BC42-877B-4DEB-9ED1-EEB193012ECA} = {EC562CF5-5055-4719-88B0-9DCAFD15D697}
 		{D72A5324-F717-4D33-A4FF-CA17B81154D8} = {6BC6DB04-9AD8-4E28-80C8-E449F932E779}
+		{806D35C5-2CE7-4BAF-881A-335966C76748} = {EC562CF5-5055-4719-88B0-9DCAFD15D697}
+		{A9F46B6F-28FD-4786-9EEA-7BEAEC36B4F0} = {EC562CF5-5055-4719-88B0-9DCAFD15D697}
 	EndGlobalSection
 EndGlobal

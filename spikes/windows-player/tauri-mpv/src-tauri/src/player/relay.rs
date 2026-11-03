@@ -28,7 +28,7 @@ use super::windows_tcp_owner::tcp_connection_owner_pid;
 const MAX_CONNECT_HEADER_BYTES: usize = 8 * 1024;
 const MAX_CONNECT_HEADER_COUNT: usize = 32;
 const MAX_RELAY_CONNECTIONS: usize = 16;
-const MAX_SESSION_CONNECTIONS: usize = 512;
+const MAX_PLAYBACK_CONNECTIONS: usize = 512;
 const CONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TUNNEL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -130,7 +130,7 @@ pub(crate) struct RelayProxy {
     state: Arc<RwLock<RelayState>>,
     shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
-    session_connections: Arc<AtomicUsize>,
+    playback_connections: Arc<AtomicUsize>,
     #[cfg(test)]
     established_tunnels: Arc<AtomicUsize>,
     active_tunnels: Arc<Mutex<HashMap<u64, Vec<TcpStream>>>>,
@@ -165,7 +165,7 @@ impl RelayProxy {
         state.generation = state.generation.wrapping_add(1);
         state.origin = Some(origin);
         state.pin = Some(Arc::new(PinCell::default()));
-        self.session_connections.store(0, Ordering::SeqCst);
+        self.playback_connections.store(0, Ordering::SeqCst);
         self.shutdown_tunnels();
         Ok(self.proxy_url())
     }
@@ -228,7 +228,7 @@ impl RelayProxy {
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let active_connections = Arc::new(AtomicUsize::new(0));
-        let session_connections = Arc::new(AtomicUsize::new(0));
+        let playback_connections = Arc::new(AtomicUsize::new(0));
         #[cfg(test)]
         let established_tunnels = Arc::new(AtomicUsize::new(0));
         let active_tunnels = Arc::new(Mutex::new(HashMap::new()));
@@ -240,7 +240,7 @@ impl RelayProxy {
             state: Arc::clone(&state),
             shutdown: Arc::clone(&shutdown),
             active_connections: Arc::clone(&active_connections),
-            session_connections: Arc::clone(&session_connections),
+            playback_connections: Arc::clone(&playback_connections),
             #[cfg(test)]
             established_tunnels: Arc::clone(&established_tunnels),
             active_tunnels: Arc::clone(&active_tunnels),
@@ -255,7 +255,7 @@ impl RelayProxy {
             state,
             shutdown,
             active_connections,
-            session_connections,
+            playback_connections,
             #[cfg(test)]
             established_tunnels,
             active_tunnels,
@@ -288,8 +288,8 @@ impl RelayProxy {
     }
 
     #[cfg(test)]
-    pub(crate) fn session_connection_count(&self) -> usize {
-        self.session_connections.load(Ordering::SeqCst)
+    pub(crate) fn playback_connection_count(&self) -> usize {
+        self.playback_connections.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
@@ -351,7 +351,7 @@ struct AcceptContext {
     state: Arc<RwLock<RelayState>>,
     shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
-    session_connections: Arc<AtomicUsize>,
+    playback_connections: Arc<AtomicUsize>,
     #[cfg(test)]
     established_tunnels: Arc<AtomicUsize>,
     active_tunnels: Arc<Mutex<HashMap<u64, Vec<TcpStream>>>>,
@@ -365,7 +365,7 @@ fn accept_loop(listener: TcpListener, context: AcceptContext) {
         state,
         shutdown,
         active_connections,
-        session_connections,
+        playback_connections,
         #[cfg(test)]
         established_tunnels,
         active_tunnels,
@@ -387,7 +387,7 @@ fn accept_loop(listener: TcpListener, context: AcceptContext) {
                 let active_guard = ActiveConnection::new(Arc::clone(&active_connections));
                 let state = Arc::clone(&state);
                 let shutdown = Arc::clone(&shutdown);
-                let session_connections = Arc::clone(&session_connections);
+                let playback_connections = Arc::clone(&playback_connections);
                 #[cfg(test)]
                 let established_tunnels = Arc::clone(&established_tunnels);
                 let active_tunnels = Arc::clone(&active_tunnels);
@@ -398,7 +398,7 @@ fn accept_loop(listener: TcpListener, context: AcceptContext) {
                         stream,
                         state,
                         shutdown,
-                        session_connections,
+                        playback_connections,
                         #[cfg(test)]
                         established_tunnels,
                         active_tunnels,
@@ -429,6 +429,14 @@ impl Drop for ActiveConnection {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+fn consume_playback_connection(count: &AtomicUsize) -> bool {
+    if count.fetch_add(1, Ordering::SeqCst) >= MAX_PLAYBACK_CONNECTIONS {
+        count.fetch_sub(1, Ordering::SeqCst);
+        return false;
+    }
+    true
 }
 
 fn validate_connection_owner(
@@ -485,7 +493,7 @@ fn handle_client(
     mut client: TcpStream,
     state: Arc<RwLock<RelayState>>,
     shutdown: Arc<AtomicBool>,
-    session_connections: Arc<AtomicUsize>,
+    playback_connections: Arc<AtomicUsize>,
     #[cfg(test)] established_tunnels: Arc<AtomicUsize>,
     active_tunnels: Arc<Mutex<HashMap<u64, Vec<TcpStream>>>>,
     next_tunnel_id: Arc<AtomicU64>,
@@ -512,12 +520,6 @@ fn handle_client(
             return;
         }
     };
-    if session_connections.fetch_add(1, Ordering::SeqCst) >= MAX_SESSION_CONNECTIONS {
-        session_connections.fetch_sub(1, Ordering::SeqCst);
-        let _ = write_response(&client, "503 Service Unavailable");
-        return;
-    }
-
     let (origin, generation, pin, target_mode) = match state.read() {
         Ok(relay_state) => {
             let Some(origin) = relay_state.origin.clone() else {
@@ -552,6 +554,10 @@ fn handle_client(
         }
     };
     if !generation_is_current(&state, generation) || shutdown.load(Ordering::SeqCst) {
+        return;
+    }
+    if !consume_playback_connection(&playback_connections) {
+        let _ = write_response(&client, "503 Service Unavailable");
         return;
     }
     let upstream = match connect_first_allowed(&addresses) {
@@ -1155,6 +1161,38 @@ mod tests {
         assert_eq!(calls.get(), 1);
     }
 
+    #[test]
+    fn playback_connection_budget_is_capped_and_reset_between_playbacks() {
+        let consumed = AtomicUsize::new(0);
+        for _ in 0..MAX_PLAYBACK_CONNECTIONS {
+            assert!(consume_playback_connection(&consumed));
+        }
+
+        assert_eq!(consumed.load(Ordering::SeqCst), MAX_PLAYBACK_CONNECTIONS);
+        assert!(
+            !consume_playback_connection(&consumed),
+            "the 513th CONNECT in one playback must be rejected"
+        );
+        consumed.store(0, Ordering::SeqCst);
+        assert!(consume_playback_connection(&consumed));
+        assert_eq!(consumed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn starting_a_new_playback_resets_the_connection_budget() {
+        let relay =
+            RelayProxy::start_loopback_fixture(origin("127.0.0.1", 443)).expect("start relay");
+        relay
+            .playback_connections
+            .store(MAX_PLAYBACK_CONNECTIONS, Ordering::SeqCst);
+
+        relay
+            .begin_playback(origin("127.0.0.1", 443))
+            .expect("begin playback");
+
+        assert_eq!(relay.playback_connection_count(), 0);
+    }
+
     #[cfg(windows)]
     #[test]
     fn tunnel_requires_the_bound_process_and_exact_origin() {
@@ -1189,6 +1227,62 @@ mod tests {
             )))
             .expect("write CONNECT");
         assert!(read_response(&mut client).starts_with("HTTP/1.1 200"));
+        client.write_all(b"PING").expect("write tunneled data");
+        let mut response = [0u8; 4];
+        client
+            .read_exact(&mut response)
+            .expect("read tunneled response");
+        assert_eq!(&response, b"PONG");
+        upstream_thread.join().expect("join upstream");
+        relay.stop();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cross_origin_rejections_do_not_consume_the_playback_budget() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
+        let upstream_address = upstream.local_addr().expect("upstream address");
+        let mut relay =
+            RelayProxy::start_loopback_fixture(origin("127.0.0.1", upstream_address.port()))
+                .expect("start relay");
+
+        for _ in 0..MAX_PLAYBACK_CONNECTIONS {
+            let mut rejected = TcpStream::connect(relay.address()).expect("connect to relay");
+            rejected
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set rejected-connection timeout");
+            rejected
+                .write_all(&connect_request("example.test:443"))
+                .expect("write wrong-origin request");
+            assert!(read_response(&mut rejected).starts_with("HTTP/1.1 403"));
+        }
+        assert_eq!(
+            relay.playback_connection_count(),
+            0,
+            "cross-origin rejections must not consume a playback connection"
+        );
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().expect("accept upstream");
+            let mut request = [0u8; 4];
+            stream.read_exact(&mut request).expect("read tunneled data");
+            assert_eq!(&request, b"PING");
+            stream.write_all(b"PONG").expect("write tunneled response");
+        });
+        let mut client = TcpStream::connect(relay.address()).expect("connect legal client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set legal-connection timeout");
+        client
+            .write_all(&connect_request(&format!(
+                "127.0.0.1:{}",
+                upstream_address.port()
+            )))
+            .expect("write legal CONNECT");
+        assert!(
+            read_response(&mut client).starts_with("HTTP/1.1 200"),
+            "a legal CONNECT must still be admitted after 512 rejected origins"
+        );
         client.write_all(b"PING").expect("write tunneled data");
         let mut response = [0u8; 4];
         client

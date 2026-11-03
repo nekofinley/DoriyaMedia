@@ -98,6 +98,9 @@ pub enum PlayerError {
     IpcProtocol,
     IpcRejected,
     MediaLoadFailed,
+    MediaAudioLoadFailed,
+    MediaDualOriginUnsupported,
+    EgressModeUnsupported,
     Exited,
     InvalidCommand,
     Internal,
@@ -121,6 +124,9 @@ impl PlayerError {
             Self::IpcProtocol => "mpv_ipc_protocol",
             Self::IpcRejected => "mpv_ipc_rejected",
             Self::MediaLoadFailed => "mpv_media_load_failed",
+            Self::MediaAudioLoadFailed => "mpv_media_audio_load_failed",
+            Self::MediaDualOriginUnsupported => "mpv_media_dual_origin_unsupported",
+            Self::EgressModeUnsupported => "mpv_egress_mode_unsupported",
             Self::Exited => "mpv_exited",
             Self::InvalidCommand => "invalid_command",
             Self::Internal => "internal_error",
@@ -154,6 +160,13 @@ impl PlayerError {
             Self::IpcProtocol => "mpv returned an invalid IPC response.",
             Self::IpcRejected => "mpv rejected the command.",
             Self::MediaLoadFailed => "mpv could not load the requested media.",
+            Self::MediaAudioLoadFailed => "mpv could not attach the requested audio stream.",
+            Self::MediaDualOriginUnsupported => {
+                "The selected egress mode cannot attach audio from a different origin."
+            }
+            Self::EgressModeUnsupported => {
+                "The selected egress mode cannot open this media source type."
+            }
             Self::Exited => "The mpv sidecar exited.",
             Self::InvalidCommand => "The playback command or value is invalid.",
             Self::Internal => "An internal player error occurred.",
@@ -211,9 +224,12 @@ pub struct PlayerController {
     state: PlayerState,
     media_loaded: bool,
     last_error_code: Option<&'static str>,
+    terminal_error: Option<PlayerError>,
     status_metrics: PlaybackMetrics,
     pending_load: Option<PendingLoad>,
     video_target: Option<isize>,
+    #[cfg(test)]
+    media_open_test_delay: Option<Duration>,
 }
 
 #[derive(Default)]
@@ -227,6 +243,15 @@ struct PlaybackMetrics {
 struct PendingLoad {
     saw_start: bool,
     deadline: Instant,
+    audio_state: AudioAttachState,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AudioAttachState {
+    #[default]
+    NotRequested,
+    Pending,
+    Attached,
 }
 
 struct CommandReply {
@@ -241,9 +266,12 @@ impl PlayerController {
             state: PlayerState::Stopped,
             media_loaded: false,
             last_error_code: None,
+            terminal_error: None,
             status_metrics: PlaybackMetrics::default(),
             pending_load: None,
             video_target: None,
+            #[cfg(test)]
+            media_open_test_delay: None,
         }
     }
 
@@ -307,14 +335,41 @@ impl PlayerController {
     }
 
     pub fn open(&mut self, media: ValidatedMedia) -> Result<PlayerSnapshot, PlayerError> {
-        let deadline = Instant::now() + self.command_deadline_budget();
-        self.ensure_runtime_until(deadline)?;
+        if let Err(error) =
+            self.ensure_runtime_until(Instant::now() + MPV_STARTUP_TIMEOUT + IPC_OPERATION_TIMEOUT)
+        {
+            self.fail_and_cleanup(error);
+            return Err(error);
+        }
+
+        self.open_runtime_ready_until(media, Instant::now() + MEDIA_OPEN_TIMEOUT)
+    }
+
+    #[cfg(test)]
+    fn open_until(
+        &mut self,
+        media: ValidatedMedia,
+        deadline: Instant,
+    ) -> Result<PlayerSnapshot, PlayerError> {
+        if let Err(error) = self.ensure_runtime_until(deadline) {
+            self.fail_and_cleanup(error);
+            return Err(error);
+        }
+
+        self.open_runtime_ready_until(media, deadline)
+    }
+
+    fn open_runtime_ready_until(
+        &mut self,
+        media: ValidatedMedia,
+        deadline: Instant,
+    ) -> Result<PlayerSnapshot, PlayerError> {
         if let Err(error) = self.configure_relay_for_media(&media, deadline) {
             self.fail_and_cleanup(error);
             return Err(error);
         }
         // Flush events already queued for the previous load before starting a new generation.
-        if let Err(error) = self.runtime_command_ignoring_events_until(
+        if let Err(error) = self.media_open_command_ignoring_events_until(
             &json!(["get_property", "mpv-version"]),
             deadline,
         ) {
@@ -322,7 +377,7 @@ impl PlayerController {
             return Err(error);
         }
 
-        self.begin_load();
+        self.begin_load(deadline);
         self.state = PlayerState::Opening;
         self.last_error_code = None;
         log_scheme("media_open_requested", media.url_scheme());
@@ -331,13 +386,39 @@ impl PlayerController {
         log_count("header_allowlist_count", headers.len());
         let result = (|| {
             // Any end-file from the previous item belongs to the old generation.
-            self.runtime_command_ignoring_events_until(&json!(["stop"]), deadline)?;
-            self.runtime_command_ignoring_events_until(
+            self.media_open_command_ignoring_events_until(&json!(["stop"]), deadline)?;
+            if media.audio().is_some() {
+                // Never let the primary clock advance while the external track is
+                // being attached. Unpause only after both streams are selected.
+                self.media_open_command_ignoring_events_until(
+                    &json!(["set_property", "pause", true]),
+                    deadline,
+                )?;
+            }
+            self.media_open_command_ignoring_events_until(
                 &json!(["set_property", "http-header-fields", headers]),
                 deadline,
             )?;
-            self.runtime_command_until(&json!(["loadfile", media.url()]), deadline)?;
-            self.runtime_command_until(&json!(["set_property", "pause", false]), deadline)?;
+            self.media_open_command_until(&json!(["loadfile", media.url()]), deadline)?;
+            if let Some(audio) = media.audio() {
+                self.wait_for_primary_track_until(deadline)?;
+                #[cfg(test)]
+                if let Some(delay) = self.media_open_test_delay {
+                    thread::sleep(delay);
+                }
+                self.begin_audio_attach();
+                log_scheme("audio_open_requested", audio.url_scheme());
+                self.media_open_command_until(
+                    &json!(["audio-add", audio.url(), "select"]),
+                    deadline,
+                )
+                .map_err(|error| match error {
+                    PlayerError::IpcRejected => PlayerError::MediaAudioLoadFailed,
+                    error => error,
+                })?;
+                self.wait_for_external_audio_track_until(deadline)?;
+            }
+            self.media_open_command_until(&json!(["set_property", "pause", false]), deadline)?;
             Ok::<(), PlayerError>(())
         })();
 
@@ -347,6 +428,7 @@ impl PlayerController {
         }
 
         if let Some(error) = self.terminal_event_error() {
+            self.fail_and_cleanup(error);
             return Err(error);
         }
 
@@ -442,6 +524,7 @@ impl PlayerController {
         }
 
         if let Some(error) = self.terminal_event_error() {
+            self.fail_and_cleanup(error);
             return Err(error);
         }
 
@@ -467,7 +550,8 @@ impl PlayerController {
         if self.check_runtime_exit().is_err() {
             return self.snapshot();
         }
-        if self.terminal_event_error().is_some() {
+        if let Some(error) = self.terminal_event_error() {
+            self.fail_and_cleanup(error);
             return self.snapshot();
         }
 
@@ -477,7 +561,8 @@ impl PlayerController {
             return self.snapshot();
         }
 
-        if self.terminal_event_error().is_some() {
+        if let Some(error) = self.terminal_event_error() {
+            self.fail_and_cleanup(error);
             return self.snapshot();
         }
         if self.opening_timed_out() {
@@ -543,21 +628,31 @@ impl PlayerController {
             match runtime.egress_mode {
                 EgressMode::RelayRequired => {
                     let relay = runtime.relay.as_ref().ok_or(PlayerError::Internal)?;
-                    let origin = media.relay_origin().ok_or(PlayerError::Internal)?;
+                    let origin = relay_origin_for_playback(media)?;
                     Some(
                         relay
                             .begin_playback(origin)
                             .map_err(|_| PlayerError::Internal)?,
                     )
                 }
+                EgressMode::DirectLoopbackFixture
+                    if media.url_scheme() == "http"
+                        && media
+                            .audio()
+                            .is_some_and(|audio| audio.url_scheme() != "http") =>
+                {
+                    return Err(PlayerError::MediaDualOriginUnsupported);
+                }
                 EgressMode::DirectLoopbackFixture if media.url_scheme() == "http" => None,
-                EgressMode::DirectLoopbackFixture => return Err(PlayerError::Internal),
+                EgressMode::DirectLoopbackFixture => {
+                    return Err(PlayerError::EgressModeUnsupported)
+                }
                 #[cfg(test)]
                 EgressMode::TestFake => None,
             }
         };
         if let Some(proxy_url) = proxy_url {
-            self.runtime_command_ignoring_events_until(
+            self.media_open_command_ignoring_events_until(
                 &json!(["set_property", "http-proxy", proxy_url]),
                 deadline,
             )?;
@@ -626,13 +721,101 @@ impl PlayerController {
         Ok(())
     }
 
-    fn begin_load(&mut self) {
+    fn wait_for_primary_track_until(&mut self, deadline: Instant) -> Result<(), PlayerError> {
+        loop {
+            if let Some(error) = self.terminal_event_error() {
+                return Err(error);
+            }
+            if Instant::now() >= deadline {
+                return Err(PlayerError::MediaOpenTimeout);
+            }
+            let track_count = self
+                .media_open_optional_command_until(
+                    &json!(["get_property", "track-list/count"]),
+                    deadline,
+                )?
+                .data
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            if let Some(error) = self.terminal_event_error() {
+                return Err(error);
+            }
+            if track_count > 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(PlayerError::MediaOpenTimeout);
+            }
+            thread::sleep(
+                Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
+    fn wait_for_external_audio_track_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), PlayerError> {
+        loop {
+            if let Some(error) = self.terminal_event_error() {
+                return Err(error);
+            }
+            if Instant::now() >= deadline {
+                return Err(PlayerError::MediaOpenTimeout);
+            }
+            let tracks = self
+                .media_open_optional_command_until(
+                    &json!(["get_property", "track-list"]),
+                    deadline,
+                )?
+                .data;
+            if let Some(error) = self.terminal_event_error() {
+                return Err(error);
+            }
+            if tracks
+                .as_ref()
+                .and_then(Value::as_array)
+                .is_some_and(|tracks| {
+                    tracks.iter().any(|track| {
+                        track.get("type").and_then(Value::as_str) == Some("audio")
+                            && track.get("selected").and_then(Value::as_bool) == Some(true)
+                            && track.get("external").and_then(Value::as_bool) == Some(true)
+                    })
+                })
+            {
+                self.mark_audio_attached();
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(PlayerError::MediaOpenTimeout);
+            }
+            thread::sleep(
+                Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
+    fn begin_load(&mut self, deadline: Instant) {
         self.pending_load = Some(PendingLoad {
             saw_start: false,
-            deadline: Instant::now() + MEDIA_OPEN_TIMEOUT,
+            deadline,
+            audio_state: AudioAttachState::NotRequested,
         });
+        self.terminal_error = None;
         self.media_loaded = false;
         self.status_metrics = PlaybackMetrics::default();
+    }
+
+    fn begin_audio_attach(&mut self) {
+        if let Some(pending) = self.pending_load.as_mut() {
+            pending.audio_state = AudioAttachState::Pending;
+        }
+    }
+
+    fn mark_audio_attached(&mut self) {
+        if let Some(pending) = self.pending_load.as_mut() {
+            pending.audio_state = AudioAttachState::Attached;
+        }
     }
 
     fn opening_timed_out(&self) -> bool {
@@ -661,6 +844,38 @@ impl PlayerController {
         })
     }
 
+    fn media_open_command_until(
+        &mut self,
+        command: &Value,
+        deadline: Instant,
+    ) -> Result<CommandReply, PlayerError> {
+        if Instant::now() >= deadline {
+            return Err(PlayerError::MediaOpenTimeout);
+        }
+        match self.runtime_command_until(command, deadline) {
+            Err(PlayerError::IpcTimeout) if Instant::now() >= deadline => {
+                Err(PlayerError::MediaOpenTimeout)
+            }
+            result => result,
+        }
+    }
+
+    fn media_open_optional_command_until(
+        &mut self,
+        command: &Value,
+        deadline: Instant,
+    ) -> Result<CommandReply, PlayerError> {
+        if Instant::now() >= deadline {
+            return Err(PlayerError::MediaOpenTimeout);
+        }
+        match self.runtime_optional_command_until(command, deadline) {
+            Err(PlayerError::IpcTimeout) if Instant::now() >= deadline => {
+                Err(PlayerError::MediaOpenTimeout)
+            }
+            result => result,
+        }
+    }
+
     fn runtime_optional_command_until(
         &mut self,
         command: &Value,
@@ -676,12 +891,20 @@ impl PlayerController {
         })
     }
 
-    fn runtime_command_ignoring_events_until(
+    fn media_open_command_ignoring_events_until(
         &mut self,
         command: &Value,
         deadline: Instant,
     ) -> Result<CommandReply, PlayerError> {
-        self.runtime_mut()?.command_until(command, deadline)
+        if Instant::now() >= deadline {
+            return Err(PlayerError::MediaOpenTimeout);
+        }
+        match self.runtime_mut()?.command_until(command, deadline) {
+            Err(PlayerError::IpcTimeout) if Instant::now() >= deadline => {
+                Err(PlayerError::MediaOpenTimeout)
+            }
+            result => result,
+        }
     }
 
     fn apply_events(&mut self, events: Vec<MpvEvent>) {
@@ -699,6 +922,7 @@ impl PlayerController {
                     self.status_metrics = PlaybackMetrics::default();
                     self.state = PlayerState::Opening;
                     self.last_error_code = None;
+                    self.terminal_error = None;
                 }
             }
             MpvEvent::FileLoaded => {
@@ -730,11 +954,18 @@ impl PlayerController {
                         self.state = PlayerState::Opening;
                     }
                     EndFileReason::Error | EndFileReason::Unknown => {
-                        self.pending_load = None;
+                        let error = self
+                            .pending_load
+                            .take()
+                            .filter(|pending| pending.audio_state == AudioAttachState::Pending)
+                            .map_or(PlayerError::MediaLoadFailed, |_| {
+                                PlayerError::MediaAudioLoadFailed
+                            });
                         self.media_loaded = false;
                         self.status_metrics = PlaybackMetrics::default();
                         self.state = PlayerState::Error;
-                        self.last_error_code = Some(PlayerError::MediaLoadFailed.code());
+                        self.last_error_code = Some(error.code());
+                        self.terminal_error = Some(error);
                     }
                     EndFileReason::Eof | EndFileReason::Stop | EndFileReason::Quit => {
                         self.pending_load = None;
@@ -742,6 +973,7 @@ impl PlayerController {
                         self.status_metrics = PlaybackMetrics::default();
                         self.state = PlayerState::Exited;
                         self.last_error_code = Some(PlayerError::Exited.code());
+                        self.terminal_error = Some(PlayerError::Exited);
                     }
                 }
             }
@@ -749,11 +981,11 @@ impl PlayerController {
     }
 
     fn terminal_event_error(&self) -> Option<PlayerError> {
-        match self.state {
+        self.terminal_error.or(match self.state {
             PlayerState::Error => Some(PlayerError::MediaLoadFailed),
             PlayerState::Exited => Some(PlayerError::Exited),
             _ => None,
-        }
+        })
     }
 
     fn runtime_mut(&mut self) -> Result<&mut MpvRuntime, PlayerError> {
@@ -771,12 +1003,14 @@ impl PlayerController {
             PlayerState::Error
         };
         self.last_error_code = Some(error.code());
+        self.terminal_error = Some(error);
     }
 
     fn clear_media_state(&mut self) {
         self.media_loaded = false;
         self.status_metrics = PlaybackMetrics::default();
         self.pending_load = None;
+        self.terminal_error = None;
     }
 
     fn snapshot(&self) -> PlayerSnapshot {
@@ -791,6 +1025,20 @@ impl PlayerController {
             last_error_code: self.last_error_code,
         }
     }
+}
+
+fn relay_origin_for_playback(
+    media: &ValidatedMedia,
+) -> Result<super::relay::RelayOrigin, PlayerError> {
+    let origin = media.relay_origin().ok_or(PlayerError::Internal)?;
+    if media
+        .audio()
+        .and_then(super::media::ValidatedStream::relay_origin)
+        .is_some_and(|audio_origin| audio_origin != origin)
+    {
+        return Err(PlayerError::MediaDualOriginUnsupported);
+    }
+    Ok(origin)
 }
 
 impl Drop for PlayerController {
@@ -1427,17 +1675,17 @@ fn log_code(event: &'static str, value: &'static str) {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::{BTreeMap, HashSet, VecDeque};
     #[cfg(windows)]
     use std::io::{BufRead, BufReader};
     #[cfg(windows)]
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     #[cfg(windows)]
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::{Arc, Mutex, MutexGuard};
 
     use super::*;
-    use crate::player::media::{validate_media, MediaLoadRequest, MediaPolicy};
+    use crate::player::media::{validate_media, MediaLoadRequest, MediaPolicy, MediaStreamRequest};
 
     #[cfg(windows)]
     #[derive(serde::Deserialize)]
@@ -1679,6 +1927,41 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    fn verify_dual_track_selection(player: &mut PlayerController, label: &str) {
+        let tracks = player_property(player, "track-list");
+        let tracks = tracks.as_array().expect("mpv track list");
+        let video_tracks = tracks
+            .iter()
+            .filter(|track| {
+                track.get("type").and_then(Value::as_str) == Some("video")
+                    && track.get("selected").and_then(Value::as_bool) == Some(true)
+            })
+            .count();
+        let audio_tracks = tracks
+            .iter()
+            .filter(|track| {
+                track.get("type").and_then(Value::as_str) == Some("audio")
+                    && track.get("selected").and_then(Value::as_bool) == Some(true)
+            })
+            .count();
+        let external_audio = tracks.iter().any(|track| {
+            track.get("type").and_then(Value::as_str) == Some("audio")
+                && track.get("selected").and_then(Value::as_bool) == Some(true)
+                && track.get("external").and_then(Value::as_bool) == Some(true)
+        });
+
+        assert_eq!(
+            video_tracks, 1,
+            "{label}: expected one selected video track"
+        );
+        assert_eq!(
+            audio_tracks, 1,
+            "{label}: expected one selected audio track"
+        );
+        assert!(external_audio, "{label}: audio track must be external");
+    }
+
     fn reply(data: Value) -> IpcReply {
         IpcReply {
             data: Some(data),
@@ -1702,10 +1985,48 @@ mod tests {
             MediaLoadRequest {
                 url: "https://media.example.invalid/file.mkv".to_owned(),
                 headers: Default::default(),
+                audio: None,
             },
             MediaPolicy::from_environment(),
         )
         .expect("valid test media")
+    }
+
+    fn test_dual_media() -> ValidatedMedia {
+        validate_media(
+            MediaLoadRequest {
+                url: "https://media.example.invalid/video.mp4".to_owned(),
+                headers: Default::default(),
+                audio: Some(MediaStreamRequest {
+                    url: "https://media.example.invalid/audio.mp4".to_owned(),
+                    headers: Default::default(),
+                }),
+            },
+            MediaPolicy::from_environment(),
+        )
+        .expect("valid dual-stream test media")
+    }
+
+    fn test_cross_origin_dual_media() -> ValidatedMedia {
+        validate_media(
+            MediaLoadRequest {
+                url: "https://video.example.invalid/video.mp4".to_owned(),
+                headers: Default::default(),
+                audio: Some(MediaStreamRequest {
+                    url: "https://audio.example.invalid/audio.mp4".to_owned(),
+                    headers: Default::default(),
+                }),
+            },
+            MediaPolicy::from_environment(),
+        )
+        .expect("valid cross-origin dual-stream test media")
+    }
+
+    fn selected_dual_track_list() -> Value {
+        json!([
+            {"type": "video", "selected": true, "external": false},
+            {"type": "audio", "selected": true, "external": true}
+        ])
     }
 
     struct FakeIpc;
@@ -1803,6 +2124,62 @@ mod tests {
         }
     }
 
+    struct RecordingIpc {
+        commands: Arc<Mutex<Vec<Vec<Value>>>>,
+    }
+
+    impl IpcConnection for RecordingIpc {
+        fn request(&mut self, _request_id: u64, command: &[Value]) -> Result<IpcReply, IpcError> {
+            self.commands
+                .lock()
+                .expect("record commands")
+                .push(command.to_vec());
+            if command.first().and_then(Value::as_str) == Some("get_property")
+                && command.get(1).and_then(Value::as_str) == Some("track-list/count")
+            {
+                Ok(reply(json!(1)))
+            } else if command.first().and_then(Value::as_str) == Some("get_property")
+                && command.get(1).and_then(Value::as_str) == Some("track-list")
+            {
+                Ok(reply(selected_dual_track_list()))
+            } else {
+                Ok(reply(Value::Null))
+            }
+        }
+
+        fn notify(&mut self, _command: &[Value]) -> Result<(), IpcError> {
+            Ok(())
+        }
+    }
+
+    struct DelayedPrimaryTrackIpc {
+        started: Instant,
+        delay: Duration,
+    }
+
+    impl IpcConnection for DelayedPrimaryTrackIpc {
+        fn request(&mut self, _request_id: u64, command: &[Value]) -> Result<IpcReply, IpcError> {
+            match (
+                command.first().and_then(Value::as_str),
+                command.get(1).and_then(Value::as_str),
+            ) {
+                (Some("get_property"), Some("track-list/count")) => {
+                    if self.started.elapsed() >= self.delay {
+                        Ok(reply(json!(1)))
+                    } else {
+                        Ok(reply(json!(0)))
+                    }
+                }
+                (Some("get_property"), Some("track-list")) => Ok(reply(selected_dual_track_list())),
+                _ => Ok(reply(Value::Null)),
+            }
+        }
+
+        fn notify(&mut self, _command: &[Value]) -> Result<(), IpcError> {
+            Ok(())
+        }
+    }
+
     struct NeverRespondingIpc;
 
     impl IpcConnection for NeverRespondingIpc {
@@ -1856,10 +2233,58 @@ mod tests {
             state: PlayerState::Ready,
             media_loaded: false,
             last_error_code: None,
+            terminal_error: None,
             status_metrics: PlaybackMetrics::default(),
             pending_load: None,
             video_target: None,
+            #[cfg(test)]
+            media_open_test_delay: None,
         }
+    }
+
+    #[cfg(windows)]
+    fn controller_with_test_egress(
+        ipc: Box<dyn IpcConnection>,
+        egress_mode: EgressMode,
+        relay: Option<RelayProxy>,
+    ) -> PlayerController {
+        PlayerController {
+            runtime: Some(MpvRuntime {
+                child: Some(spawn_long_lived_child().into()),
+                ipc: Some(IpcWorker::new(ipc, IPC_REQUEST_TIMEOUT)),
+                relay,
+                egress_mode,
+                next_request_id: 1,
+                operation_timeout: IPC_OPERATION_TIMEOUT,
+                job: None,
+            }),
+            state: PlayerState::Ready,
+            media_loaded: false,
+            last_error_code: None,
+            terminal_error: None,
+            status_metrics: PlaybackMetrics::default(),
+            pending_load: None,
+            video_target: None,
+            media_open_test_delay: None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn controller_with_relay_runtime(ipc: Box<dyn IpcConnection>) -> PlayerController {
+        let relay = RelayProxy::start().expect("start test relay");
+        relay
+            .bind_process(
+                std::process::id(),
+                super::super::windows_security::current_process_creation_time()
+                    .expect("current process creation time"),
+            )
+            .expect("bind relay to the test process");
+        controller_with_test_egress(ipc, EgressMode::RelayRequired, Some(relay))
+    }
+
+    #[cfg(windows)]
+    fn controller_with_loopback_runtime(ipc: Box<dyn IpcConnection>) -> PlayerController {
+        controller_with_test_egress(ipc, EgressMode::DirectLoopbackFixture, None)
     }
 
     #[cfg(windows)]
@@ -2177,9 +2602,12 @@ mod tests {
             state: PlayerState::Ready,
             media_loaded: false,
             last_error_code: None,
+            terminal_error: None,
             status_metrics: PlaybackMetrics::default(),
             pending_load: None,
             video_target: None,
+            #[cfg(test)]
+            media_open_test_delay: None,
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2256,6 +2684,7 @@ mod tests {
             MediaLoadRequest {
                 url: "https://media.example.invalid/file.mkv".to_owned(),
                 headers: Default::default(),
+                audio: None,
             },
             MediaPolicy::from_environment(),
         )
@@ -2330,11 +2759,360 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn dual_stream_open_pauses_before_load_and_unpauses_after_both_tracks() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let mut player = controller_with_runtime(Box::new(RecordingIpc {
+            commands: Arc::clone(&commands),
+        }));
+
+        player.open(test_dual_media()).expect("dual-stream open");
+        let commands = commands.lock().expect("read recorded commands");
+        let position = |name: &str, argument: &str| {
+            commands
+                .iter()
+                .position(|command| {
+                    command.first().and_then(Value::as_str) == Some(name)
+                        && command.get(1).and_then(Value::as_str) == Some(argument)
+                })
+                .unwrap_or_else(|| panic!("missing command {name} {argument}"))
+        };
+        let pause_before_load = commands
+            .iter()
+            .position(|command| {
+                command.first().and_then(Value::as_str) == Some("set_property")
+                    && command.get(1).and_then(Value::as_str) == Some("pause")
+                    && command.get(2).and_then(Value::as_bool) == Some(true)
+            })
+            .expect("missing pause-before-load command");
+        let loadfile = position("loadfile", "https://media.example.invalid/video.mp4");
+        let audio_add = position("audio-add", "https://media.example.invalid/audio.mp4");
+        let track_selection = position("get_property", "track-list");
+        let unpause = commands
+            .iter()
+            .position(|command| {
+                command.first().and_then(Value::as_str) == Some("set_property")
+                    && command.get(1).and_then(Value::as_str) == Some("pause")
+                    && command.get(2).and_then(Value::as_bool) == Some(false)
+            })
+            .expect("missing unpause command");
+
+        assert!(
+            pause_before_load < loadfile,
+            "the primary clock must be paused before loadfile"
+        );
+        assert!(loadfile < audio_add, "audio must be added after the video");
+        assert!(
+            audio_add < track_selection && track_selection < unpause,
+            "the selected external audio track must be observed before playback"
+        );
+        assert_eq!(
+            commands[audio_add].get(2).and_then(Value::as_str),
+            Some("select")
+        );
+        player.shutdown();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn primary_failure_before_audio_attach_remains_a_media_load_error() {
+        let ipc = ScriptedIpc::new([
+            Ok(reply(Value::Null)),
+            Ok(reply(Value::Null)),
+            Ok(reply(Value::Null)),
+            Ok(reply(Value::Null)),
+            Ok(reply_with_events(
+                Value::Null,
+                vec![MpvEvent::StartFile, MpvEvent::EndFile(EndFileReason::Error)],
+            )),
+        ]);
+        let mut player = controller_with_runtime(Box::new(ipc));
+
+        let error = player
+            .open(test_dual_media())
+            .err()
+            .expect("primary failure must surface during open");
+
+        assert_eq!(error, PlayerError::MediaLoadFailed);
+        assert_eq!(
+            player.snapshot().last_error_code,
+            Some(PlayerError::MediaLoadFailed.code())
+        );
+        assert!(player.runtime.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn asynchronous_external_audio_failure_while_attaching_keeps_audio_error() {
+        let ipc = ScriptedIpc::new([
+            Ok(reply(Value::Null)),
+            Ok(reply(Value::Null)),
+            Ok(reply(Value::Null)),
+            Ok(reply(Value::Null)),
+            Ok(reply_with_events(Value::Null, vec![MpvEvent::StartFile])),
+            Ok(reply(json!(1))),
+            Ok(reply_with_events(
+                Value::Null,
+                vec![MpvEvent::EndFile(EndFileReason::Error)],
+            )),
+        ]);
+        let mut player = controller_with_runtime(Box::new(ipc));
+
+        let error = player
+            .open(test_dual_media())
+            .err()
+            .expect("external audio failure must surface during open");
+
+        assert_eq!(error, PlayerError::MediaAudioLoadFailed);
+        assert_eq!(
+            player.snapshot().last_error_code,
+            Some(PlayerError::MediaAudioLoadFailed.code())
+        );
+        assert!(player.runtime.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn error_after_external_audio_attachment_uses_generic_media_error() {
+        let ipc = ScriptedIpc::new([
+            // open(): flush, stop, pause, headers, loadfile, primary track,
+            // audio-add, selected external track, unpause.
+            Ok(reply(Value::Null)),
+            Ok(reply(Value::Null)),
+            Ok(reply(Value::Null)),
+            Ok(reply(Value::Null)),
+            Ok(reply_with_events(Value::Null, vec![MpvEvent::StartFile])),
+            Ok(reply(json!(1))),
+            Ok(reply(Value::Null)),
+            Ok(reply(selected_dual_track_list())),
+            Ok(reply(Value::Null)),
+            // After attachment mpv events do not identify which stream failed.
+            Ok(reply_with_events(
+                Value::Null,
+                vec![MpvEvent::EndFile(EndFileReason::Error)],
+            )),
+        ]);
+        let mut player = controller_with_runtime(Box::new(ipc));
+
+        player
+            .open(test_dual_media())
+            .expect("dual-stream commands must be accepted");
+        let snapshot = player.status();
+
+        assert_eq!(snapshot.state, PlayerState::Error);
+        assert_eq!(
+            snapshot.last_error_code,
+            Some(PlayerError::MediaLoadFailed.code())
+        );
+        assert!(
+            player.runtime.is_none(),
+            "terminal media error must release the runtime"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dual_stream_open_waits_more_than_five_seconds_for_the_primary_track() {
+        let delay = Duration::from_millis(5_300);
+        let mut player = controller_with_runtime(Box::new(DelayedPrimaryTrackIpc {
+            started: Instant::now(),
+            delay,
+        }));
+
+        let started = Instant::now();
+        player
+            .open(test_dual_media())
+            .expect("the 30-second media-open deadline must cover a slow primary track");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(5_050),
+            "test must exercise a primary-track delay over the old 5-second budget: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "slow primary load must stay bounded by the media-open deadline: {elapsed:?}"
+        );
+        player.shutdown();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_open_deadline_expiry_reports_media_timeout_before_ipc_timeout() {
+        let mut player = controller_with_runtime(Box::new(DelayedPrimaryTrackIpc {
+            started: Instant::now(),
+            delay: MEDIA_OPEN_TIMEOUT,
+        }));
+
+        let started = Instant::now();
+        let error = player
+            .open_until(
+                test_dual_media(),
+                Instant::now() + Duration::from_millis(150),
+            )
+            .err()
+            .expect("media open must time out");
+
+        assert_eq!(error, PlayerError::MediaOpenTimeout);
+        assert_eq!(
+            player.snapshot().last_error_code,
+            Some(PlayerError::MediaOpenTimeout.code())
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the media-open deadline must win before the per-request IPC timeout"
+        );
+        assert!(player.runtime.is_none());
+    }
+
+    #[test]
+    fn relay_mode_rejects_audio_from_a_different_origin() {
+        let same_origin = validate_media(
+            MediaLoadRequest {
+                url: "https://media.example.invalid/video.mp4".to_owned(),
+                headers: Default::default(),
+                audio: Some(MediaStreamRequest {
+                    url: "https://media.example.invalid/audio.mp4".to_owned(),
+                    headers: Default::default(),
+                }),
+            },
+            MediaPolicy::from_environment(),
+        )
+        .expect("same-origin dual stream");
+        assert!(relay_origin_for_playback(&same_origin).is_ok());
+
+        let cross_origin = validate_media(
+            MediaLoadRequest {
+                url: "https://video.example.invalid/video.mp4".to_owned(),
+                headers: Default::default(),
+                audio: Some(MediaStreamRequest {
+                    url: "https://audio.example.invalid/audio.mp4".to_owned(),
+                    headers: Default::default(),
+                }),
+            },
+            MediaPolicy::from_environment(),
+        )
+        .expect("cross-origin dual stream");
+        assert_eq!(
+            relay_origin_for_playback(&cross_origin)
+                .expect_err("cross-origin dual stream must fail"),
+            PlayerError::MediaDualOriginUnsupported
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn relay_mode_configures_same_origin_dual_stream_through_controller_open() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let mut player = controller_with_relay_runtime(Box::new(RecordingIpc {
+            commands: Arc::clone(&commands),
+        }));
+
+        player
+            .open(test_dual_media())
+            .expect("same-origin dual stream must open through the relay mode");
+        let commands = commands.lock().expect("read recorded commands");
+        let proxy = commands
+            .iter()
+            .find(|command| {
+                command.first().and_then(Value::as_str) == Some("set_property")
+                    && command.get(1).and_then(Value::as_str) == Some("http-proxy")
+            })
+            .and_then(|command| command.get(2))
+            .and_then(Value::as_str)
+            .expect("relay mode must configure mpv's HTTP proxy");
+        assert!(proxy.starts_with("http://127.0.0.1:"));
+        assert!(commands.iter().any(|command| {
+            command.first().and_then(Value::as_str) == Some("audio-add")
+                && command.get(2).and_then(Value::as_str) == Some("select")
+        }));
+        drop(commands);
+        player.shutdown();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn relay_mode_rejects_cross_origin_dual_stream_end_to_end() {
+        let mut player = controller_with_relay_runtime(Box::new(FakeIpc));
+
+        let error = player
+            .open(test_cross_origin_dual_media())
+            .err()
+            .expect("cross-origin dual stream must fail through open()");
+
+        assert_eq!(error, PlayerError::MediaDualOriginUnsupported);
+        assert_eq!(
+            player.snapshot().last_error_code,
+            Some(PlayerError::MediaDualOriginUnsupported.code())
+        );
+        assert!(player.runtime.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn debug_loopback_mode_rejects_public_https_audio_mixed_with_loopback_http_video() {
+        let _environment = set_opt_in_environment(true);
+        let media = validate_media(
+            MediaLoadRequest {
+                url: "http://127.0.0.1:19090/video.mp4".to_owned(),
+                headers: Default::default(),
+                audio: Some(MediaStreamRequest {
+                    url: "https://media.example.invalid/audio.mp4".to_owned(),
+                    headers: Default::default(),
+                }),
+            },
+            MediaPolicy::from_environment(),
+        )
+        .expect("each test URL is valid under its respective scheme policy");
+        let mut player = controller_with_loopback_runtime(Box::new(FakeIpc));
+
+        let error = player
+            .open(media)
+            .err()
+            .expect("mixed loopback HTTP and public HTTPS streams must fail");
+
+        assert_eq!(error, PlayerError::MediaDualOriginUnsupported);
+        assert_eq!(
+            player.snapshot().last_error_code,
+            Some(PlayerError::MediaDualOriginUnsupported.code())
+        );
+        assert!(player.runtime.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn debug_loopback_mode_reports_unsupported_egress_for_a_single_https_source() {
+        let media = validate_media(
+            MediaLoadRequest {
+                url: "https://media.example.invalid/video.mp4".to_owned(),
+                headers: Default::default(),
+                audio: None,
+            },
+            MediaPolicy::from_environment(),
+        )
+        .expect("single HTTPS source");
+        let mut player = controller_with_loopback_runtime(Box::new(FakeIpc));
+
+        let error = player
+            .open(media)
+            .err()
+            .expect("loopback fixture mode cannot open public HTTPS");
+
+        assert_eq!(error, PlayerError::EgressModeUnsupported);
+        assert_eq!(
+            player.snapshot().last_error_code,
+            Some(PlayerError::EgressModeUnsupported.code())
+        );
+        assert!(player.runtime.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn file_loaded_transitions_to_playing_without_timing_metrics() {
         let mut player = controller_with_runtime(Box::new(FakeIpc));
         player.pending_load = Some(PendingLoad {
             saw_start: true,
             deadline: Instant::now() + MEDIA_OPEN_TIMEOUT,
+            audio_state: AudioAttachState::NotRequested,
         });
         player.media_loaded = true;
         player.state = PlayerState::Opening;
@@ -2353,6 +3131,7 @@ mod tests {
         player.pending_load = Some(PendingLoad {
             saw_start: true,
             deadline: Instant::now() - Duration::from_secs(1),
+            audio_state: AudioAttachState::NotRequested,
         });
         player.state = PlayerState::Opening;
 
@@ -2395,7 +3174,7 @@ mod tests {
             Some(PlayerError::MediaLoadFailed.code())
         );
         assert!(!snapshot.media_loaded);
-        player.shutdown();
+        assert!(player.runtime.is_none());
     }
 
     #[cfg(windows)]
@@ -2430,7 +3209,7 @@ mod tests {
         assert_eq!(snapshot.state, PlayerState::Exited);
         assert_eq!(snapshot.last_error_code, Some(PlayerError::Exited.code()));
         assert!(!snapshot.media_loaded);
-        player.shutdown();
+        assert!(player.runtime.is_none());
     }
 
     #[cfg(windows)]
@@ -2702,6 +3481,7 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
+                audio: None,
             },
             MediaPolicy::from_environment(),
         )
@@ -2729,6 +3509,137 @@ mod tests {
         verify_twenty_player_seeks(&mut player, "S1");
         verify_playback_advances(&mut player, "S1");
         player.shutdown();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an installed mpv and two Python fixture servers"]
+    fn installed_mpv_merges_synthetic_video_and_audio_streams_and_seeks() {
+        let _environment = set_opt_in_environment(true);
+        let video_fixture = start_loopback_fixture("s1-video-only.mp4");
+        let audio_fixture = start_loopback_fixture("s1-audio-only.mp4");
+        assert_eq!(video_fixture.info.referer, audio_fixture.info.referer);
+        assert_eq!(video_fixture.info.user_agent, audio_fixture.info.user_agent);
+        let headers = [
+            ("Referer".to_owned(), video_fixture.info.referer.clone()),
+            (
+                "User-Agent".to_owned(),
+                video_fixture.info.user_agent.clone(),
+            ),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let media = validate_media(
+            MediaLoadRequest {
+                url: video_fixture.info.url.clone(),
+                headers: headers.clone(),
+                audio: Some(MediaStreamRequest {
+                    url: audio_fixture.info.url.clone(),
+                    headers,
+                }),
+            },
+            MediaPolicy::from_environment(),
+        )
+        .expect("valid synthetic dual-stream media");
+
+        let mut player = PlayerController::new();
+        player
+            .start_standalone()
+            .expect("start player for synthetic dual stream");
+        set_player_property(&mut player, "hr-seek", Value::String("yes".to_owned()));
+        set_player_property(&mut player, "hwdec", Value::String("no".to_owned()));
+        let pause_gate_delay = Duration::from_millis(1_200);
+        player.media_open_test_delay = Some(pause_gate_delay);
+        let open_started = Instant::now();
+        player.open(media).expect("open synthetic dual stream");
+        let open_elapsed = open_started.elapsed();
+        let paused = player
+            .control(PlaybackCommand::Pause)
+            .expect("pause synthetic dual stream");
+        let paused_position = player_time_position(&mut player);
+        assert!(
+            open_elapsed >= pause_gate_delay,
+            "the real-mpv probe must wait while the primary track is paused"
+        );
+        assert_eq!(paused.state, PlayerState::Paused);
+        assert!(
+            paused_position < 0.75,
+            "the primary clock advanced before audio attachment completed: {paused_position:.3}s"
+        );
+        eprintln!(
+            "DUAL_STREAM_PAUSE_GATE|status=PASS|open_ms={}|position_ms={:.0}",
+            open_elapsed.as_millis(),
+            paused_position * 1_000.0
+        );
+
+        verify_dual_track_selection(&mut player, "dual-stream initial");
+        assert_eq!(
+            player_property(&mut player, "audio-codec-name").as_str(),
+            Some("aac")
+        );
+        verify_twenty_player_seeks(&mut player, "dual-stream");
+        verify_dual_track_selection(&mut player, "dual-stream after seeks");
+        verify_playback_advances(&mut player, "dual-stream");
+        verify_dual_track_selection(&mut player, "dual-stream after resume");
+
+        let video_position = player_property(&mut player, "time-pos")
+            .as_f64()
+            .expect("video position");
+        let audio_pts = player_property(&mut player, "audio-pts")
+            .as_f64()
+            .expect("audio PTS");
+        assert!(video_position.is_finite() && audio_pts.is_finite());
+        eprintln!(
+            "DUAL_STREAM_PTS|status=PASS|video={video_position:.3}|audio={audio_pts:.3}|delta={:.3}",
+            (audio_pts - video_position).abs()
+        );
+        player.shutdown();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an installed mpv and Python fixture server"]
+    fn installed_mpv_rejects_missing_external_audio_and_cleans_up() {
+        let _environment = set_opt_in_environment(true);
+        let fixture = start_loopback_fixture("s1-video-only.mp4");
+        let media = validate_media(
+            MediaLoadRequest {
+                url: fixture.info.url.clone(),
+                headers: [
+                    ("Referer".to_owned(), fixture.info.referer.clone()),
+                    ("User-Agent".to_owned(), fixture.info.user_agent.clone()),
+                ]
+                .into_iter()
+                .collect(),
+                audio: Some(MediaStreamRequest {
+                    url: format!("{}.missing", fixture.info.url),
+                    headers: [
+                        ("Referer".to_owned(), fixture.info.referer.clone()),
+                        ("User-Agent".to_owned(), fixture.info.user_agent.clone()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                }),
+            },
+            MediaPolicy::from_environment(),
+        )
+        .expect("valid missing-audio fixture request");
+
+        let mut player = PlayerController::new();
+        player
+            .start_standalone()
+            .expect("start player for missing-audio probe");
+        let error = player.open(media).err().expect("audio add must fail");
+
+        assert_eq!(error, PlayerError::MediaAudioLoadFailed);
+        assert_eq!(
+            player.snapshot().last_error_code,
+            Some(PlayerError::MediaAudioLoadFailed.code())
+        );
+        assert!(
+            player.runtime.is_none(),
+            "failed dual stream must be cleaned up"
+        );
     }
 
     #[cfg(windows)]
@@ -2764,6 +3675,7 @@ mod tests {
                     ]
                     .into_iter()
                     .collect(),
+                    audio: None,
                 },
                 MediaPolicy::from_environment(),
             )
@@ -2915,6 +3827,7 @@ mod tests {
                 MediaLoadRequest {
                     url: "https://example.com/".to_owned(),
                     headers: Default::default(),
+                    audio: None,
                 },
                 MediaPolicy::from_environment(),
             )
@@ -2939,9 +3852,9 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "mpv did not establish an owner-bound tunnel through the relay (raw={}, session={})",
+                "mpv did not establish an owner-bound tunnel through the relay (raw={}, playback={})",
                 relay.raw_connection_count(),
-                relay.session_connection_count()
+                relay.playback_connection_count()
             );
             thread::sleep(Duration::from_millis(50));
         }

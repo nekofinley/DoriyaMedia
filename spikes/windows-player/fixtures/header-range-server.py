@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 import secrets
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -117,7 +118,15 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--referer", default="https://www.bilibili.com/")
     parser.add_argument("--user-agent", default="Doriya-W0-Test/1")
+    parser.add_argument(
+        "--max-seconds",
+        type=int,
+        default=0,
+        help="Exit automatically after this many seconds; zero disables the limit.",
+    )
     args = parser.parse_args()
+    if args.max_seconds < 0:
+        parser.error("--max-seconds must be zero or positive")
 
     media_path = args.file.resolve(strict=True)
     if not media_path.is_file():
@@ -145,11 +154,18 @@ def main() -> None:
         ),
         flush=True,
     )
+    lifetime_timer = None
+    if args.max_seconds > 0:
+        lifetime_timer = threading.Timer(args.max_seconds, server.shutdown)
+        lifetime_timer.daemon = True
+        lifetime_timer.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if lifetime_timer is not None:
+            lifetime_timer.cancel()
         server.server_close()
 
 
